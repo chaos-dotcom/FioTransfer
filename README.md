@@ -12,6 +12,18 @@ make cli     # command-line version → bin/fio
 make test    # engine tests with fault injection
 ```
 
+## Releases
+
+GitHub Actions (`.github/workflows/build.yml`) tests and builds every push. To publish a downloadable version:
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+That creates a GitHub Release with `FioTransfer-1.0.0.dmg` (a universal build for Apple Silicon and Intel, macOS 13 or later), a `.zip`, and checksums.
+
+The app is ad-hoc signed. The first time, people **right-click → Open**, or run `xattr -dr com.apple.quarantine /Applications/FioTransfer.app`. To ship a fully signed and notarized app, add these repository secrets: `MACOS_CERT_P12` (base64 Developer ID .p12), `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`.
+
 ## Downloads
 
 Downloads need no sign-in and no setup.

@@ -21,7 +21,8 @@ import (
 	"fiotransfer/internal/xfer"
 )
 
-const version = "1.0.0"
+// version is set at build time: -ldflags "-X main.version=1.2.3".
+var version = "dev"
 
 // App is bound to the frontend; its exported methods are callable from JS.
 type App struct {
