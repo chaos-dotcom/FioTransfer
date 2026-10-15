@@ -231,6 +231,7 @@ func (a *App) GetState() State {
 	}
 	if st.LoggedIn {
 		st.User = a.user()
+		st.LoggedIn = a.auth.LoggedIn() // a dead session is cleared while fetching the user
 	}
 	return st
 }

@@ -30,7 +30,7 @@ import (
 var imsBase = "https://ims-na1.adobelogin.com"
 
 const (
-	scopes        = "openid,offline_access,email,profile,additional_info.roles"
+	scopes        = "openid email profile offline_access additional_info.roles" // as in Frame.io's SDK
 	keyringSvc    = "FioTransfer"
 	keyringUser   = "adobe-ims"
 	refreshMargin = 5 * time.Minute
@@ -55,7 +55,7 @@ type Manager struct {
 
 func NewManager(clientID func() string) *Manager {
 	m := &Manager{clientID: clientID, http: &http.Client{Timeout: 30 * time.Second}}
-	m.tok = loadToken()
+	m.tok = store.load()
 	return m
 }
 
@@ -111,13 +111,20 @@ func (m *Manager) refreshLocked(ctx context.Context) error {
 	}
 	t, err := m.tokenRequest(ctx, form)
 	if err != nil {
-		return fmt.Errorf("refreshing Adobe session (sign in again if this persists): %w", err)
+		var re *rejectedError
+		if errors.As(err, &re) {
+			// The session is gone (revoked or expired): drop it so the app asks to sign in.
+			m.tok = nil
+			store.clear()
+			return ErrNotLoggedIn
+		}
+		return fmt.Errorf("refreshing Adobe session: %w", err)
 	}
 	if t.Refresh == "" {
 		t.Refresh = m.tok.Refresh
 	}
 	m.tok = t
-	saveToken(t)
+	store.save(t)
 	return nil
 }
 
@@ -125,8 +132,7 @@ func (m *Manager) Logout() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.tok = nil
-	_ = keyring.Delete(keyringSvc, keyringUser)
-	_ = os.Remove(fallbackPath())
+	store.clear()
 }
 
 // RedirectURI is what must be registered on the Adobe "OAuth Single Page App" credential.
@@ -234,7 +240,7 @@ func (m *Manager) Login(ctx context.Context, port int, openURL func(string)) err
 	m.mu.Lock()
 	m.tok = t
 	m.mu.Unlock()
-	saveToken(t)
+	store.save(t)
 	return nil
 }
 
@@ -248,6 +254,9 @@ func (m *Manager) tokenRequest(ctx context.Context, form url.Values) (*Token, er
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == 400 || resp.StatusCode == 401 {
+			return nil, &rejectedError{fmt.Sprintf("Adobe returned %d: %s", resp.StatusCode, truncate(string(body), 300))}
+		}
 		return nil, fmt.Errorf("Adobe token endpoint returned %d: %s", resp.StatusCode, truncate(string(body), 300))
 	}
 	var r struct {
@@ -270,6 +279,29 @@ func (m *Manager) tokenRequest(ctx context.Context, form url.Values) (*Token, er
 
 // Tokens live in the Keychain; a 0600 file is the fallback if the Keychain is unavailable.
 func fallbackPath() string { return filepath.Join(config.Dir(), "token.json") }
+
+// rejectedError means Adobe refused the grant (bad code, revoked or expired refresh token).
+type rejectedError struct{ msg string }
+
+func (e *rejectedError) Error() string { return e.msg }
+
+// tokenStore persists tokens; tests swap in a memory store so they never touch the Keychain.
+type tokenStore interface {
+	load() *Token
+	save(*Token)
+	clear()
+}
+
+type keychainTokens struct{}
+
+func (keychainTokens) load() *Token  { return loadToken() }
+func (keychainTokens) save(t *Token) { saveToken(t) }
+func (keychainTokens) clear() {
+	_ = keyring.Delete(keyringSvc, keyringUser)
+	_ = os.Remove(fallbackPath())
+}
+
+var store tokenStore = keychainTokens{}
 
 func saveToken(t *Token) {
 	b, _ := json.Marshal(t)

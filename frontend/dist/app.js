@@ -591,6 +591,9 @@ async function loadLevel(autoSkip) {
     else if (t.kind === 'workspace') items = await call('ListProjects', D.stack[0].id, t.id);
     else items = await call('ListFolders', D.stack[0].id, t.folder_id);
   } catch (e) {
+    S.state = await call('GetState');
+    renderState();
+    if (!S.state.logged_in) { closeDest(); toast('Signed out — sign in again', 'err'); return; }
     list.innerHTML = `<div class="dest-msg" style="color:var(--error-text)">${esc(errMsg(e))}</div>`;
     return;
   }

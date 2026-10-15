@@ -10,8 +10,35 @@ import (
 	"time"
 )
 
-func TestLoginHTTPSCallback(t *testing.T) {
+type memTokens struct{ t *Token }
+
+func (m *memTokens) load() *Token  { return m.t }
+func (m *memTokens) save(t *Token) { m.t = t }
+func (m *memTokens) clear()        { m.t = nil }
+
+func TestMain(m *testing.M) {
+	store = &memTokens{} // never touch the real Keychain from tests
 	trustLocalCert = func(string) {}
+	m.Run()
+}
+
+func TestRejectedRefreshSignsOut(t *testing.T) {
+	ims := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"access_denied"}`, 400)
+	}))
+	defer ims.Close()
+	imsBase = ims.URL
+	m := &Manager{clientID: func() string { return "cid" }, http: http.DefaultClient,
+		tok: &Token{Access: "old", Refresh: "dead", Expiry: time.Now().Add(-time.Minute)}}
+	if _, err := m.Token(t.Context()); err != ErrNotLoggedIn {
+		t.Fatalf("err = %v, want ErrNotLoggedIn", err)
+	}
+	if m.LoggedIn() {
+		t.Error("still logged in after rejected refresh")
+	}
+}
+
+func TestLoginHTTPSCallback(t *testing.T) {
 	ims := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		if r.URL.Path != "/ims/token/v3" || r.Form.Get("code") != "the-code" || r.Form.Get("code_verifier") == "" ||
