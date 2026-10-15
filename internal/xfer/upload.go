@@ -15,8 +15,9 @@ import (
 	"fiotransfer/internal/netx"
 )
 
-// statusPollDelays spaces out the post-upload status checks.
-var statusPollDelays = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 30 * time.Second}
+// verifyDelays spaces out the post-upload status checks. They run in the
+// background so a finished file frees its slot for the next one immediately.
+var verifyDelays = []time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second}
 
 // uploadFile creates the file on Frame.io and PUTs all parts in parallel to
 // the presigned URLs Frame.io hands back.
@@ -51,6 +52,10 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	f.RemoteID = lu.ID
 	f.ViewURL = lu.ViewURL
 	f.mu.Unlock()
+	if j.linkFromFile {
+		j.setLink(lu.ViewURL)
+	}
+	started := time.Now()
 
 	contentType := "application/octet-stream"
 	if lu.MediaType != nil && *lu.MediaType != "" {
@@ -91,28 +96,50 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}
+	secs := time.Since(started).Seconds()
+	f.mu.Lock()
+	f.detail = fmt.Sprintf("%d parts × %s, %.1fs, %s/s", len(parts), humanBytes(parts[0].size), secs, humanBytes(int64(float64(size)/max(secs, 0.001))))
+	f.mu.Unlock()
 
-	// All bytes are on S3; Frame.io assembles the parts. Confirm, but don't
-	// burn the API budget polling forever.
-	f.setStatus(Finalizing, "")
-	for _, d := range statusPollDelays {
-		sleepCtx(ctx, d)
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		s, err := j.mgr.API.FileStatus(ctx, j.AccountID, lu.ID)
-		if err != nil {
-			continue
-		}
-		if s.UploadFailed {
-			return errors.New("Frame.io reported the upload as failed after assembly")
-		}
-		if s.UploadComplete {
-			return nil
-		}
-	}
-	f.setNote("uploaded; Frame.io is still processing")
+	// All bytes are on S3; Frame.io assembles the parts. Confirm in the background.
+	j.verifyLater(f, lu.ID)
 	return nil
+}
+
+// verifyLater checks Frame.io's assembly status without holding an upload slot.
+// A failure reported by Frame.io turns the file into a failed one.
+func (j *Job) verifyLater(f *File, fileID string) {
+	j.verifyWG.Add(1)
+	go func() {
+		defer j.verifyWG.Done()
+		for _, d := range j.mgr.VerifyDelays {
+			sleepCtx(j.ctx, d)
+			if j.ctx.Err() != nil {
+				return
+			}
+			s, err := j.mgr.API.FileStatus(j.ctx, j.AccountID, fileID)
+			if err != nil {
+				continue
+			}
+			if s.UploadFailed {
+				f.mu.Lock()
+				f.status, f.err = Failed, "Frame.io reported the upload as failed"
+				f.mu.Unlock()
+				j.persistFile(f)
+				j.mgr.Hist.Log("%s FAILED   [%s] %s — %s", kindTag(j.Kind), j.ID, f.RelPath, "Frame.io reported the upload as failed")
+				if j.onFileDone != nil {
+					j.onFileDone(f)
+				}
+				j.mgr.touch()
+				return
+			}
+			if s.UploadComplete {
+				return
+			}
+		}
+		f.setNote("processing on Frame.io")
+		j.persistFile(f)
+	}()
 }
 
 func putPart(ctx context.Context, f *File, fh *os.File, off, size int64, url, contentType string) error {
@@ -200,8 +227,9 @@ func putOnce(ctx context.Context, url string, fh *os.File, off, size int64, cont
 
 // ensureFolders creates the remote folder tree for an upload, returning a map
 // from relative directory ("" = destination root) to Frame.io folder ID.
-func ensureFolders(ctx context.Context, c *api.Client, acct, root string, dirs []string) (map[string]string, error) {
+func ensureFolders(ctx context.Context, c *api.Client, acct, root string, dirs []string) (map[string]string, map[string]string, error) {
 	ids := map[string]string{"": root}
+	urls := map[string]string{}
 	for _, d := range dirs { // dirs are sorted so parents come first
 		if _, ok := ids[d]; ok {
 			continue
@@ -209,13 +237,14 @@ func ensureFolders(ctx context.Context, c *api.Client, acct, root string, dirs [
 		parent := parentDir(d)
 		pid, ok := ids[parent]
 		if !ok {
-			return nil, fmt.Errorf("internal error: parent of %q not created", d)
+			return nil, nil, fmt.Errorf("internal error: parent of %q not created", d)
 		}
 		folder, err := c.CreateFolder(ctx, acct, pid, baseName(d))
 		if err != nil {
-			return nil, fmt.Errorf("creating folder %q: %w", d, err)
+			return nil, nil, fmt.Errorf("creating folder %q: %w", d, err)
 		}
 		ids[d] = folder.ID
+		urls[d] = folder.ViewURL
 	}
-	return ids, nil
+	return ids, urls, nil
 }

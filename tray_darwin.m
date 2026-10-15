@@ -81,3 +81,19 @@ void fioActivate(void) {
 		[NSApp activateIgnoringOtherApps:YES];
 	});
 }
+
+// While transfers run, tell macOS this is user-requested work: no App Nap
+// throttling and no idle sleep, even when the window is hidden.
+static id fioActivity;
+
+void fioSetActive(int on) {
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if (on && !fioActivity) {
+			fioActivity = [[NSProcessInfo processInfo] beginActivityWithOptions:(NSActivityUserInitiated | NSActivityIdleSystemSleepDisabled)
+			                                                             reason:@"Transfers in progress"];
+		} else if (!on && fioActivity) {
+			[[NSProcessInfo processInfo] endActivity:fioActivity];
+			fioActivity = nil;
+		}
+	});
+}

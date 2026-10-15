@@ -21,10 +21,9 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 }
 
 func TestWatchFolder(t *testing.T) {
-	watchInterval, watchSettle = 50*time.Millisecond, 200*time.Millisecond
 	fake := newFake(t)
 	m := newTestManager(t, fake, 8, 1)
-	w := NewWatcher(m)
+	w := newWatcher(m, 50*time.Millisecond, 200*time.Millisecond)
 	defer w.Close()
 
 	root := t.TempDir()
@@ -90,7 +89,7 @@ func TestWatchFolder(t *testing.T) {
 	// Watches survive a restart without re-uploading.
 	before := fake.fileSeq.Load()
 	w.Close()
-	w2 := NewWatcher(m)
+	w2 := newWatcher(m, 50*time.Millisecond, 200*time.Millisecond)
 	defer w2.Close()
 	time.Sleep(700 * time.Millisecond)
 	if fake.fileSeq.Load() != before {

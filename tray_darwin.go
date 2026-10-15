@@ -9,6 +9,7 @@ void fioTrayInit(void);
 void fioTraySet(const char *status, const char *title, int login);
 void fioSyncDock(void);
 void fioActivate(void);
+void fioSetActive(int on);
 */
 import "C"
 
@@ -51,3 +52,11 @@ func traySet(status, title string, login bool) {
 
 func syncDock()    { C.fioSyncDock() }
 func activateApp() { C.fioActivate() }
+
+func setTransfersActive(on bool) {
+	v := 0
+	if on {
+		v = 1
+	}
+	C.fioSetActive(C.int(v))
+}

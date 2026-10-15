@@ -30,7 +30,8 @@ type Watch struct {
 const (
 	WatchUploaded = "uploaded"
 	WatchFailed   = "failed"
-	WatchIgnored  = "ignored" // existed before the watch was created
+	WatchIgnored  = "ignored"  // existed before the watch was created
+	WatchCanceled = "canceled" // the user canceled its upload; not retried automatically
 )
 
 type WatchFile struct {
@@ -64,6 +65,22 @@ func (s *Store) Watches() ([]Watch, error) {
 		out = append(out, w)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) UpdateWatch(w Watch) error {
+	_, err := s.db.Exec(`UPDATE watches SET local_path=?, account_id=?, folder_id=?, dest_label=? WHERE id=?`,
+		w.LocalPath, w.AccountID, w.FolderID, w.DestLabel, w.ID)
+	return err
+}
+
+// ResetWatchFiles forgets every file record (used when the watched folder changes).
+func (s *Store) ResetWatchFiles(id string) {
+	s.db.Exec(`DELETE FROM watch_files WHERE watch_id=?`, id)
+}
+
+// RequeueCanceled lets canceled files upload again.
+func (s *Store) RequeueCanceled(id string) {
+	s.db.Exec(`DELETE FROM watch_files WHERE watch_id=? AND state='canceled'`, id)
 }
 
 func (s *Store) SetWatchEnabled(id string, on bool) {
@@ -121,6 +138,7 @@ func (s *Store) PutWatchFiles(id string, files []WatchFile) error {
 type WatchStats struct {
 	Uploaded   int   `json:"uploaded"`
 	Failed     int   `json:"failed"`
+	Canceled   int   `json:"canceled"`
 	LastUpload int64 `json:"last_upload"`
 }
 
@@ -128,7 +146,8 @@ func (s *Store) WatchStats(id string) WatchStats {
 	var st WatchStats
 	var last sql.NullInt64
 	s.db.QueryRow(`SELECT COUNT(*) FILTER (WHERE state='uploaded'), COUNT(*) FILTER (WHERE state='failed'),
-		MAX(CASE WHEN state='uploaded' THEN updated_at END) FROM watch_files WHERE watch_id=?`, id).Scan(&st.Uploaded, &st.Failed, &last)
+		COUNT(*) FILTER (WHERE state='canceled'), MAX(CASE WHEN state='uploaded' THEN updated_at END)
+		FROM watch_files WHERE watch_id=?`, id).Scan(&st.Uploaded, &st.Failed, &st.Canceled, &last)
 	st.LastUpload = last.Int64
 	return st
 }

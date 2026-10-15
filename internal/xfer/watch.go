@@ -37,20 +37,25 @@ type watchState struct {
 	seen    map[string]obs
 	job     *Job
 	err     string
-	pending int // files waiting to settle
+	pending int    // files waiting to settle
+	link    string // Frame.io page of the destination folder
 }
 
 type Watcher struct {
-	m  *Manager
-	mu sync.Mutex
-	ws map[string]*watchState
+	m        *Manager
+	mu       sync.Mutex
+	ws       map[string]*watchState
+	interval time.Duration
+	settle   time.Duration
 
 	stop     chan struct{}
 	stopOnce sync.Once
 }
 
-func NewWatcher(m *Manager) *Watcher {
-	w := &Watcher{m: m, ws: map[string]*watchState{}, stop: make(chan struct{})}
+func NewWatcher(m *Manager) *Watcher { return newWatcher(m, watchInterval, watchSettle) }
+
+func newWatcher(m *Manager, interval, settle time.Duration) *Watcher {
+	w := &Watcher{m: m, ws: map[string]*watchState{}, stop: make(chan struct{}), interval: interval, settle: settle}
 	if list, err := m.Hist.Watches(); err == nil {
 		for _, x := range list {
 			w.ws[x.ID] = &watchState{w: x, seen: map[string]obs{}}
@@ -63,7 +68,7 @@ func NewWatcher(m *Manager) *Watcher {
 func (w *Watcher) Close() { w.stopOnce.Do(func() { close(w.stop) }) }
 
 func (w *Watcher) loop() {
-	t := time.NewTicker(watchInterval)
+	t := time.NewTicker(w.interval)
 	defer t.Stop()
 	w.tick()
 	for {
@@ -149,6 +154,67 @@ func (w *Watcher) Remove(id string) {
 	w.m.Hist.DeleteWatch(id)
 }
 
+// Update changes a watch's folder and/or destination. A new local folder starts
+// fresh (existing files are skipped unless includeExisting); a new destination
+// applies to files from now on.
+func (w *Watcher) Update(id, local, acct, folder, label string, includeExisting bool) error {
+	local = filepath.Clean(local)
+	if st, err := os.Stat(local); err != nil || !st.IsDir() {
+		return fmt.Errorf("not a folder: %s", local)
+	}
+	if acct == "" || folder == "" {
+		return errors.New("no destination")
+	}
+	w.mu.Lock()
+	s := w.ws[id]
+	if s == nil {
+		w.mu.Unlock()
+		return errors.New("watch not found")
+	}
+	for oid, o := range w.ws {
+		if oid != id && o.w.LocalPath == local {
+			w.mu.Unlock()
+			return errors.New("already watched")
+		}
+	}
+	folderChanged := s.w.LocalPath != local
+	destChanged := s.w.FolderID != folder || s.w.AccountID != acct
+	if s.job != nil && !s.job.Status().terminal() {
+		s.job.cancel() // not a user cancel: its files stay eligible under the new settings
+	}
+	s.w.LocalPath, s.w.AccountID, s.w.FolderID, s.w.DestLabel = local, acct, folder, label
+	s.seen, s.pending, s.err = map[string]obs{}, 0, ""
+	if destChanged {
+		s.link = ""
+	}
+	x := s.w
+	w.mu.Unlock()
+
+	if err := w.m.Hist.UpdateWatch(x); err != nil {
+		return err
+	}
+	if destChanged || folderChanged {
+		w.m.Hist.ClearWatchDirs(id)
+	}
+	if folderChanged {
+		w.m.Hist.ResetWatchFiles(id)
+		if !includeExisting {
+			var base []history.WatchFile
+			walkWatch(local, func(rel string, info fs.FileInfo) {
+				base = append(base, history.WatchFile{RelPath: rel, Size: info.Size(), Mtime: info.ModTime().UnixNano(), State: history.WatchIgnored})
+			})
+			w.m.Hist.PutWatchFiles(id, base)
+		}
+	}
+	w.m.Hist.Log("WATCH    edited   [%s] %s -> %s", id, local, label)
+	return nil
+}
+
+// RequeueCanceled lets files from canceled batches upload again.
+func (w *Watcher) RequeueCanceled(id string) {
+	w.m.Hist.RequeueCanceled(id)
+}
+
 type WatchView struct {
 	ID         string `json:"id"`
 	LocalPath  string `json:"local_path"`
@@ -159,7 +225,11 @@ type WatchView struct {
 	Detail     string `json:"detail"`
 	Uploaded   int    `json:"uploaded"`
 	Failed     int    `json:"failed"`
+	Canceled   int    `json:"canceled"`
 	Pending    int    `json:"pending"`
+	AccountID  string `json:"account_id"`
+	FolderID   string `json:"folder_id"`
+	Link       string `json:"link"`
 	LastUpload int64  `json:"last_upload"`
 }
 
@@ -176,7 +246,8 @@ func (w *Watcher) Views() []WatchView {
 		st := w.m.Hist.WatchStats(s.w.ID)
 		w.mu.Lock()
 		v := WatchView{ID: s.w.ID, LocalPath: s.w.LocalPath, Name: filepath.Base(s.w.LocalPath), DestLabel: s.w.DestLabel,
-			Enabled: s.w.Enabled, Uploaded: st.Uploaded, Failed: st.Failed, LastUpload: st.LastUpload, Pending: s.pending}
+			Enabled: s.w.Enabled, Uploaded: st.Uploaded, Failed: st.Failed, Canceled: st.Canceled, LastUpload: st.LastUpload,
+			Pending: s.pending, AccountID: s.w.AccountID, FolderID: s.w.FolderID, Link: s.link}
 		switch {
 		case !s.w.Enabled:
 			v.State = "paused"
@@ -261,7 +332,7 @@ func (w *Watcher) scan(s *watchState) {
 		size, mt := info.Size(), info.ModTime().UnixNano()
 		if k, ok := known[rel]; ok {
 			switch k.State {
-			case history.WatchUploaded, history.WatchIgnored:
+			case history.WatchUploaded, history.WatchIgnored, history.WatchCanceled:
 				return
 			case history.WatchFailed:
 				if k.Attempts >= watchMaxRetries && k.Size == size && k.Mtime == mt {
@@ -277,7 +348,7 @@ func (w *Watcher) scan(s *watchState) {
 			o.since = prev.since
 		}
 		seen[rel] = o
-		if now.Sub(o.since) >= watchSettle {
+		if now.Sub(o.since) >= w.settle {
 			if len(ready) < watchBatchMax {
 				ready = append(ready, scanned{local: filepath.Join(x.LocalPath, filepath.FromSlash(rel)), rel: rel, size: size})
 			}
@@ -328,6 +399,32 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 			mtimes[it.rel] = info.ModTime().UnixNano()
 		}
 	}
+	w.mu.Lock()
+	link := s.link
+	w.mu.Unlock()
+	if link != "" {
+		j.setLink(link)
+	}
+	var recMu sync.Mutex
+	recorded := map[string]bool{}
+	// A batch the user cancels stays canceled: those files aren't picked up again.
+	j.onFinish = func(j *Job) {
+		if !j.userCanceled.Load() {
+			return
+		}
+		var canceled []history.WatchFile
+		recMu.Lock()
+		for _, it := range items {
+			if !recorded[it.rel] {
+				canceled = append(canceled, history.WatchFile{RelPath: it.rel, Size: it.size, Mtime: mtimes[it.rel], State: history.WatchCanceled})
+			}
+		}
+		recMu.Unlock()
+		if len(canceled) > 0 {
+			m.Hist.PutWatchFiles(x.ID, canceled)
+			m.Hist.Log("WATCH    canceled [%s] %d files won't be uploaded by %s", j.ID, len(canceled), x.LocalPath)
+		}
+	}
 	j.onFileDone = func(f *File) {
 		f.mu.Lock()
 		st, e, rid := f.status, f.err, f.RemoteID
@@ -345,6 +442,9 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 		default:
 			return
 		}
+		recMu.Lock()
+		recorded[f.RelPath] = true
+		recMu.Unlock()
 		m.Hist.PutWatchFiles(x.ID, []history.WatchFile{wf})
 	}
 	m.Hist.Start(j.record(), nil)
@@ -353,6 +453,17 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 	go func() {
 		defer j.finish()
 		j.setStatus(Resolving)
+		if link == "" {
+			j.linkToFolder(x.FolderID)
+			j.mu.Lock()
+			l := j.link
+			j.mu.Unlock()
+			w.mu.Lock()
+			if s.w.FolderID == x.FolderID {
+				s.link = l
+			}
+			w.mu.Unlock()
+		}
 		rels := make([]string, n)
 		for i, it := range items {
 			rels[i] = it.rel

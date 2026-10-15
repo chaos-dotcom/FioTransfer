@@ -25,17 +25,18 @@ const DefaultBaseURL = "https://api.frame.io"
 type Client struct {
 	Auth    *auth.Manager
 	BaseURL string
-	limiter *rate.Limiter
+	limits  *limiters
 }
 
-// Frame.io allows ~100 calls/minute per user; stay just under it.
 func New(a *auth.Manager) *Client {
-	return &Client{Auth: a, BaseURL: DefaultBaseURL, limiter: rate.NewLimiter(rate.Limit(1.5), 10)}
+	return &Client{Auth: a, BaseURL: DefaultBaseURL, limits: newLimiters()}
 }
 
-// SetRate overrides the API rate limit (used by tests).
+// SetRate replaces per-route limits with one fixed limit (used by tests).
 func (c *Client) SetRate(perSec float64, burst int) {
-	c.limiter = rate.NewLimiter(rate.Limit(perSec), burst)
+	c.limits.mu.Lock()
+	c.limits.override = rate.NewLimiter(rate.Limit(perSec), burst)
+	c.limits.mu.Unlock()
 }
 
 type Error struct {
@@ -67,9 +68,10 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		}
 		u += sep + query.Encode()
 	}
+	key := routeKey(method, u)
 	refreshed := false
 	for attempt := 0; ; attempt++ {
-		if err := c.limiter.Wait(ctx); err != nil {
+		if err := c.limits.get(key).Wait(ctx); err != nil {
 			return err
 		}
 		tok, err := c.Auth.Token(ctx)
@@ -92,6 +94,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		}
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		resp.Body.Close()
+		c.limits.observe(key, resp.Header)
 		switch {
 		case resp.StatusCode == 401 && !refreshed:
 			refreshed = true
@@ -327,4 +330,13 @@ func (c *Client) FileDownloadURL(ctx context.Context, acct, file string) (string
 		return "", errors.New("no original download link available for this file")
 	}
 	return *ml.Original.DownloadURL, nil
+}
+
+// Folder returns a folder, including its Frame.io view URL.
+func (c *Client) Folder(ctx context.Context, acct, id string) (*Asset, error) {
+	var r struct{ Data Asset }
+	if err := c.do(ctx, "GET", "/v4/accounts/"+acct+"/folders/"+id, nil, nil, &r); err != nil {
+		return nil, err
+	}
+	return &r.Data, nil
 }

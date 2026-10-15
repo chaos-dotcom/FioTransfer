@@ -73,6 +73,9 @@ type fakeFrameio struct {
 	putFailEvery int64
 	rejectName   string // PUTs for this file name fail permanently (400)
 	apiCalls     atomic.Int64
+	putDelay     atomic.Int64  // slow storage (ns)
+	assemblyTime time.Duration // Frame.io reports complete this long after the last part
+	failAssembly string        // Frame.io reports this file name as failed after upload
 }
 
 type fakeFolder struct{ parent, name string }
@@ -82,6 +85,7 @@ type fakeUpload struct {
 	size                    int64
 	parts                   [][]byte
 	partSizes               []int64
+	lastPart                time.Time
 }
 
 func newFake(t *testing.T) *fakeFrameio {
@@ -299,7 +303,7 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 		f.folders[id] = fakeFolder{parent: parts[4], name: in.Data.Name}
 		f.mu.Unlock()
 		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": id, "name": in.Data.Name, "type": "folder", "parent_id": parts[4]}})
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": id, "name": in.Data.Name, "type": "folder", "parent_id": parts[4], "view_url": "https://next.frame.io/folder/" + id}})
 	case r.Method == "POST" && len(parts) == 7 && parts[5] == "files" && parts[6] == "local_upload":
 		var in struct {
 			Data struct {
@@ -323,6 +327,8 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": id, "name": in.Data.Name, "media_type": up.mediaType,
 			"file_size": in.Data.FileSize, "status": "created", "view_url": "https://next.frame.io/view/" + id, "upload_urls": urls}})
+	case r.Method == "GET" && len(parts) == 5 && parts[3] == "folders":
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": parts[4], "name": "dest", "type": "folder", "view_url": "https://next.frame.io/folder/" + parts[4]}})
 	case r.Method == "GET" && len(parts) == 6 && parts[3] == "folders" && parts[5] == "children":
 		var data []any
 		f.mu.Lock()
@@ -337,15 +343,20 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		up := f.uploads[parts[4]]
 		complete := up != nil
+		failed := false
 		if up != nil {
 			for _, p := range up.parts {
 				if p == nil {
 					complete = false
 				}
 			}
+			if complete && time.Since(up.lastPart) < f.assemblyTime {
+				complete = false
+			}
+			failed = complete && up.name == f.failAssembly
 		}
 		f.mu.Unlock()
-		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": parts[4], "upload_complete": complete, "upload_failed": false, "filetype": "video"}})
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": parts[4], "upload_complete": complete && !failed, "upload_failed": failed, "filetype": "video"}})
 	default:
 		http.NotFound(w, r)
 	}
@@ -375,6 +386,9 @@ func (f *fakeFrameio) s3(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rejected", 400)
 		return
 	}
+	if d := time.Duration(f.putDelay.Load()); d > 0 {
+		time.Sleep(d)
+	}
 	n := f.putCount.Add(1)
 	if f.putFailEvery > 0 && n%f.putFailEvery == 0 {
 		http.Error(w, "slow down", 503)
@@ -387,6 +401,7 @@ func (f *fakeFrameio) s3(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	up.parts[idx] = body
+	up.lastPart = time.Now()
 	f.mu.Unlock()
 	w.WriteHeader(200)
 }
@@ -455,7 +470,6 @@ func (s *memSecrets) Set(k, v string) error {
 func newTestManager(t *testing.T, fake *fakeFrameio, streams, segMB int) *Manager {
 	t.Helper()
 	share.GraphQLURL = fake.srv.URL + "/graphql"
-	statusPollDelays = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 50 * time.Millisecond}
 	dir := t.TempDir()
 	h, err := history.Open(dir, dir)
 	if err != nil {
@@ -468,6 +482,7 @@ func newTestManager(t *testing.T, fake *fakeFrameio, streams, segMB int) *Manage
 	settings := func() config.Settings { return config.Settings{Streams: streams, SegmentMB: segMB} }
 	m := NewManager(c, h, settings)
 	m.Secrets = &memSecrets{m: map[string]string{}}
+	m.VerifyDelays = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 50 * time.Millisecond}
 	return m
 }
 

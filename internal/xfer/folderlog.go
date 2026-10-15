@@ -129,6 +129,9 @@ func (j *Job) folderLogText() string {
 	if j.Kind == "upload" {
 		w("From         %s\n", strings.Join(j.logDirs(), ", "))
 		w("To           Frame.io / %s\n", rec.Dest)
+		if rec.Link != "" {
+			w("Frame.io     %s\n", rec.Link)
+		}
 	} else {
 		w("Link         %s\n", rec.Source)
 		w("To           %s\n", rec.Dest)

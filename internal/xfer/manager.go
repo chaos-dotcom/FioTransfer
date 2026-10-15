@@ -64,6 +64,7 @@ type File struct {
 
 	done    atomic.Int64
 	retries atomic.Int64
+	detail  string // e.g. part count and speed, for the log
 
 	mu       sync.Mutex
 	status   Status
@@ -129,6 +130,11 @@ type Job struct {
 	logRoot    string // download root for the folder log
 	logName    string
 
+	link         string // Frame.io link to the uploaded files (guarded by mu)
+	linkFromFile bool   // single-file upload: the file's own page is the link
+	userCanceled atomic.Bool
+	verifyWG     sync.WaitGroup
+
 	watchLog   bool        // append to a daily watch-folder log
 	onFileDone func(*File) // called after each file finishes (watch folders)
 	onFinish   func(*Job)
@@ -152,6 +158,25 @@ type Job struct {
 }
 
 func (j *Job) addTotal(n int64) { j.total.Add(n) }
+
+func (j *Job) setLink(u string) {
+	if u == "" {
+		return
+	}
+	j.mu.Lock()
+	j.link = u
+	j.mu.Unlock()
+	j.mgr.touch()
+}
+
+// linkToFolder sets the link to a Frame.io folder's page (one quick API call).
+func (j *Job) linkToFolder(folderID string) {
+	ctx, cancel := context.WithTimeout(j.ctx, 10*time.Second)
+	defer cancel()
+	if f, err := j.mgr.API.Folder(ctx, j.AccountID, folderID); err == nil {
+		j.setLink(f.ViewURL)
+	}
+}
 
 // setFiles publishes the job's file list (read concurrently by the UI).
 func (j *Job) setFiles(fs []*File) {
@@ -209,17 +234,21 @@ type Manager struct {
 	Settings func() config.Settings
 	// OnUpdate receives a fresh snapshot whenever something changes (≤ 2/sec).
 	OnUpdate func(Snapshot)
+	// VerifyDelays spaces out the post-upload Frame.io status checks.
+	VerifyDelays []time.Duration
 
 	mu    sync.Mutex
 	jobs  []*Job
 	dirty atomic.Bool
+
+	progressLogged map[string]time.Time // last progress line per running job
 
 	caffeinate *exec.Cmd
 }
 
 func NewManager(a *api.Client, h *history.Store, settings func() config.Settings) *Manager {
 	s := settings()
-	m := &Manager{API: a, Hist: h, Settings: settings, Limiter: NewLimiter(s.Streams), Secrets: keychainStore{}}
+	m := &Manager{API: a, Hist: h, Settings: settings, Limiter: NewLimiter(s.Streams), Secrets: keychainStore{}, VerifyDelays: verifyDelays}
 	h.MarkInterrupted()
 	go m.loop()
 	return m
@@ -242,6 +271,7 @@ func (m *Manager) loop() {
 		}
 		m.mu.Unlock()
 		m.keepAwake(active)
+		m.logProgress()
 		if (active || m.dirty.Swap(false)) && m.OnUpdate != nil {
 			m.OnUpdate(m.Snapshot())
 		}
@@ -292,8 +322,10 @@ func (m *Manager) job(id string) *Job {
 	return nil
 }
 
+// Cancel stops a job at the user's request (shutdown uses CancelAll instead).
 func (m *Manager) Cancel(id string) {
 	if j := m.job(id); j != nil {
+		j.userCanceled.Store(true)
 		j.cancel()
 	}
 }
@@ -658,10 +690,18 @@ func (j *Job) runUpload() {
 	if len(dirs) > 0 {
 		j.setPhase(fmt.Sprintf("Creating %d folders on Frame.io…", len(dirs)))
 	}
-	ids, err := ensureFolders(j.ctx, j.mgr.API, j.AccountID, j.FolderID, dirs)
+	ids, urls, err := ensureFolders(j.ctx, j.mgr.API, j.AccountID, j.FolderID, dirs)
 	if err != nil {
 		j.fail(err)
 		return
+	}
+	// Link: the uploaded folder, the single file, or else the destination folder.
+	if top := topFolder(j.paths, items); top != "" && urls[top] != "" {
+		j.setLink(urls[top])
+	} else if len(items) == 1 {
+		j.linkFromFile = true
+	} else {
+		j.linkToFolder(j.FolderID)
 	}
 	list := make([]*File, 0, len(items))
 	for i, it := range items {
@@ -727,9 +767,14 @@ func (m *Manager) Retry(id, passphrase string) (*Job, error) {
 			}
 		}
 		ids := map[string]string{"": j.FolderID}
+		if len(todo) == 1 {
+			j.linkFromFile = true
+		} else {
+			j.linkToFolder(j.FolderID)
+		}
 		if len(need) > 0 {
 			var err error
-			ids, err = ensureFolders(j.ctx, m.API, j.AccountID, j.FolderID, dirsFor(need))
+			ids, _, err = ensureFolders(j.ctx, m.API, j.AccountID, j.FolderID, dirsFor(need))
 			if err != nil {
 				j.fail(err)
 				return
@@ -804,7 +849,7 @@ loop:
 				f.status = Canceled
 			case err != nil:
 				f.status, f.err = Failed, err.Error()
-			case f.status != Skipped:
+			case f.status != Skipped && f.status != Failed:
 				f.status = Done
 			}
 			st, e := f.status, f.err
@@ -817,7 +862,11 @@ loop:
 			case Failed:
 				j.mgr.Hist.Log("%s FAILED   [%s] %s — %s", kindTag(j.Kind), j.ID, f.RelPath, e)
 			case Done:
-				j.mgr.Hist.Log("%s file ok  [%s] %s (%s)", kindTag(j.Kind), j.ID, f.RelPath, humanBytes(f.Size))
+				if f.detail != "" {
+					j.mgr.Hist.Log("%s file ok  [%s] %s (%s; %s)", kindTag(j.Kind), j.ID, f.RelPath, humanBytes(f.Size), f.detail)
+				} else {
+					j.mgr.Hist.Log("%s file ok  [%s] %s (%s)", kindTag(j.Kind), j.ID, f.RelPath, humanBytes(f.Size))
+				}
 			}
 			j.mgr.touch()
 		}(f)
@@ -855,6 +904,7 @@ func (j *Job) counts() (done, failed, skipped, canceled int) {
 }
 
 func (j *Job) finish() {
+	j.verifyWG.Wait()
 	j.mu.Lock()
 	j.finished = time.Now()
 	if !j.status.terminal() {
@@ -913,7 +963,7 @@ func (j *Job) record() history.Transfer {
 		Status: string(j.status), Error: j.err,
 		TotalBytes: j.total.Load(), DoneBytes: j.done.Load(),
 		FilesTotal: len(j.Files), FilesDone: done + skipped, FilesFailed: failed,
-		CreatedAt: j.created.UnixMilli(), PeakBps: j.meter.Peak(), Options: string(opts),
+		CreatedAt: j.created.UnixMilli(), PeakBps: j.meter.Peak(), Options: string(opts), Link: j.link,
 	}
 	if !j.started.IsZero() {
 		t.StartedAt = j.started.UnixMilli()
@@ -985,6 +1035,7 @@ type JobView struct {
 	FinishedAt  int64   `json:"finished_at"`
 	Elapsed     float64 `json:"elapsed"`
 	AvgSpeed    float64 `json:"avg_speed"`
+	Link        string  `json:"link"`
 }
 
 type FileView struct {
@@ -1019,7 +1070,7 @@ func (j *Job) view() JobView {
 	}
 	v := JobView{ID: j.ID, Kind: j.Kind, Title: j.Title, Source: j.Source, Dest: j.Dest, Status: j.status, Phase: j.phase,
 		Error: j.err, Total: j.total.Load(), Done: j.done.Load(), FilesTotal: len(j.Files), FilesDone: done + skipped,
-		FilesFailed: failed, FilesActive: active}
+		FilesFailed: failed, FilesActive: active, Link: j.link}
 	if !j.status.terminal() {
 		v.Speed = j.meter.Rate()
 		if v.Speed > 1 && v.Total > v.Done {
@@ -1097,4 +1148,50 @@ func humanDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%02ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
+}
+
+// topFolder returns the relative path of the single folder being uploaded, if
+// the upload is exactly one folder.
+func topFolder(paths []string, items []scanned) string {
+	if len(paths) != 1 || len(items) == 0 {
+		return ""
+	}
+	if st, err := os.Stat(paths[0]); err != nil || !st.IsDir() {
+		return ""
+	}
+	return filepath.Base(filepath.Clean(paths[0]))
+}
+
+// logProgress writes a line per running job every minute, so a slow transfer
+// leaves a speed trace in the app log.
+func (m *Manager) logProgress() {
+	now := time.Now()
+	if m.progressLogged == nil {
+		m.progressLogged = map[string]time.Time{}
+	}
+	m.mu.Lock()
+	jobs := append([]*Job(nil), m.jobs...)
+	m.mu.Unlock()
+	for _, j := range jobs {
+		if j.Status() != Running {
+			delete(m.progressLogged, j.ID)
+			continue
+		}
+		last, ok := m.progressLogged[j.ID]
+		if !ok {
+			m.progressLogged[j.ID] = now
+			continue
+		}
+		if now.Sub(last) < time.Minute {
+			continue
+		}
+		m.progressLogged[j.ID] = now
+		v := j.view()
+		pct := 0.0
+		if v.Total > 0 {
+			pct = 100 * float64(v.Done) / float64(v.Total)
+		}
+		m.Hist.Log("%s progress [%s] %.0f%% %s of %s, %s/s, %d/%d streams busy", kindTag(j.Kind), j.ID, pct,
+			humanBytes(v.Done), humanBytes(v.Total), humanBytes(int64(v.Speed)), m.Limiter.Active(), m.Settings().Streams)
+	}
 }

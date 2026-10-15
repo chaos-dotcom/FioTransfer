@@ -238,6 +238,42 @@
   </div>
 </div>
 
+<!-- Watch folder editor -->
+<div class="modal hidden" id="watch-modal">
+  <div class="modal-box small">
+    <div class="modal-head">
+      <div class="modal-title">Edit watch folder</div>
+      <button class="icon-btn" id="we-close" title="Close"><svg viewBox="0 0 20 20"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+    </div>
+    <div class="edit-body">
+      <div class="edit-row">
+        <div class="edit-label">Folder</div>
+        <div class="edit-val trunc" id="we-local"></div>
+        <button class="btn" id="we-local-btn">Change…</button>
+      </div>
+      <div class="edit-row hidden" id="we-existing-row">
+        <div class="edit-label"></div>
+        <label class="check"><input type="checkbox" id="we-existing"><span>Include existing files</span></label>
+      </div>
+      <div class="edit-row">
+        <div class="edit-label">Upload to</div>
+        <div class="edit-val trunc" id="we-dest"></div>
+        <button class="btn" id="we-dest-btn">Change…</button>
+      </div>
+      <div class="edit-row hidden" id="we-canceled-row">
+        <div class="edit-label">Canceled</div>
+        <div class="edit-val" id="we-canceled"></div>
+        <button class="btn" id="we-requeue">Upload them</button>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <div class="grow"></div>
+      <button class="btn subtle" id="we-cancel">Cancel</button>
+      <button class="btn primary" id="we-save">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Destination picker -->
 <div class="modal hidden" id="dest-modal">
   <div class="modal-box">

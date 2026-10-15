@@ -19,6 +19,9 @@ const I = {
   reveal: '<svg viewBox="0 0 20 20"><path d="M3 6.2c0-.7.5-1.2 1.2-1.2h3.4l1.6 1.7h6.6c.7 0 1.2.5 1.2 1.2v6.9c0 .7-.5 1.2-1.2 1.2H4.2c-.7 0-1.2-.5-1.2-1.2z" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>',
   chevron: '<svg viewBox="0 0 20 20"><path d="M7 8l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   chevronUp: '<svg viewBox="0 0 20 20"><path d="M7 12l3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  open: '<svg viewBox="0 0 20 20"><path d="M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12M11 4h5v5M16 4l-7 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  copy: '<svg viewBox="0 0 20 20"><rect x="7" y="7" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M13 7V5.5A1.5 1.5 0 0 0 11.5 4h-6A1.5 1.5 0 0 0 4 5.5v6A1.5 1.5 0 0 0 5.5 13H7" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>',
+  pencil: '<svg viewBox="0 0 20 20"><path d="M12.8 4.7l2.5 2.5M4 16l.7-3.2 8.6-8.6a1.2 1.2 0 0 1 1.7 0l.8.8a1.2 1.2 0 0 1 0 1.7l-8.6 8.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>',
   external: '<svg viewBox="0 0 20 20" width="12" height="12"><path d="M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12M11 4h5v5M16 4l-7 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
 
@@ -76,6 +79,10 @@ function toast(msg, kind = 'info', ms = 5000) {
   setTimeout(() => el.remove(), ms);
 }
 const errMsg = (e) => (e && e.message) || String(e);
+function copyLink(url) {
+  window.runtime.ClipboardSetText(url);
+  toast('Link copied', 'ok', 2000);
+}
 
 // ---------- state ----------
 const S = {
@@ -127,7 +134,9 @@ function bindUI() {
     if (a) { e.preventDefault(); call('OpenURL', a.dataset.url); }
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !$('#dest-modal').classList.contains('hidden')) closeDest();
+    if (e.key !== 'Escape') return;
+    if (!$('#dest-modal').classList.contains('hidden')) closeDest();
+    else if (!$('#watch-modal').classList.contains('hidden')) closeWatchEdit();
   });
 
   const inspectSoon = debounce(inspectLink, 450);
@@ -182,6 +191,22 @@ function bindUI() {
   });
 
   $('#watch-add').addEventListener('click', addWatch);
+  $('#we-close').addEventListener('click', closeWatchEdit);
+  $('#we-cancel').addEventListener('click', closeWatchEdit);
+  $('#we-save').addEventListener('click', saveWatchEdit);
+  $('#we-local-btn').addEventListener('click', async () => {
+    const p = await call('PickFolder');
+    if (!p) return;
+    WE.local = p;
+    renderWatchEdit();
+  });
+  $('#we-dest-btn').addEventListener('click', () => openDest('pick', (d) => { Object.assign(WE, d); renderWatchEdit(); }));
+  $('#we-requeue').addEventListener('click', async () => {
+    await call('RequeueCanceled', WE.id);
+    WE.canceled = 0;
+    renderWatchEdit();
+    loadWatches();
+  });
   $('#dest-close').addEventListener('click', closeDest);
   $('#dest-cancel').addEventListener('click', closeDest);
   $('#dest-choose').addEventListener('click', chooseDest);
@@ -440,6 +465,8 @@ function createJob(j) {
       <div class="cell r strong c-speed"></div>
       <div class="c-status"></div>
       <div class="actions">
+        <button class="icon-btn a-open" title="Open in Frame.io">${I.open}</button>
+        <button class="icon-btn a-copy" title="Copy Frame.io link">${I.copy}</button>
         <button class="icon-btn a-reveal" title="Show in Finder">${I.reveal}</button>
         <button class="icon-btn a-retry" title="Retry">${I.retry}</button>
         <button class="icon-btn a-cancel" title="Cancel">${I.x}</button>
@@ -449,6 +476,8 @@ function createJob(j) {
     <div class="error-line hidden"></div>
     <div class="row-detail hidden"><div class="files"></div></div>`;
   $('.a-cancel', el).onclick = () => call('Cancel', j.id);
+  $('.a-open', el).onclick = () => el.dataset.link && call('OpenURL', el.dataset.link);
+  $('.a-copy', el).onclick = () => el.dataset.link && copyLink(el.dataset.link);
   $('.a-retry', el).onclick = () => retry(j.id);
   $('.a-reveal', el).onclick = () => call('Reveal', el.dataset.dest || '').catch((e) => toast(errMsg(e), 'err'));
   $('.a-files', el).onclick = () => toggleFiles(j.id, el);
@@ -461,6 +490,7 @@ function updateJob(el, j) {
   const terminal = TERMINAL.has(j.status);
   el.className = `row ${j.kind} ${j.status}`;
   el.dataset.dest = j.dest;
+  el.dataset.link = j.link || '';
   $('.name', el).textContent = j.title || (j.kind === 'upload' ? 'Upload' : 'Download');
   const sub = j.kind === 'upload' ? `To ${j.dest}` : `${shortLink(j.source)} → ${shortPath(j.dest)}`;
   $('.sub', el).textContent = j.phase && !terminal ? j.phase : sub;
@@ -490,6 +520,8 @@ function updateJob(el, j) {
   if (showErr) { err.textContent = j.error; err.title = j.error; }
 
   $('.a-cancel', el).classList.toggle('hidden', terminal);
+  $('.a-open', el).classList.toggle('hidden', !j.link);
+  $('.a-copy', el).classList.toggle('hidden', !j.link);
   $('.a-retry', el).classList.toggle('hidden', !(terminal && j.status !== 'done'));
   $('.a-reveal', el).classList.toggle('hidden', j.kind !== 'download' || !j.dest);
   $('.a-files', el).classList.toggle('hidden', j.files_total === 0);
@@ -559,12 +591,13 @@ async function retry(id) {
 // ---------- destination picker ----------
 const D = { stack: [], mode: 'upload', watchPath: '' };
 
-function openDest(mode = 'upload') {
+function openDest(mode = 'upload', onPick = null) {
   D.mode = mode;
+  D.onPick = onPick;
   $('#dest-existing-wrap').classList.toggle('hidden', mode !== 'watch');
   $('#dest-existing').checked = false;
   $('.modal-title').textContent = mode === 'watch' ? `${baseName(D.watchPath)} → Frame.io` : 'Upload to';
-  $('#dest-choose').textContent = mode === 'watch' ? 'Watch' : 'Upload here';
+  $('#dest-choose').textContent = mode === 'watch' ? 'Watch' : mode === 'pick' ? 'Choose' : 'Upload here';
   $('#dest-modal').classList.remove('hidden');
   D.stack = [];
   $('#newfolder-name').classList.add('hidden');
@@ -572,7 +605,7 @@ function openDest(mode = 'upload') {
 }
 function closeDest() {
   $('#dest-modal').classList.add('hidden');
-  S.pendingPaths = null;
+  if (D.mode !== 'pick') S.pendingPaths = null;
 }
 const destTop = () => D.stack[D.stack.length - 1];
 
@@ -632,6 +665,11 @@ function destLabel() {
 async function chooseDest() {
   const t = destTop();
   if (!t) return;
+  if (D.mode === 'pick') {
+    $('#dest-modal').classList.add('hidden');
+    if (D.onPick) D.onPick({ acct: D.stack[0].id, folder: t.folder_id, label: destLabel() });
+    return;
+  }
   if (D.mode === 'watch') {
     try {
       await call('AddWatch', D.watchPath, D.stack[0].id, t.folder_id, destLabel(), $('#dest-existing').checked);
@@ -692,6 +730,7 @@ async function loadHistory() {
         <div class="cell r">${fmtDur(dur)}</div>
         <div>${statusHTML(status, t.kind)}</div>
         <div class="actions">
+          ${t.link ? `<button class="icon-btn h-open" title="Open in Frame.io">${I.open}</button>` : ''}
           ${canRetry ? `<button class="icon-btn h-retry" title="Retry">${I.retry}</button>` : ''}
           ${t.kind === 'download' ? `<button class="icon-btn h-reveal" title="Show in Finder">${I.reveal}</button>` : ''}
         </div>
@@ -708,6 +747,7 @@ async function loadHistory() {
       loadHistory();
     });
     const r = $('.h-retry', row); if (r) r.onclick = () => retry(t.id);
+    const o = $('.h-open', row); if (o) o.onclick = () => call('OpenURL', t.link);
     const v = $('.h-reveal', row); if (v) v.onclick = () => call('Reveal', t.dest).catch((e) => toast(errMsg(e), 'err'));
     if (S.histExpanded.has(t.id)) renderHistoryDetails(t, $('.hist-detail', row));
   });
@@ -724,10 +764,12 @@ async function renderHistoryDetails(t, box) {
     ['Speed', t.avg_bps ? `${fmtSpeed(t.avg_bps)} average (${fmtMbit(t.avg_bps)})${t.peak_bps ? ` · ${fmtSpeed(t.peak_bps)} peak` : ''}` : '—'],
     ['Transfer ID', t.id],
   ];
+  if (t.link) meta.splice(2, 0, ['Frame.io', t.link]);
   if (t.error) meta.push(['Error', t.error]);
-  box.innerHTML = `<div class="meta">${meta.map(([k, v]) => `<span class="k">${esc(k)}</span><span class="v selectable">${esc(v)}</span>`).join('')}</div>
+  box.innerHTML = `<div class="meta">${meta.map(([k, v]) => `<span class="k">${esc(k)}</span>${k === 'Frame.io' ? `<span class="v"><a data-url="${esc(v)}">${esc(v)}</a> · <a class="copy-link" data-link="${esc(v)}">Copy</a></span>` : `<span class="v selectable">${esc(v)}</span>`}`).join('')}</div>
     <div class="files">${files.length ? fileRows(files, t.kind) : '<div class="files-more">No files</div>'}</div>`;
   bindReveal(box);
+  $$('a.copy-link', box).forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); copyLink(a.dataset.link); }));
 }
 
 // ---------- watch folders ----------
@@ -763,10 +805,12 @@ async function loadWatches() {
         <div class="cell-name"><div class="kind-icon">${I.folder}</div><div class="names"><div class="name">${esc(w.name)}</div><div class="sub" title="${esc(w.local_path)}">${esc(shortPath(w.local_path))}</div></div></div>
         <div class="cell" title="${esc(w.dest_label)}">${esc(w.dest_label)}</div>
         <div><span class="status ${w.state}" title="${esc(label)}"><span class="dot"></span><span class="trunc">${esc(label)}</span></span></div>
-        <div class="cell r">${w.uploaded}${w.failed ? ` <span style="color:var(--error-text)">· ${w.failed} failed</span>` : ''}</div>
+        <div class="cell r">${w.uploaded}${w.failed ? ` <span style="color:var(--error-text)">· ${w.failed} failed</span>` : ''}${w.canceled ? ` <span class="muted-note">· ${w.canceled} canceled</span>` : ''}</div>
         <div class="cell">${w.last_upload ? fmtDate(w.last_upload) : '—'}</div>
         <div class="actions">
           <button class="icon-btn w-toggle" title="${w.enabled ? 'Pause' : 'Resume'}">${w.enabled ? pause : play}</button>
+          <button class="icon-btn w-edit" title="Edit">${I.pencil}</button>
+          ${w.link ? `<button class="icon-btn w-open" title="Open in Frame.io">${I.open}</button>` : ''}
           <button class="icon-btn w-reveal" title="Show in Finder">${I.reveal}</button>
           <button class="icon-btn w-remove ${conf ? 'confirm' : ''}" title="Remove">${conf ? 'Remove' : trash}</button>
         </div>
@@ -778,6 +822,8 @@ async function loadWatches() {
     const w = byId[row.dataset.id];
     $('.w-toggle', row).onclick = async () => { await call('SetWatchEnabled', w.id, !w.enabled); loadWatches(); };
     $('.w-reveal', row).onclick = () => call('Reveal', w.local_path).catch((e) => toast(errMsg(e), 'err'));
+    $('.w-edit', row).onclick = () => openWatchEdit(w);
+    const wo = $('.w-open', row); if (wo) wo.onclick = () => call('OpenURL', w.link);
     $('.w-remove', row).onclick = async () => {
       if (W.confirm !== w.id) { W.confirm = w.id; loadWatches(); setTimeout(() => { if (W.confirm === w.id) { W.confirm = null; loadWatches(); } }, 3000); return; }
       W.confirm = null;
@@ -785,4 +831,34 @@ async function loadWatches() {
       loadWatches();
     };
   });
+}
+
+// ---------- watch folder editor ----------
+const WE = {};
+
+function openWatchEdit(w) {
+  Object.assign(WE, { id: w.id, local: w.local_path, origLocal: w.local_path, acct: w.account_id, folder: w.folder_id, label: w.dest_label, canceled: w.canceled });
+  $('#we-existing').checked = false;
+  renderWatchEdit();
+  $('#watch-modal').classList.remove('hidden');
+}
+
+function renderWatchEdit() {
+  $('#we-local').textContent = shortPath(WE.local);
+  $('#we-local').title = WE.local;
+  $('#we-dest').textContent = WE.label;
+  $('#we-dest').title = WE.label;
+  $('#we-existing-row').classList.toggle('hidden', WE.local === WE.origLocal);
+  $('#we-canceled-row').classList.toggle('hidden', !WE.canceled);
+  $('#we-canceled').textContent = `${WE.canceled} file${WE.canceled === 1 ? '' : 's'}`;
+}
+
+function closeWatchEdit() { $('#watch-modal').classList.add('hidden'); }
+
+async function saveWatchEdit() {
+  try {
+    await call('UpdateWatch', WE.id, WE.local, WE.acct, WE.folder, WE.label, $('#we-existing').checked);
+    closeWatchEdit();
+    loadWatches();
+  } catch (e) { toast(errMsg(e), 'err'); }
 }

@@ -146,6 +146,7 @@ func (a *App) trayLoop() {
 			}
 		}
 		traySet(status, title, loginEnabled())
+		setTransfersActive(active > 0)
 	}
 }
 
@@ -505,3 +506,9 @@ func (a *App) SetOpenAtLogin(on bool) (State, error) {
 	err := setLogin(on)
 	return a.GetState(), err
 }
+
+func (a *App) UpdateWatch(id, local, acct, folder, label string, includeExisting bool) error {
+	return a.wat.Update(id, local, acct, folder, label, includeExisting)
+}
+
+func (a *App) RequeueCanceled(id string) { a.wat.RequeueCanceled(id) }
