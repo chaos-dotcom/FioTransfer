@@ -12,7 +12,7 @@ FioTransfer is a desktop app that replaces Frame.io's Transfer app. It moves fil
 - **Uploads files and folders:** drop anything onto the window. Folders are recreated in Frame.io, and you get a link to the uploaded files right away.
 - **Runs at full speed:** each transfer is split across many parallel connections, measured at over 900 Mbit/s.
 - **Picks up where it stopped:** interrupted downloads continue from the last finished piece, and failed uploads can be retried from History.
-- **Watches folders:** anything that lands in a watched folder uploads automatically once it has finished copying.
+- **Watches folders:** pair a folder on your Mac with a Frame.io folder. New files upload once they've finished copying, download once they've finished uploading to Frame.io, or both ways with Mirror. Subfolders are kept, and nothing is ever deleted on either side.
 - **Logs every transfer:** each one is listed in History, with a log file saved next to the media.
 - **Keeps running in the menu bar:** close the window and transfers carry on. It can also start at login.
 - **Works from the command line:** the `fio` tool does downloads and uploads from scripts.
@@ -31,7 +31,7 @@ Or download the `.dmg` from [Releases](https://github.com/farbhaus/FioTransfer/r
 
 ## Set up uploads
 
-Downloads work straight away. Uploads need a free Adobe developer credential, set up once:
+Downloads from links work straight away. Uploads and watch folders need a free Adobe developer credential, set up once:
 
 1. In the [Adobe Developer Console](https://developer.adobe.com/console), create a project and add the **Frame.io API** with **User Authentication → OAuth Single Page App**.
 2. Set both the default redirect URI and the redirect URI pattern to `https://localhost:8765/callback`.

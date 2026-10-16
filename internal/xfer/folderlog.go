@@ -135,6 +135,12 @@ func (j *Job) folderLogText(dirs []string) string {
 		if rec.Link != "" {
 			w("Frame.io     %s\n", rec.Link)
 		}
+	} else if j.watchID != "" {
+		w("From         Frame.io / %s\n", rec.Source)
+		if rec.Link != "" {
+			w("Frame.io     %s\n", rec.Link)
+		}
+		w("To           %s\n", rec.Dest)
 	} else {
 		w("Link         %s\n", rec.Source)
 		w("To           %s\n", rec.Dest)

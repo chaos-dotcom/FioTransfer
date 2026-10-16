@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"fiotransfer/internal/history"
 )
 
 // Waiting for Frame.io to finish processing must not hold upload slots.
@@ -84,7 +86,7 @@ func TestWatchCancelPersists(t *testing.T) {
 	for i := 0; i < 6; i++ {
 		writeFile(t, filepath.Join(root, string(rune('a'+i))+".mov"), randBytes(int64(i), 50<<10))
 	}
-	x, err := w.Add(root, "acct", "dest", "P", true)
+	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +135,7 @@ func TestWatchShutdownDoesNotCancelFiles(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		writeFile(t, filepath.Join(root, string(rune('a'+i))+".mov"), randBytes(int64(i), 50<<10))
 	}
-	w.Add(root, "acct", "dest", "P", true)
+	w.Add(root, "acct", "dest", "P", history.DirUpload, true)
 	waitFor(t, "batch", 10*time.Second, func() bool { return fake.fileSeq.Load() > 0 })
 	w.Close()
 	m.CancelAll() // app quitting
@@ -151,14 +153,14 @@ func TestWatchEdit(t *testing.T) {
 	defer w.Close()
 	a, b, other := t.TempDir(), t.TempDir(), t.TempDir()
 	writeFile(t, filepath.Join(b, "old.mov"), randBytes(9, 500))
-	x, _ := w.Add(a, "acct", "dest", "P / A", false)
-	w.Add(other, "acct", "dest", "P / O", false)
+	x, _ := w.Add(a, "acct", "dest", "P / A", history.DirUpload, false)
+	w.Add(other, "acct", "dest", "P / O", history.DirUpload, false)
 
 	writeFile(t, filepath.Join(a, "new1.mov"), randBytes(1, 500))
 	waitFor(t, "new1", 10*time.Second, func() bool { return fake.assembled("dest")["new1.mov"] != nil })
 
 	// New destination applies to new files.
-	if err := w.Update(x.ID, a, "acct", "dest2", "P / B", false); err != nil {
+	if err := w.Update(x.ID, a, "acct", "dest2", "P / B", history.DirUpload, false); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(a, "new2.mov"), randBytes(2, 500))
@@ -168,7 +170,7 @@ func TestWatchEdit(t *testing.T) {
 	}
 
 	// New local folder: existing files skipped, new ones uploaded.
-	if err := w.Update(x.ID, b, "acct", "dest2", "P / B", false); err != nil {
+	if err := w.Update(x.ID, b, "acct", "dest2", "P / B", history.DirUpload, false); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(b, "new3.mov"), randBytes(3, 500))
@@ -177,7 +179,7 @@ func TestWatchEdit(t *testing.T) {
 	if fake.assembled("dest2")["old.mov"] != nil {
 		t.Error("existing file in the new folder was uploaded")
 	}
-	if err := w.Update(x.ID, other, "acct", "dest2", "P / B", false); err == nil {
+	if err := w.Update(x.ID, other, "acct", "dest2", "P / B", history.DirUpload, false); err == nil {
 		t.Error("expected error when pointing at a folder another watch uses")
 	}
 	if _, err := os.Stat(b); err != nil {

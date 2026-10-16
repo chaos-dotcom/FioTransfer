@@ -78,9 +78,23 @@ type fakeFrameio struct {
 	putDelay     atomic.Int64  // slow storage (ns)
 	assemblyTime time.Duration // Frame.io reports complete this long after the last part
 	failAssembly string        // Frame.io reports this file name as failed after upload
+
+	// files in the account (download watches)
+	seedSeq   atomic.Int64
+	remote    map[string]*fakeRemote
+	forbidden map[string]bool // GET files/{id} answers 403 (original not served yet)
+	noHeads   atomic.Bool     // listings leave out version stacks' head_version
+	fileGets  sync.Map        // file id -> *atomic.Int64, GET files/{id} calls
 }
 
 type fakeFolder struct{ parent, name string }
+
+// fakeRemote is a file or version stack in the account.
+type fakeRemote struct {
+	id, parent, name, status string
+	size                     int64
+	versions                 []*fakeRemote // version stack: oldest first
+}
 
 type fakeUpload struct {
 	parent, name, mediaType string
@@ -92,7 +106,8 @@ type fakeUpload struct {
 
 func newFake(t *testing.T) *fakeFrameio {
 	f := &fakeFrameio{t: t, shares: map[string]*fakeShare{}, assets: map[string]*fakeAsset{}, sig: map[string]int{},
-		pageSize: 2, folders: map[string]fakeFolder{}, uploads: map[string]*fakeUpload{}, partSize: 3 << 20}
+		pageSize: 2, folders: map[string]fakeFolder{}, uploads: map[string]*fakeUpload{}, partSize: 3 << 20,
+		remote: map[string]*fakeRemote{}, forbidden: map[string]bool{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -117,6 +132,78 @@ func (f *fakeFrameio) addShare(s *fakeShare) {
 		}
 	}
 	reg(s.root)
+}
+
+// addFolder puts a folder in the account (not counted in folderSeq).
+func (f *fakeFrameio) addFolder(parent, name string) string {
+	id := fmt.Sprintf("seed-folder-%d", f.seedSeq.Add(1))
+	f.mu.Lock()
+	f.folders[id] = fakeFolder{parent: parent, name: name}
+	f.mu.Unlock()
+	return id
+}
+
+func (f *fakeFrameio) newRemote(parent, name string, data []byte) *fakeRemote {
+	r := &fakeRemote{id: fmt.Sprintf("seed-file-%d", f.seedSeq.Add(1)), parent: parent, name: name, status: "uploaded", size: int64(len(data))}
+	f.assets[r.id] = &fakeAsset{typename: "FileAsset", id: r.id, name: name, data: data}
+	return r
+}
+
+// addRemote puts a finished upload in the account and returns its ID.
+func (f *fakeFrameio) addRemote(parent, name string, data []byte) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.newRemote(parent, name, data)
+	f.remote[r.id] = r
+	return r.id
+}
+
+// addStack puts a version stack in the account; the last version is the head.
+func (f *fakeFrameio) addStack(parent, name string, names []string, data [][]byte) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st := &fakeRemote{id: fmt.Sprintf("seed-stack-%d", f.seedSeq.Add(1)), parent: parent, name: name}
+	for i := range names {
+		st.versions = append(st.versions, f.newRemote(st.id, names[i], data[i]))
+	}
+	f.remote[st.id] = st
+	return st.id
+}
+
+func (f *fakeFrameio) setStatus(id, status string) {
+	f.mu.Lock()
+	f.remote[id].status = status
+	f.mu.Unlock()
+}
+
+func (f *fakeFrameio) forbid(id string, on bool) {
+	f.mu.Lock()
+	f.forbidden[id] = on
+	f.mu.Unlock()
+}
+
+// gets counts GET files/{id} calls for the IDs that match.
+func (f *fakeFrameio) gets(match func(id string) bool) int64 {
+	var n int64
+	f.fileGets.Range(func(k, v any) bool {
+		if match(k.(string)) {
+			n += v.(*atomic.Int64).Load()
+		}
+		return true
+	})
+	return n
+}
+
+// fileJSON renders an account file; f.mu must be held.
+func (f *fakeFrameio) fileJSON(r *fakeRemote) map[string]any {
+	return map[string]any{"id": r.id, "name": r.name, "type": "file", "parent_id": r.parent, "file_size": r.size, "status": r.status,
+		"created_at": time.Unix(1700000000+f.seedSeqOf(r.id), 0).UTC().Format(time.RFC3339)}
+}
+
+func (f *fakeFrameio) seedSeqOf(id string) int64 {
+	i := strings.LastIndex(id, "-")
+	n, _ := strconv.ParseInt(id[i+1:], 10, 64)
+	return n
 }
 
 func (f *fakeFrameio) bumpSig(id string) {
@@ -344,8 +431,72 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 				data = append(data, map[string]any{"id": id, "name": fd.name, "type": "folder", "parent_id": fd.parent})
 			}
 		}
+		for id, up := range f.uploads { // files uploaded through local_upload
+			if up.parent == parts[4] {
+				status := "uploaded"
+				for _, p := range up.parts {
+					if p == nil {
+						status = "created"
+					}
+				}
+				data = append(data, map[string]any{"id": id, "name": up.name, "type": "file", "parent_id": up.parent, "file_size": up.size, "status": status})
+			}
+		}
+		for _, r := range f.remote {
+			switch {
+			case r.parent != parts[4]:
+			case r.versions == nil:
+				data = append(data, f.fileJSON(r))
+			default:
+				st := map[string]any{"id": r.id, "name": r.name, "type": "version_stack", "parent_id": r.parent}
+				if !f.noHeads.Load() {
+					st["head_version"] = f.fileJSON(r.versions[len(r.versions)-1])
+				}
+				data = append(data, st)
+			}
+		}
 		f.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{"data": data, "links": map[string]any{"next": nil}})
+	case r.Method == "GET" && len(parts) == 6 && parts[3] == "version_stacks" && parts[5] == "children":
+		var data []any
+		f.mu.Lock()
+		if st := f.remote[parts[4]]; st != nil {
+			for _, v := range st.versions {
+				data = append(data, f.fileJSON(v))
+			}
+		}
+		f.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"data": data, "links": map[string]any{"next": nil}})
+	case r.Method == "GET" && len(parts) == 5 && parts[3] == "files":
+		id := parts[4]
+		c, _ := f.fileGets.LoadOrStore(id, new(atomic.Int64))
+		c.(*atomic.Int64).Add(1)
+		f.mu.Lock()
+		forbidden := f.forbidden[id]
+		a := f.assets[id]
+		if up := f.uploads[id]; up != nil && a == nil { // serve an uploaded file's parts
+			var buf bytes.Buffer
+			for _, p := range up.parts {
+				buf.Write(p)
+			}
+			a = &fakeAsset{typename: "FileAsset", id: id, name: up.name, data: buf.Bytes()}
+			f.assets[id] = a
+		}
+		sig := f.sig[id]
+		f.mu.Unlock()
+		switch {
+		case forbidden:
+			http.Error(w, `{"errors":[{"detail":"forbidden"}]}`, 403)
+		case a == nil:
+			http.Error(w, `{"errors":[{"detail":"not found"}]}`, 404)
+		default:
+			if r.URL.Query().Get("include") != "media_links.original" {
+				f.t.Errorf("GET file without media_links.original: %s", r.URL.RawQuery)
+			}
+			url := fmt.Sprintf("%s/data/%s?sig=%d", f.srv.URL, id, sig)
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": id, "name": a.name, "type": "file",
+				"media_links": map[string]any{"original": map[string]any{"download_url": url}}}})
+		}
 	case r.Method == "GET" && len(parts) == 6 && parts[3] == "files" && parts[5] == "status":
 		f.mu.Lock()
 		up := f.uploads[parts[4]]

@@ -90,6 +90,8 @@ func Open(dir, logDir string) (*Store, error) {
 	}
 	// Columns added after the first release.
 	addColumn(db, "transfers", "link", "TEXT")
+	addColumn(db, "watches", "direction", "TEXT NOT NULL DEFAULT 'upload'")
+	addColumn(db, "watches", "ignore_remote", "INTEGER NOT NULL DEFAULT 0")
 	return &Store{db: db, logDir: logDir}, nil
 }
 

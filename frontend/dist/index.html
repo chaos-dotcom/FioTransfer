@@ -106,7 +106,7 @@
       </header>
       <div class="list">
         <div class="list-head watch-grid">
-          <span>Folder</span><span>Uploads to</span><span>Status</span><span class="r w-uploaded">Uploaded</span><span class="w-last">Last upload</span><span></span>
+          <span>Folder</span><span>Frame.io</span><span>Status</span><span class="r w-uploaded">Files</span><span class="w-last">Last transfer</span><span></span>
         </div>
         <div id="watch-body"></div>
         <div class="empty hidden" id="watch-empty">
@@ -251,19 +251,25 @@
         <div class="edit-val trunc" id="we-local"></div>
         <button class="btn" id="we-local-btn">Change…</button>
       </div>
+      <div class="edit-row">
+        <div class="edit-label">Direction</div>
+        <div class="segmented" id="we-dir">
+          <button data-dir="upload" title="New files here go to Frame.io">Upload</button><button data-dir="download" title="New files on Frame.io come here">Download</button><button data-dir="mirror" title="New files go both ways. Nothing is deleted.">Mirror</button>
+        </div>
+      </div>
+      <div class="edit-row">
+        <div class="edit-label">Frame.io</div>
+        <div class="edit-val trunc" id="we-dest"></div>
+        <button class="btn" id="we-dest-btn">Change…</button>
+      </div>
       <div class="edit-row hidden" id="we-existing-row">
         <div class="edit-label"></div>
         <label class="check"><input type="checkbox" id="we-existing"><span>Include existing files</span></label>
       </div>
-      <div class="edit-row">
-        <div class="edit-label">Upload to</div>
-        <div class="edit-val trunc" id="we-dest"></div>
-        <button class="btn" id="we-dest-btn">Change…</button>
-      </div>
       <div class="edit-row hidden" id="we-canceled-row">
         <div class="edit-label">Canceled</div>
         <div class="edit-val" id="we-canceled"></div>
-        <button class="btn" id="we-requeue">Upload them</button>
+        <button class="btn" id="we-requeue">Transfer them</button>
       </div>
     </div>
     <div class="modal-foot">
@@ -279,6 +285,9 @@
   <div class="modal-box">
     <div class="modal-head">
       <div class="modal-title">Upload to</div>
+      <div class="segmented hidden" id="dest-dir">
+        <button data-dir="upload" title="New files here go to Frame.io">Upload</button><button data-dir="download" title="New files on Frame.io come here">Download</button><button data-dir="mirror" title="New files go both ways. Nothing is deleted.">Mirror</button>
+      </div>
       <button class="icon-btn" id="dest-close" title="Close"><svg viewBox="0 0 20 20"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
     </div>
     <div class="crumbs" id="dest-crumbs"></div>

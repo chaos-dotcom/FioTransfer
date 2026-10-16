@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"fiotransfer/internal/history"
 	"fiotransfer/internal/share"
 )
 
@@ -24,7 +25,7 @@ func TestRetryWatchBatchStaysInWatch(t *testing.T) {
 	fake.failChildren.Store(true) // the batch fails before uploading anything
 	w := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond)
 	defer w.Close()
-	if _, err := w.Add(root, "acct", "dest", "P", false); err != nil {
+	if _, err := w.Add(root, "acct", "dest", "P", history.DirUpload, false); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(root, "sub/new.mov"), randBytes(3, 1000))
@@ -52,6 +53,7 @@ func TestRetryWatchBatchStaysInWatch(t *testing.T) {
 		t.Fatalf("Retry = %v, %v; want the watch to take it", j, err)
 	}
 	waitFor(t, "retried file", 10*time.Second, func() bool { return fake.assembled("dest")["sub/new.mov"] != nil })
+	waitFor(t, "batch to finish", 10*time.Second, func() bool { return !m.Active() }) // it writes its log into root
 	if got := fake.assembled("dest"); len(got) != 1 {
 		t.Errorf("uploaded %d files, want only sub/new.mov", len(got))
 	}

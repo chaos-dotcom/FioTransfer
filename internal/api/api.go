@@ -215,12 +215,16 @@ type Project struct {
 }
 
 type Asset struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	FileSize int64  `json:"file_size"`
-	ParentID string `json:"parent_id"`
-	ViewURL  string `json:"view_url"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"` // file | folder | version_stack
+	FileSize  int64  `json:"file_size"`
+	ParentID  string `json:"parent_id"`
+	ViewURL   string `json:"view_url"`
+	Status    string `json:"status"` // files: created (still uploading) | uploaded | transcoded
+	CreatedAt string `json:"created_at"`
+	// HeadVersion is a version stack's current file, when the listing includes it.
+	HeadVersion *Asset `json:"head_version"`
 }
 
 type UploadPart struct {
@@ -295,6 +299,37 @@ func (c *Client) FileStatus(ctx context.Context, acct, file string) (*FileStatus
 		return nil, err
 	}
 	return &r.Data, nil
+}
+
+// VersionStackChildren lists the files in a version stack.
+func (c *Client) VersionStackChildren(ctx context.Context, acct, stack string) ([]Asset, error) {
+	return list[Asset](ctx, c, "/v4/accounts/"+acct+"/version_stacks/"+stack+"/children", url.Values{"page_size": {"100"}})
+}
+
+// ErrNoOriginal means Frame.io returned no download link for a file's original
+// (downloads are disabled for it, or it's watermarked for this user).
+var ErrNoOriginal = errors.New("Frame.io offers no download of this file's original")
+
+// DownloadURL returns a signed URL for a file's original. A 403 means the user
+// may not download it, or Frame.io hasn't finished processing the upload yet.
+func (c *Client) DownloadURL(ctx context.Context, acct, file string) (string, error) {
+	var r struct {
+		Data struct {
+			MediaLinks struct {
+				Original *struct {
+					DownloadURL *string `json:"download_url"`
+				} `json:"original"`
+			} `json:"media_links"`
+		}
+	}
+	q := url.Values{"include": {"media_links.original"}}
+	if err := c.do(ctx, "GET", "/v4/accounts/"+acct+"/files/"+file, q, nil, &r); err != nil {
+		return "", err
+	}
+	if o := r.Data.MediaLinks.Original; o != nil && o.DownloadURL != nil && *o.DownloadURL != "" {
+		return *o.DownloadURL, nil
+	}
+	return "", ErrNoOriginal
 }
 
 // Folder returns a folder, including its Frame.io view URL.

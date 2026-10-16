@@ -22,6 +22,7 @@ const I = {
   open: '<svg viewBox="0 0 20 20"><path d="M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12M11 4h5v5M16 4l-7 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   copy: '<svg viewBox="0 0 20 20"><rect x="7" y="7" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M13 7V5.5A1.5 1.5 0 0 0 11.5 4h-6A1.5 1.5 0 0 0 4 5.5v6A1.5 1.5 0 0 0 5.5 13H7" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>',
   pencil: '<svg viewBox="0 0 20 20"><path d="M12.8 4.7l2.5 2.5M4 16l.7-3.2 8.6-8.6a1.2 1.2 0 0 1 1.7 0l.8.8a1.2 1.2 0 0 1 0 1.7l-8.6 8.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>',
+  sync: '<svg viewBox="0 0 20 20"><path d="M6.5 15V5m0 0L3.8 7.7M6.5 5l2.7 2.7M13.5 5v10m0 0l-2.7-2.7m2.7 2.7l2.7-2.7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   external: '<svg viewBox="0 0 20 20" width="12" height="12"><path d="M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12M11 4h5v5M16 4l-7 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
 
@@ -194,8 +195,10 @@ function bindUI() {
   $('#we-close').addEventListener('click', closeWatchEdit);
   $('#we-cancel').addEventListener('click', closeWatchEdit);
   $('#we-save').addEventListener('click', saveWatchEdit);
+  $$('#dest-dir button').forEach((b) => b.addEventListener('click', () => { D.watchDir = b.dataset.dir; renderDestTitle(); }));
+  $$('#we-dir button').forEach((b) => b.addEventListener('click', () => { WE.dir = b.dataset.dir; renderWatchEdit(); }));
   $('#we-local-btn').addEventListener('click', async () => {
-    const p = await call('PickFolder');
+    const p = await call('PickWatchFolder');
     if (!p) return;
     WE.local = p;
     renderWatchEdit();
@@ -595,25 +598,32 @@ async function refreshFiles(id, force) {
 async function retry(id) {
   try {
     const newId = await call('Retry', id, '');
-    if (!newId) { toast('Its watch folder will upload these files again', 'ok'); loadWatches(); return; }
+    if (!newId) { toast('Its watch folder will retry these files', 'ok'); loadWatches(); return; }
     showView('transfers');
   } catch (e) { toast(errMsg(e), 'err'); }
 }
 
 // ---------- destination picker ----------
-const D = { stack: [], mode: 'upload', watchPath: '' };
+const D = { stack: [], mode: 'upload', watchPath: '', watchDir: 'upload' };
+const DIR_ARROW = { upload: '→', download: '←', mirror: '↔' };
 
 function openDest(mode = 'upload', onPick = null) {
   D.mode = mode;
   D.onPick = onPick;
   $('#dest-existing-wrap').classList.toggle('hidden', mode !== 'watch');
+  $('#dest-dir').classList.toggle('hidden', mode !== 'watch');
   $('#dest-existing').checked = false;
-  $('#dest-modal .modal-title').textContent = mode === 'watch' ? `${baseName(D.watchPath)} → Frame.io` : 'Upload to';
+  renderDestTitle();
   $('#dest-choose').textContent = mode === 'watch' ? 'Watch' : mode === 'pick' ? 'Choose' : 'Upload here';
   $('#dest-modal').classList.remove('hidden');
   D.stack = [];
   $('#newfolder-name').classList.add('hidden');
   loadLevel(true);
+}
+function renderDestTitle() {
+  $$('#dest-dir button').forEach((b) => b.classList.toggle('active', b.dataset.dir === D.watchDir));
+  $('#dest-modal .modal-title').textContent = D.mode === 'watch' ? `${baseName(D.watchPath)} ${DIR_ARROW[D.watchDir]} Frame.io`
+    : D.mode === 'pick' ? 'Frame.io folder' : 'Upload to';
 }
 function closeDest() {
   $('#dest-modal').classList.add('hidden');
@@ -684,7 +694,7 @@ async function chooseDest() {
   }
   if (D.mode === 'watch') {
     try {
-      await call('AddWatch', D.watchPath, D.stack[0].id, t.folder_id, destLabel(), $('#dest-existing').checked);
+      await call('AddWatch', D.watchPath, D.stack[0].id, t.folder_id, destLabel(), D.watchDir, $('#dest-existing').checked);
       $('#dest-modal').classList.add('hidden');
       showView('watch');
     } catch (e) { toast(errMsg(e), 'err'); }
@@ -789,13 +799,18 @@ const W = { confirm: null };
 
 async function addWatch() {
   if (!ensureCanUpload()) return;
-  const p = await call('PickFolder');
+  const p = await call('PickWatchFolder');
   if (!p) return;
   D.watchPath = p;
+  D.watchDir = 'upload';
   openDest('watch');
 }
 
-const WATCH_STATUS = { watching: 'Watching', paused: 'Paused', uploading: 'Uploading', settling: 'Copying', error: 'Error' };
+const WATCH_STATUS = { watching: 'Watching', paused: 'Paused', uploading: 'Uploading', downloading: 'Downloading', settling: 'Copying', waiting: 'Waiting', error: 'Error' };
+const DIR_ICON = { upload: I.up, download: I.down, mirror: I.sync };
+const DIR_VERB = { upload: 'Uploads to', download: 'Downloads from', mirror: 'Mirrors' };
+const ups = (d) => d !== 'download';
+const downs = (d) => d !== 'upload';
 
 async function loadWatches() {
   let list;
@@ -811,14 +826,18 @@ async function loadWatches() {
   const trash = '<svg viewBox="0 0 20 20"><path d="M4.5 6h11M8 6V4.5h4V6M6 6l.7 9.5h6.6L14 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   $('#watch-body').innerHTML = list.map((w) => {
     const label = WATCH_STATUS[w.state] + (w.detail ? ` · ${w.detail}` : '');
+    const tip = w.state === 'waiting' ? `${w.detail} not ready on Frame.io yet` : label;
     const conf = W.confirm === w.id;
+    const dir = w.direction || 'upload';
+    const count = dir === 'mirror' ? `↑ ${w.uploaded}  ↓ ${w.downloaded}` : String(dir === 'download' ? w.downloaded : w.uploaded);
+    const countTip = [ups(dir) && `${w.uploaded} uploaded`, downs(dir) && `${w.downloaded} downloaded`, w.failed && `${w.failed} failed`, w.canceled && `${w.canceled} canceled`].filter(Boolean).join(' · ');
     return `<div class="row ${w.enabled ? '' : 'paused'}" data-id="${w.id}">
       <div class="row-main watch-grid">
         <div class="cell-name"><div class="kind-icon">${I.folder}</div><div class="names"><div class="name">${esc(w.name)}</div><div class="sub" title="${esc(w.local_path)}">${esc(shortPath(w.local_path))}</div></div></div>
-        <div class="cell" title="${esc(w.dest_label)}">${esc(w.dest_label)}</div>
-        <div><span class="status ${w.state}" title="${esc(label)}"><span class="dot"></span><span class="trunc">${esc(label)}</span></span></div>
-        <div class="cell r w-uploaded" title="${w.uploaded} uploaded${w.failed ? ` · ${w.failed} failed` : ''}${w.canceled ? ` · ${w.canceled} canceled` : ''}">${w.uploaded}${w.failed ? ` <span style="color:var(--error-text)">· ${w.failed} failed</span>` : ''}${w.canceled ? ` <span class="muted-note">· ${w.canceled} canceled</span>` : ''}</div>
-        <div class="cell w-last">${w.last_upload ? fmtDate(w.last_upload) : '—'}</div>
+        <div class="cell dir-cell" title="${esc(`${DIR_VERB[dir]} ${w.dest_label}`)}">${DIR_ICON[dir]}<span class="trunc">${esc(w.dest_label)}</span></div>
+        <div><span class="status ${w.state}" title="${esc(tip)}"><span class="dot"></span><span class="trunc">${esc(label)}</span></span></div>
+        <div class="cell r w-uploaded" title="${esc(countTip)}">${esc(count)}${w.failed ? ` <span style="color:var(--error-text)">· ${w.failed} failed</span>` : ''}${w.canceled ? ` <span class="muted-note">· ${w.canceled} canceled</span>` : ''}</div>
+        <div class="cell w-last">${w.last_transfer ? fmtDate(w.last_transfer) : '—'}</div>
         <div class="actions">
           <button class="icon-btn w-toggle" title="${w.enabled ? 'Pause' : 'Resume'}">${w.enabled ? pause : play}</button>
           <button class="icon-btn w-edit" title="Edit">${I.pencil}</button>
@@ -849,7 +868,9 @@ async function loadWatches() {
 const WE = {};
 
 function openWatchEdit(w) {
-  Object.assign(WE, { id: w.id, local: w.local_path, origLocal: w.local_path, acct: w.account_id, folder: w.folder_id, label: w.dest_label, canceled: w.canceled });
+  const dir = w.direction || 'upload';
+  Object.assign(WE, { id: w.id, local: w.local_path, acct: w.account_id, folder: w.folder_id, label: w.dest_label, dir, canceled: w.canceled,
+    orig: { local: w.local_path, acct: w.account_id, folder: w.folder_id, dir } });
   $('#we-existing').checked = false;
   renderWatchEdit();
   $('#watch-modal').classList.remove('hidden');
@@ -860,16 +881,26 @@ function renderWatchEdit() {
   $('#we-local').title = WE.local;
   $('#we-dest').textContent = WE.label;
   $('#we-dest').title = WE.label;
-  $('#we-existing-row').classList.toggle('hidden', WE.local === WE.origLocal);
+  $$('#we-dir button').forEach((b) => b.classList.toggle('active', b.dataset.dir === WE.dir));
+  $('#we-existing-row').classList.toggle('hidden', !freshSide());
   $('#we-canceled-row').classList.toggle('hidden', !WE.canceled);
+  $('#we-requeue').textContent = { upload: 'Upload them', download: 'Download them', mirror: 'Transfer them' }[WE.orig.dir];
   $('#we-canceled').textContent = `${WE.canceled} file${WE.canceled === 1 ? '' : 's'}`;
+}
+
+// Same rule as Watcher.Update: a side the watch takes files from starts over
+// when it's new or points elsewhere (for a mirror, when either end changes).
+function freshSide() {
+  const o = WE.orig, m = WE.dir === 'mirror';
+  const lc = WE.local !== o.local, dc = WE.folder !== o.folder || WE.acct !== o.acct;
+  return (ups(WE.dir) && (lc || (m && dc) || !ups(o.dir))) || (downs(WE.dir) && (dc || (m && lc) || !downs(o.dir)));
 }
 
 function closeWatchEdit() { $('#watch-modal').classList.add('hidden'); }
 
 async function saveWatchEdit() {
   try {
-    await call('UpdateWatch', WE.id, WE.local, WE.acct, WE.folder, WE.label, $('#we-existing').checked);
+    await call('UpdateWatch', WE.id, WE.local, WE.acct, WE.folder, WE.label, WE.dir, $('#we-existing').checked);
     closeWatchEdit();
     loadWatches();
   } catch (e) { toast(errMsg(e), 'err'); }

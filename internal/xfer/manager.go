@@ -278,8 +278,8 @@ type Manager struct {
 	// VerifyDelays spaces out the post-upload Frame.io status checks.
 	VerifyDelays []time.Duration
 	// RetryWatch re-queues a watch-folder batch's unfinished files in their
-	// watch instead of starting a separate upload (set by NewWatcher).
-	RetryWatch func(watchID, localPath string, rels []string) error
+	// watch instead of starting a separate transfer (set by NewWatcher).
+	RetryWatch func(watchID, localPath string, files []history.File) error
 
 	mu    sync.Mutex
 	jobs  []*Job
@@ -857,7 +857,7 @@ func (m *Manager) Retry(id, passphrase string) (*Job, error) {
 	}
 	var opts jobOptions
 	_ = json.Unmarshal([]byte(t.Options), &opts)
-	if t.Kind == "download" {
+	if t.Kind == "download" && opts.Watch == "" {
 		return m.StartDownload(DownloadOptions{Link: t.Source, Passphrase: passphrase, DestDir: t.Dest, Subfolder: opts.Subfolder})
 	}
 	files, err := m.Hist.Files(id)
@@ -876,11 +876,7 @@ func (m *Manager) Retry(id, passphrase string) (*Job, error) {
 		if m.RetryWatch == nil {
 			return nil, errors.New("watch folders aren't running")
 		}
-		rels := make([]string, len(todo))
-		for i, f := range todo {
-			rels[i] = f.RelPath
-		}
-		return nil, m.RetryWatch(opts.Watch, t.Source, rels)
+		return nil, m.RetryWatch(opts.Watch, t.Source, todo)
 	}
 	if len(files) == 0 {
 		// Never got past scanning: start over with the original paths.

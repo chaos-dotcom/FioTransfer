@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"fiotransfer/internal/history"
 )
 
 func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
@@ -29,11 +31,11 @@ func TestWatchFolder(t *testing.T) {
 	root := t.TempDir()
 	old := randBytes(51, 2000)
 	writeFile(t, filepath.Join(root, "old.mov"), old) // existed before the watch: ignored
-	x, err := w.Add(root, "acct", "dest", "P / Watch", false)
+	x, err := w.Add(root, "acct", "dest", "P / Watch", history.DirUpload, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Add(root, "acct", "dest", "P / Watch", false); err == nil {
+	if _, err := w.Add(root, "acct", "dest", "P / Watch", history.DirUpload, false); err == nil {
 		t.Error("expected duplicate watch to be rejected")
 	}
 
