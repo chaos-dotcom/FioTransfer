@@ -10,3 +10,6 @@
 # macOS
 .DS_Store
 /dist/
+
+# Local notes for AI-assisted development
+/CLAUDE.md
