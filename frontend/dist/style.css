@@ -102,6 +102,12 @@ svg { flex: none; }
 .nav-item span:nth-of-type(1) { flex: 1; }
 .count { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--brand); color: #fff; font-size: 11px; font-weight: 600; display: grid; place-items: center; font-variant-numeric: tabular-nums; }
 
+.update-card { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; padding: 10px 10px 10px 12px; background: var(--card); border: 1px solid var(--border-2); border-radius: var(--r); }
+.uc-text { flex: 1; min-width: 0; line-height: 1.3; }
+.uc-title { color: var(--text); font-weight: 500; font-size: 12.5px; }
+.uc-sub { color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.err-text { color: var(--error-text); }
+#app-version { color: var(--text-2); font-weight: 400; margin-left: 4px; }
 .throughput { border-top: 1px solid var(--border); padding: 12px 10px 10px; display: flex; flex-direction: column; gap: 5px; }
 .tp-row { display: flex; justify-content: space-between; font-size: 12px; }
 .tp-label { color: var(--text-3); }

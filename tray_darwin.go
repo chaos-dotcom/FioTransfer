@@ -6,7 +6,7 @@ package main
 #include <stdlib.h>
 
 void fioTrayInit(void);
-void fioTraySet(const char *status, const char *title, int login);
+void fioTraySet(const char *status, const char *title, int login, const char *update);
 void fioSyncDock(void);
 void fioActivate(void);
 void fioSetActive(int on);
@@ -31,6 +31,7 @@ const (
 	trayLogin  = 2
 	trayQuit   = 3
 	trayReopen = 4
+	trayUpdate = 5
 )
 
 func trayInit(h func(int)) {
@@ -38,16 +39,18 @@ func trayInit(h func(int)) {
 	C.fioTrayInit()
 }
 
-// traySet updates the menu's status line and the text next to the icon.
-func traySet(status, title string, login bool) {
-	cs, ct := C.CString(status), C.CString(title)
+// traySet updates the menu's status line, the text next to the icon and the
+// update item (hidden when update is "").
+func traySet(status, title string, login bool, update string) {
+	cs, ct, cu := C.CString(status), C.CString(title), C.CString(update)
 	defer C.free(unsafe.Pointer(cs))
 	defer C.free(unsafe.Pointer(ct))
+	defer C.free(unsafe.Pointer(cu))
 	l := 0
 	if login {
 		l = 1
 	}
-	C.fioTraySet(cs, ct, C.int(l))
+	C.fioTraySet(cs, ct, C.int(l), cu)
 }
 
 func syncDock()    { C.fioSyncDock() }

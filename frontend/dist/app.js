@@ -99,6 +99,7 @@ const S = {
   histKind: '',
   histExpanded: new Set(),
   pendingPaths: null,
+  update: null,
 };
 
 // ---------- boot ----------
@@ -122,6 +123,9 @@ async function init() {
   window.runtime.EventsOn('files-dropped', onDrop);
   window.runtime.EventsOn('menu', onMenu);
   window.runtime.EventsOn('state-changed', async () => { S.state = await call('GetState'); renderState(); });
+  window.runtime.EventsOn('update', (u) => { S.update = u; renderUpdate(); });
+  S.update = await call('UpdateStatus');
+  renderUpdate();
   loadWatches();
   setInterval(loadWatches, 2000);
 }
@@ -181,6 +185,17 @@ function bindUI() {
     try { S.state = await call('SetOpenAtLogin', e.target.checked); renderState(); } catch (err) { toast(errMsg(err), 'err'); }
   });
   $('#folder-logs').addEventListener('change', (e) => saveSettings({ no_folder_logs: !e.target.checked }));
+  $('#auto-update').addEventListener('change', async (e) => {
+    await saveSettings({ no_update_check: !e.target.checked });
+    if (e.target.checked) S.update = await call('CheckForUpdate');
+    renderUpdate();
+  });
+  $('#update-btn').addEventListener('click', async () => {
+    if (S.update?.available) return installUpdate();
+    S.update = await call('CheckForUpdate');
+    renderUpdate();
+  });
+  $('#uc-btn').addEventListener('click', installUpdate);
   $('#change-default-dir').addEventListener('click', async () => {
     const p = await call('PickDownloadDir', S.state.settings.download_dir);
     if (p) await saveSettings({ download_dir: p });
@@ -229,6 +244,7 @@ function showView(v) {
 }
 
 function onMenu(what) {
+  if (what === 'update') { showView('settings'); return; }
   if (what === 'download') { showView('transfers'); $('#link').focus(); $('#link').select(); return; }
   if (what === 'upload-files') pickFiles();
   if (what === 'upload-folder') pickFolder();
@@ -267,6 +283,7 @@ function renderState() {
   $('#default-dir').title = s.download_dir;
   $('#folder-logs').checked = !s.no_folder_logs;
   $('#open-login').checked = !!st.open_at_login;
+  $('#auto-update').checked = !s.no_update_check;
   $('#log-path').textContent = shortPath(st.log_file || st.log_dir);
   $('#about').textContent = `FioTransfer ${st.version}`;
 
@@ -334,6 +351,47 @@ async function login() {
   if (seq !== loginSeq) return;
   S.state = st;
   renderState();
+}
+
+// ---------- updates ----------
+function renderUpdate() {
+  const u = S.update;
+  if (!u) return;
+  const dev = u.blocker === 'development build';
+  const busy = u.state === 'downloading' || u.state === 'restarting';
+  const progress = u.state === 'downloading' ? `Downloading… ${Math.floor((u.progress || 0) * 100)}%` : 'Restarting…';
+
+  $('#update-card').classList.toggle('hidden', !u.available && !busy);
+  $('.uc-title').textContent = busy ? 'Updating' : u.blocker ? 'New version' : 'Update available';
+  $('#uc-sub').textContent = busy ? progress : `Version ${u.latest}`;
+  $('#uc-btn').classList.toggle('hidden', busy);
+  $('#uc-btn').textContent = u.blocker ? 'Download' : 'Update';
+
+  $('#app-version').textContent = u.current;
+  let line;
+  if (dev) line = 'Development build';
+  else if (busy) line = esc(progress);
+  else if (u.state === 'checking') line = 'Checking…';
+  else if (u.available) line = `${esc(u.latest)} available · <a data-url="${esc(u.url)}">What's new</a>${u.blocker ? ` · ${esc(u.blocker)}` : ''}`;
+  else if (u.checked_at && !u.error) line = 'Up to date';
+  else line = '';
+  if (u.error) line += `${line ? ' · ' : ''}<span class="err-text">${esc(u.error)}</span>`;
+  $('#update-line').innerHTML = line;
+  $('#update-line').title = u.checked_at ? `Checked ${fmtDate(u.checked_at)}` : '';
+
+  $('#auto-update').closest('.set-line').classList.toggle('hidden', dev);
+  const btn = $('#update-btn');
+  btn.classList.toggle('hidden', dev);
+  btn.disabled = busy || u.state === 'checking';
+  btn.classList.toggle('primary', !!u.available && !u.blocker);
+  btn.textContent = u.available ? (u.blocker ? 'Download' : 'Update') : 'Check now';
+}
+
+async function installUpdate() {
+  const u = S.update;
+  if (!u?.available) return;
+  if (u.blocker) return call('OpenURL', u.url); // can't replace itself here: get it from the release page
+  try { await call('InstallUpdate'); } catch (e) { toast(errMsg(e), 'err'); }
 }
 
 // ---------- uploads ----------

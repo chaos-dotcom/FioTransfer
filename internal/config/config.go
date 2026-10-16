@@ -22,6 +22,10 @@ type Settings struct {
 	DownloadDir string `json:"download_dir"`
 	// Write a transfer log next to the media (on by default).
 	NoFolderLogs bool `json:"no_folder_logs"`
+	// Ask GitHub for new releases (on by default).
+	NoUpdateCheck bool `json:"no_update_check"`
+	// The last release a notification was shown for.
+	UpdateNotified string `json:"update_notified"`
 
 	// Last upload destination, remembered for convenience.
 	LastAccountID   string `json:"last_account_id"`

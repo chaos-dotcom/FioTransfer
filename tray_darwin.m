@@ -12,6 +12,7 @@
 static NSStatusItem *fioItem;
 static NSMenuItem *fioStatusLine;
 static NSMenuItem *fioLoginItem;
+static NSMenuItem *fioUpdateItem;
 static FioTrayTarget *fioTarget;
 
 static NSMenuItem *fioAdd(NSMenu *m, NSString *title, int tag, NSString *key) {
@@ -37,6 +38,8 @@ void fioTrayInit(void) {
 		fioStatusLine.enabled = NO;
 		[m addItem:fioStatusLine];
 		[m addItem:[NSMenuItem separatorItem]];
+		fioUpdateItem = fioAdd(m, @"Update", 5, @"");
+		fioUpdateItem.hidden = YES;
 		fioAdd(m, @"Open FioTransfer", 1, @"");
 		fioLoginItem = fioAdd(m, @"Open at Login", 2, @"");
 		[m addItem:[NSMenuItem separatorItem]];
@@ -52,14 +55,17 @@ void fioTrayInit(void) {
 	});
 }
 
-void fioTraySet(const char *status, const char *title, int login) {
+void fioTraySet(const char *status, const char *title, int login, const char *update) {
 	NSString *s = [NSString stringWithUTF8String:status];
 	NSString *t = [NSString stringWithUTF8String:title];
+	NSString *u = [NSString stringWithUTF8String:update];
 	dispatch_async(dispatch_get_main_queue(), ^{
 		if (!fioItem) return;
 		fioStatusLine.title = s;
 		fioItem.button.title = t;
 		fioLoginItem.state = login ? NSControlStateValueOn : NSControlStateValueOff;
+		fioUpdateItem.hidden = u.length == 0;
+		if (u.length) fioUpdateItem.title = u;
 	});
 }
 

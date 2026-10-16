@@ -38,6 +38,11 @@
 
     <div class="grow"></div>
 
+    <div class="update-card hidden" id="update-card">
+      <div class="uc-text"><div class="uc-title">Update available</div><div class="uc-sub" id="uc-sub"></div></div>
+      <button class="btn sm primary" id="uc-btn">Update</button>
+    </div>
+
     <div class="throughput">
       <div class="tp-row"><span class="tp-label">Upload</span><span class="tp-val" id="speed-up">—</span></div>
       <div class="tp-row"><span class="tp-label">Download</span><span class="tp-val" id="speed-down">—</span></div>
@@ -182,6 +187,14 @@
             <div class="set-line">
               <div class="grow"><label for="open-login">Open at login</label></div>
               <label class="check"><input type="checkbox" id="open-login"></label>
+            </div>
+            <div class="set-line">
+              <div class="grow min0"><label>Version <span class="val" id="app-version"></span></label><div class="help" id="update-line"></div></div>
+              <button class="btn" id="update-btn">Check now</button>
+            </div>
+            <div class="set-line">
+              <div class="grow"><label for="auto-update">Check for updates</label></div>
+              <label class="check"><input type="checkbox" id="auto-update"></label>
             </div>
           </div>
         </div>

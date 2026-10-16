@@ -49,6 +49,9 @@ type App struct {
 
 	openAtLogin atomic.Bool // cached for the menu bar, refreshed every 30s
 	started     time.Time
+
+	upd      updater
+	updating atomic.Bool // quitting to restart into an update: don't ask about transfers
 }
 
 func NewApp() *App {
@@ -95,6 +98,7 @@ func (a *App) startup(ctx context.Context) {
 	a.started = time.Now()
 	trayInit(a.onTray)
 	go a.trayLoop()
+	a.initUpdates()
 }
 
 func (a *App) showWindow() {
@@ -114,6 +118,9 @@ func (a *App) onTray(action int) {
 	case trayLogin:
 		_ = a.setOpenAtLogin(!loginEnabled())
 		runtime.EventsEmit(a.ctx, "state-changed")
+	case trayUpdate:
+		a.showWindow()
+		runtime.EventsEmit(a.ctx, "menu", "update")
 	case trayQuit:
 		runtime.Quit(a.ctx)
 	}
@@ -144,7 +151,7 @@ func (a *App) trayLoop() {
 				status += " · " + title
 			}
 		}
-		traySet(status, title, a.openAtLogin.Load())
+		traySet(status, title, a.openAtLogin.Load(), a.updateMenuTitle())
 		setTransfersActive(active > 0)
 		<-t.C
 	}
@@ -176,7 +183,7 @@ func (a *App) shutdown(ctx context.Context) {
 
 // beforeClose asks for confirmation if transfers are running.
 func (a *App) beforeClose(ctx context.Context) bool {
-	if a.mgr == nil || !a.mgr.Active() {
+	if a.updating.Load() || a.mgr == nil || !a.mgr.Active() {
 		return false
 	}
 	res, err := runtime.MessageDialog(ctx, runtime.MessageDialogOptions{
@@ -286,6 +293,7 @@ func (a *App) SaveSettings(s config.Settings) (State, error) {
 	s.ClientID = strings.TrimSpace(s.ClientID)
 	saved, err := config.Update(func(cur *config.Settings) {
 		cur.ClientID, cur.RedirectPort, cur.Streams, cur.SegmentMB, cur.DownloadDir, cur.NoFolderLogs = s.ClientID, s.RedirectPort, s.Streams, s.SegmentMB, s.DownloadDir, s.NoFolderLogs
+		cur.NoUpdateCheck = s.NoUpdateCheck
 	})
 	if err != nil {
 		return a.GetState(), err
