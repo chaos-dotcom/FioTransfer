@@ -24,7 +24,14 @@ import (
 // callback is served on https://localhost. Like mkcert, FioTransfer creates a
 // small local certificate authority that macOS trusts once; browsers (including
 // Firefox, which imports OS root CAs but not individually trusted leaf certs)
-// then accept the localhost certificate it signs.
+// then accept the localhost certificate it signs. The CA is name-constrained to
+// localhost, so even its private key can't mint certificates for other sites.
+
+// loopback is what the CA may sign for.
+var loopback = []*net.IPNet{
+	{IP: net.IPv4(127, 0, 0, 0).To4(), Mask: net.CIDRMask(8, 32)},
+	{IP: net.IPv6loopback, Mask: net.CIDRMask(128, 128)},
+}
 
 func certDir() string { return config.Dir() }
 
@@ -39,15 +46,19 @@ func serial() *big.Int {
 	return n
 }
 
-// localCA loads or creates the local certificate authority.
+// localCA loads or creates the local certificate authority. A CA from an
+// earlier build without name constraints is replaced; trustCert then removes
+// it from the keychain.
 func localCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	certPath, keyPath := pemFile("local-ca.pem"), pemFile("local-ca-key.pem")
 	if c, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
-		if cert, err := x509.ParseCertificate(c.Certificate[0]); err == nil && time.Until(cert.NotAfter) > 60*24*time.Hour {
+		if cert, err := x509.ParseCertificate(c.Certificate[0]); err == nil && time.Until(cert.NotAfter) > 60*24*time.Hour &&
+			cert.PermittedDNSDomainsCritical && len(cert.PermittedDNSDomains) > 0 {
 			if key, ok := c.PrivateKey.(*ecdsa.PrivateKey); ok {
 				return cert, key, nil
 			}
 		}
+		_ = os.Rename(certPath, pemFile(oldCAFile))
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -55,14 +66,17 @@ func localCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	}
 	host, _ := os.Hostname()
 	tmpl := &x509.Certificate{
-		SerialNumber:          serial(),
-		Subject:               pkix.Name{CommonName: "FioTransfer Local CA (" + host + ")", Organization: []string{"FioTransfer"}},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().AddDate(10, 0, 0),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		MaxPathLenZero:        true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		SerialNumber:                serial(),
+		Subject:                     pkix.Name{CommonName: "FioTransfer Local CA (" + host + ")", Organization: []string{"FioTransfer"}},
+		NotBefore:                   time.Now().Add(-time.Hour),
+		NotAfter:                    time.Now().AddDate(10, 0, 0),
+		IsCA:                        true,
+		BasicConstraintsValid:       true,
+		MaxPathLenZero:              true,
+		KeyUsage:                    x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		PermittedDNSDomainsCritical: true,
+		PermittedDNSDomains:         []string{"localhost"},
+		PermittedIPRanges:           loopback,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -124,9 +138,13 @@ func localCert() (tls.Certificate, string, error) {
 
 var trustLocalCert = trustCert
 
+// oldCAFile holds a replaced CA until trustCert has removed it from the keychain.
+const oldCAFile = "local-ca-old.pem"
+
 // trustCert makes macOS trust the local CA (one password prompt, first time only).
 func trustCert(caPath string) {
-	removeLegacyCert()
+	untrust(pemFile("localhost-cert.pem")) // self-signed leaf used by early builds
+	untrust(pemFile(oldCAFile))
 	if exec.Command("/usr/bin/security", "verify-cert", "-c", pemFile("localhost.pem"), "-p", "ssl", "-s", "localhost", "-q").Run() == nil &&
 		caTrusted(caPath) {
 		return
@@ -141,16 +159,17 @@ func caTrusted(caPath string) bool {
 	return exec.Command("/usr/bin/security", "verify-cert", "-c", caPath, "-p", "basic", "-q").Run() == nil
 }
 
-// removeLegacyCert deletes the self-signed localhost cert used by earlier builds.
-func removeLegacyCert() {
-	old := pemFile("localhost-cert.pem")
-	b, err := os.ReadFile(old)
+// untrust removes a certificate an earlier build installed (its trust setting
+// and its keychain entry), then the file itself.
+func untrust(path string) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return
 	}
 	if blk, _ := pem.Decode(b); blk != nil {
+		_ = exec.Command("/usr/bin/security", "remove-trusted-cert", path).Run()
 		sum := sha1.Sum(blk.Bytes)
 		_ = exec.Command("/usr/bin/security", "delete-certificate", "-Z", hex.EncodeToString(sum[:])).Run()
 	}
-	_ = os.Remove(old)
+	_ = os.Remove(path)
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -69,6 +70,9 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		u += sep + query.Encode()
 	}
 	key := routeKey(method, u)
+	// A POST that was sent but got no clear answer may still have been carried
+	// out; repeating it could create a duplicate folder or file.
+	repeatable := method != http.MethodPost
 	refreshed := false
 	for attempt := 0; ; attempt++ {
 		if err := c.limits.get(key).Wait(ctx); err != nil {
@@ -86,10 +90,10 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		}
 		resp, err := netx.APIClient.Do(req)
 		if err != nil {
-			if ctx.Err() != nil || attempt >= 5 {
+			if ctx.Err() != nil || attempt >= 5 || (!repeatable && !notSent(err)) {
 				return err
 			}
-			sleep(ctx, backoff(attempt))
+			netx.Sleep(ctx, netx.Backoff(attempt))
 			continue
 		}
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
@@ -103,14 +107,15 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			}
 			continue
 		case resp.StatusCode == 429 || resp.StatusCode >= 500:
-			if attempt >= 6 {
+			// 429 and 503 mean the request was turned away, so even a POST can be repeated.
+			if attempt >= 6 || (!repeatable && resp.StatusCode != 429 && resp.StatusCode != 503) {
 				return &Error{resp.StatusCode, trim(data)}
 			}
-			d := backoff(attempt)
+			d := netx.Backoff(attempt)
 			if ra, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && ra > 0 {
 				d = time.Duration(ra) * time.Second
 			}
-			sleep(ctx, d)
+			netx.Sleep(ctx, d)
 			continue
 		case resp.StatusCode >= 300:
 			return &Error{resp.StatusCode, trim(data)}
@@ -130,18 +135,21 @@ func trim(b []byte) string {
 	return s
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(1<<min(attempt, 5)) * 500 * time.Millisecond
-	return d
+// notSent reports whether a request failed before reaching the server.
+func notSent(err error) bool {
+	var op *net.OpError
+	return errors.As(err, &op) && (op.Op == "dial" || op.Op == "proxyconnect")
 }
 
-func sleep(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
+// Ambiguous reports whether a failed request may still have been carried out
+// by Frame.io: it was sent, but the reply was a server error or never came.
+func Ambiguous(err error) bool {
+	var ae *Error
+	if errors.As(err, &ae) {
+		return ae.Status >= 500 && ae.Status != 503
 	}
+	var ue *url.Error
+	return errors.As(err, &ue) && !notSent(err)
 }
 
 type links struct {
@@ -287,49 +295,6 @@ func (c *Client) FileStatus(ctx context.Context, acct, file string) (*FileStatus
 		return nil, err
 	}
 	return &r.Data, nil
-}
-
-// ShareAsset is an item from the (experimental) share asset listing for shares
-// in the user's own account.
-type ShareAsset struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	FileSize   int64  `json:"file_size"`
-	ParentID   string `json:"parent_id"`
-	MediaLinks *struct {
-		Original *struct {
-			DownloadURL *string `json:"download_url"`
-		} `json:"original"`
-	} `json:"media_links"`
-}
-
-func (c *Client) ShareAssets(ctx context.Context, acct, share string) ([]ShareAsset, error) {
-	return list[ShareAsset](ctx, c, "/v4/accounts/"+acct+"/shares/"+share+"/assets",
-		url.Values{"page_size": {"100"}, "include": {"media_links.original"}})
-}
-
-type FileWithLinks struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	FileSize   int64  `json:"file_size"`
-	MediaLinks *struct {
-		Original *struct {
-			DownloadURL *string `json:"download_url"`
-		} `json:"original"`
-	} `json:"media_links"`
-}
-
-func (c *Client) FileDownloadURL(ctx context.Context, acct, file string) (string, error) {
-	var r struct{ Data FileWithLinks }
-	if err := c.do(ctx, "GET", "/v4/accounts/"+acct+"/files/"+file, url.Values{"include": {"media_links.original"}}, nil, &r); err != nil {
-		return "", err
-	}
-	ml := r.Data.MediaLinks
-	if ml == nil || ml.Original == nil || ml.Original.DownloadURL == nil || *ml.Original.DownloadURL == "" {
-		return "", errors.New("no original download link available for this file")
-	}
-	return *ml.Original.DownloadURL, nil
 }
 
 // Folder returns a folder, including its Frame.io view URL.

@@ -1,8 +1,11 @@
 package share
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 )
 
@@ -73,9 +76,74 @@ func TestDedupeAndSafeNames(t *testing.T) {
 			t.Errorf("file %d = %q, want %q", i, files[i].RelPath, w)
 		}
 	}
-	for in, w := range map[string]string{"..": "untitled", "a/b": "a_b", "x:y": "x_y", "  ": "untitled", "ok.mov": "ok.mov"} {
-		if got := safeName(in); got != w {
-			t.Errorf("safeName(%q) = %q, want %q", in, got, w)
+	// A generated name must not take a name another file already has.
+	files = []File{{RelPath: "a.mov"}, {RelPath: "a.mov"}, {RelPath: "a (2).mov"}}
+	dedupePaths(files)
+	want = []string{"a.mov", "a (3).mov", "a (2).mov"}
+	for i, w := range want {
+		if files[i].RelPath != w {
+			t.Errorf("collision case: file %d = %q, want %q", i, files[i].RelPath, w)
 		}
+	}
+	for in, w := range map[string]string{"..": "untitled", "a/b": "a_b", "x:y": "x_y", "  ": "untitled", "ok.mov": "ok.mov"} {
+		if got := SafeName(in); got != w {
+			t.Errorf("SafeName(%q) = %q, want %q", in, got, w)
+		}
+	}
+}
+
+// Legacy listings keep their order with folders listed in parallel, and page
+// on even when the server leaves out the total-pages header.
+func TestLegacyListOrderAndPaging(t *testing.T) {
+	asset := func(id, typ string) map[string]any {
+		a := map[string]any{"id": id, "name": id, "type": typ, "filesize": 1}
+		if typ == "file" {
+			a["original"] = "https://cdn/" + id
+		}
+		return a
+	}
+	var top []any // 130 items: a folder at position 1, files elsewhere
+	for i := range 130 {
+		typ := "file"
+		if i == 1 {
+			typ = "folder"
+		}
+		top = append(top, map[string]any{"asset": asset(fmt.Sprintf("t%03d", i), typ)})
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		size, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+		var all []any
+		switch r.URL.Path {
+		case "/review_links/" + id + "/items/shared":
+			all = top
+		case "/assets/t001/children":
+			all = []any{asset("t001a", "file"), asset("t001b", "folder")}
+		case "/assets/t001b/children":
+			all = []any{asset("deep", "file")}
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		lo, hi := min((page-1)*size, len(all)), min(page*size, len(all))
+		json.NewEncoder(w).Encode(all[lo:hi]) // no total-pages header
+	}))
+	defer srv.Close()
+	LegacyAPI = srv.URL
+	files, err := (&LegacyClient{ReviewID: id}).List(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 131 { // 129 top-level files + t001a + deep
+		t.Fatalf("listed %d files, want 131", len(files))
+	}
+	want := []string{"t000", "t001/t001a", "t001/t001b/deep", "t002"}
+	for i, w := range want {
+		if files[i].RelPath != w {
+			t.Errorf("file %d = %q, want %q", i, files[i].RelPath, w)
+		}
+	}
+	if last := files[len(files)-1].RelPath; last != "t129" {
+		t.Errorf("last file = %q, want t129", last)
 	}
 }

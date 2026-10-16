@@ -73,6 +73,8 @@ type fakeFrameio struct {
 	putFailEvery int64
 	rejectName   string // PUTs for this file name fail permanently (400)
 	apiCalls     atomic.Int64
+	listCalls    atomic.Int64  // share folder listings (GraphQL)
+	failChildren atomic.Bool   // folder listings are refused (403)
 	putDelay     atomic.Int64  // slow storage (ns)
 	assemblyTime time.Duration // Frame.io reports complete this long after the last part
 	failAssembly string        // Frame.io reports this file name as failed after upload
@@ -197,6 +199,7 @@ func (f *fakeFrameio) graphql(w http.ResponseWriter, r *http.Request) {
 	case "FioShare":
 		out["share"] = map[string]any{"__typename": "Share", "id": sh.id, "name": sh.name, "downloadingEnabled": !sh.noDownload, "enabled": true}
 	case "FioShareAssets":
+		f.listCalls.Add(1)
 		items := sh.root
 		if fid, ok := req.Variables["folderId"].(string); ok && fid != "" {
 			items = f.assets[fid].children
@@ -330,6 +333,10 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && len(parts) == 5 && parts[3] == "folders":
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": parts[4], "name": "dest", "type": "folder", "view_url": "https://next.frame.io/folder/" + parts[4]}})
 	case r.Method == "GET" && len(parts) == 6 && parts[3] == "folders" && parts[5] == "children":
+		if f.failChildren.Load() {
+			http.Error(w, `{"errors":[{"detail":"forbidden"}]}`, 403)
+			return
+		}
 		var data []any
 		f.mu.Lock()
 		for id, fd := range f.folders {

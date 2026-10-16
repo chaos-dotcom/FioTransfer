@@ -10,9 +10,9 @@ import (
 )
 
 type Settings struct {
-	// Adobe Developer Console "OAuth Native App" credential client ID.
+	// Adobe Developer Console "OAuth Single Page App" credential client ID.
 	ClientID string `json:"client_id"`
-	// Loopback port for the OAuth redirect (http://127.0.0.1:<port>/callback).
+	// Port for the sign-in redirect (https://localhost:<port>/callback).
 	RedirectPort int `json:"redirect_port"`
 	// Max parallel HTTP streams across all transfers.
 	Streams int `json:"streams"`
@@ -90,18 +90,19 @@ func path() string { return filepath.Join(Dir(), "settings.json") }
 func Load() Settings {
 	mu.Lock()
 	defer mu.Unlock()
+	return load()
+}
+
+func load() Settings {
 	s := Defaults()
-	b, err := os.ReadFile(path())
-	if err == nil {
+	if b, err := os.ReadFile(path()); err == nil {
 		_ = json.Unmarshal(b, &s)
 	}
 	s.normalize()
 	return s
 }
 
-func Save(s Settings) error {
-	mu.Lock()
-	defer mu.Unlock()
+func save(s Settings) error {
 	s.normalize()
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
@@ -114,14 +115,15 @@ func Save(s Settings) error {
 	return os.Rename(tmp, path())
 }
 
-// Update loads, mutates and saves settings atomically.
+// Update loads, mutates and saves settings under one lock, so concurrent
+// updates can't drop each other's changes.
 func Update(fn func(*Settings)) (Settings, error) {
-	s := Load()
+	mu.Lock()
+	defer mu.Unlock()
+	s := load()
 	fn(&s)
-	if err := Save(s); err != nil {
-		return s, err
-	}
-	return Load(), nil
+	s.normalize()
+	return s, save(s)
 }
 
 var ErrNoClientID = errors.New("no Adobe Client ID set")

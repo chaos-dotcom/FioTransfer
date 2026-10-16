@@ -17,7 +17,7 @@ type Limiter struct {
 }
 
 func NewLimiter(n int) *Limiter {
-	l := &Limiter{limit: n}
+	l := &Limiter{limit: max(n, 1)}
 	l.cond = sync.NewCond(&l.mu)
 	return l
 }

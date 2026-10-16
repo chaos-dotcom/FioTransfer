@@ -2,10 +2,13 @@ package xfer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"fiotransfer/internal/netx"
 )
@@ -22,6 +26,9 @@ var (
 	errNoRange      = errors.New("server does not support ranged downloads")
 	errRangeIgnored = errors.New("server ignored the Range header")
 )
+
+// maxName is the longest file name macOS volumes accept, in bytes.
+const maxName = 255
 
 // urlSource holds a signed URL that can be refreshed when it expires.
 type urlSource struct {
@@ -68,22 +75,8 @@ func (j *Job) downloadFile(ctx context.Context, f *File, segSize int64, src *url
 	if err := os.MkdirAll(filepath.Dir(f.LocalPath), 0o755); err != nil {
 		return err
 	}
-	partPath := func() string { return f.LocalPath + ".fiopart" }
-	statePath := func() string { return f.LocalPath + ".fiostate" }
-
-	if st, err := os.Stat(f.LocalPath); err == nil {
-		if _, perr := os.Stat(partPath()); perr != nil {
-			if f.Size > 0 && st.Size() == f.Size {
-				f.credit(f.Size)
-				f.setStatus(Skipped, "already downloaded")
-				return nil
-			}
-			f.LocalPath = uniquePath(f.LocalPath)
-		}
-	}
-
 	size := f.Size
-	if size <= 0 {
+	if size <= 0 { // unknown (or empty) in the listing: ask the server
 		s, err := probeSize(ctx, src)
 		if err != nil {
 			return err
@@ -94,17 +87,21 @@ func (j *Job) downloadFile(ctx context.Context, f *File, segSize int64, src *url
 		f.mu.Unlock()
 		j.addTotal(s)
 	}
+	if done, err := j.placeDownload(f, size); err != nil || done {
+		return err
+	}
 	if size == 0 {
 		return os.WriteFile(f.LocalPath, nil, 0o644)
 	}
-
+	prefix := sidecar(f.LocalPath)
+	partPath, statePath := prefix+".fiopart", prefix+".fiostate"
 	for {
-		err := j.downloadSegments(ctx, f, size, segSize, src, partPath(), statePath())
+		err := j.downloadSegments(ctx, f, size, segSize, src, partPath, statePath)
 		if errors.Is(err, errNoRange) && segSize < size {
 			// Fall back to a single stream; reset progress for this file.
 			f.unwind(f.done.Load())
-			_ = os.Remove(partPath())
-			_ = os.Remove(statePath())
+			_ = os.Remove(partPath)
+			_ = os.Remove(statePath)
 			segSize = size
 			continue
 		}
@@ -113,11 +110,64 @@ func (j *Job) downloadFile(ctx context.Context, f *File, segSize int64, src *url
 		}
 		break
 	}
-	if err := os.Rename(partPath(), f.LocalPath); err != nil {
+	if err := os.Rename(partPath, f.LocalPath); err != nil {
 		return err
 	}
-	_ = os.Remove(statePath())
+	_ = os.Remove(statePath)
 	return nil
+}
+
+// placeDownload settles where f is written. It goes back to the path this asset
+// was saved to before (it may have been renamed after a name clash), skips a
+// file that is already complete, and picks a free name when a different file
+// is in the way. It reports done when there is nothing left to download.
+func (j *Job) placeDownload(f *File, size int64) (done bool, err error) {
+	p := f.LocalPath
+	if prev := j.mgr.Hist.AssetPath(f.AssetID, filepath.Dir(p), j.ID); prev != "" && prev != p &&
+		(exists(prev) || exists(sidecar(prev)+".fiopart")) {
+		p = prev
+	}
+	if st, err := os.Stat(p); err == nil && !exists(sidecar(p)+".fiopart") {
+		// The same size alone isn't proof: a file another asset was downloaded to is a different file.
+		if owner := j.mgr.Hist.PathOwner(p, j.ID); st.Size() == size && (owner == "" || owner == f.AssetID) {
+			j.setLocalPath(f, p)
+			f.credit(size)
+			f.setStatus(Skipped, "already downloaded")
+			return true, nil
+		}
+		if p, err = uniquePath(p); err != nil {
+			return false, err
+		}
+	}
+	j.setLocalPath(f, p)
+	return false, nil
+}
+
+// setLocalPath moves f to p and records it, so an interrupted download resumes there.
+func (j *Job) setLocalPath(f *File, p string) {
+	f.mu.Lock()
+	moved := f.LocalPath != p
+	f.LocalPath = p
+	f.mu.Unlock()
+	if moved {
+		j.persistFile(f)
+	}
+}
+
+func exists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// sidecar returns the path prefix for a download's temp files (.fiopart and
+// .fiostate). A name too long to take those suffixes gets a short hashed one.
+func sidecar(p string) string {
+	dir, name := filepath.Split(p)
+	if len(name)+len(".fiostate.tmp") <= maxName {
+		return p
+	}
+	sum := sha256.Sum256([]byte(name))
+	return dir + ".fio-" + hex.EncodeToString(sum[:8])
 }
 
 func (j *Job) downloadSegments(ctx context.Context, f *File, size, segSize int64, src *urlSource, partPath, statePath string) error {
@@ -180,7 +230,6 @@ func (j *Job) downloadSegments(ctx context.Context, f *File, size, segSize int64
 		if st.Done[i] {
 			continue
 		}
-		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -217,7 +266,7 @@ func fetchRange(ctx context.Context, f *File, src *urlSource, fh *os.File, start
 			return ctx.Err()
 		}
 		if attempt > 0 {
-			sleepCtx(ctx, retryDelay(attempt))
+			netx.Sleep(ctx, netx.Backoff(attempt))
 		}
 		u, gen := src.get()
 		n, status, err := getInto(ctx, u, fh, start+got, length-got, ranged || got > 0, func(n int64) { f.add(n) })
@@ -332,7 +381,10 @@ var bufPool = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
 func probeSize(ctx context.Context, src *urlSource) (int64, error) {
 	for attempt := 0; attempt < 3; attempt++ {
 		u, gen := src.get()
-		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return 0, err
+		}
 		req.Header.Set("Range", "bytes=0-0")
 		resp, err := netx.DataClient.Do(req)
 		if err != nil {
@@ -341,7 +393,7 @@ func probeSize(ctx context.Context, src *urlSource) (int64, error) {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 		resp.Body.Close()
 		switch resp.StatusCode {
-		case 206:
+		case 206, 416: // a 416 still reports the size ("bytes */0" for an empty file)
 			cr := resp.Header.Get("Content-Range")
 			if i := strings.LastIndex(cr, "/"); i >= 0 {
 				if n, err := strconv.ParseInt(cr[i+1:], 10, 64); err == nil {
@@ -363,29 +415,58 @@ func probeSize(ctx context.Context, src *urlSource) (int64, error) {
 	return 0, errors.New("could not determine file size")
 }
 
-func uniquePath(p string) string {
-	ext := filepath.Ext(p)
-	base := strings.TrimSuffix(p, ext)
-	for i := 2; ; i++ {
-		c := fmt.Sprintf("%s (%d)%s", base, i, ext)
-		if _, err := os.Stat(c); errors.Is(err, os.ErrNotExist) {
-			if _, err := os.Stat(c + ".fiopart"); errors.Is(err, os.ErrNotExist) {
-				return c
-			}
+// uniquePath returns a free variant of p ("name (2).ext", …), shortening the
+// name when the suffix would push it past the file-name limit.
+func uniquePath(p string) (string, error) {
+	dir, name := filepath.Split(p)
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	for i := 2; i < 10000; i++ {
+		suffix := fmt.Sprintf(" (%d)%s", i, ext)
+		b := base
+		if over := len(b) + len(suffix) - maxName; over > 0 {
+			b = truncateUTF8(b, len(b)-over)
+		}
+		c := dir + b + suffix
+		free, err := pathFree(c)
+		if err != nil {
+			return "", err
+		}
+		if !free {
+			continue
+		}
+		if free, err = pathFree(sidecar(c) + ".fiopart"); err != nil {
+			return "", err
+		} else if free {
+			return c, nil
 		}
 	}
+	return "", fmt.Errorf("no free file name for %s", name)
 }
 
-func retryDelay(attempt int) time.Duration {
-	d := time.Duration(1<<min(attempt, 5)) * 500 * time.Millisecond
-	return min(d, 15*time.Second)
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
+// pathFree reports whether nothing exists at p. Errors other than "not found"
+// (a name that's too long, a folder that can't be read) are returned.
+func pathFree(p string) (bool, error) {
+	_, err := os.Lstat(p)
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return true, nil
 	}
+	return false, err
+}
+
+// truncateUTF8 cuts s to at most n bytes without splitting a character.
+func truncateUTF8(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

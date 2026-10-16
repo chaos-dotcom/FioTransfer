@@ -68,20 +68,23 @@ func (j *Job) writeFolderLog(final bool) {
 	if !j.mgr.Settings().FolderLogs() {
 		return
 	}
+	if j.watchLog && !final {
+		return // watch folders append each batch once it's finished
+	}
+	dirs := j.logDirs()
+	body := j.folderLogText(dirs)
 	if j.watchLog {
 		// Watch folders get one log per day; each finished batch is appended.
-		if !final {
-			return
-		}
 		name := fmt.Sprintf("%sWatch %s.txt", folderLogPrefix, time.Now().Format("2006-01-02"))
-		for _, d := range j.logDirs() {
+		for _, d := range dirs {
 			fh, err := os.OpenFile(filepath.Join(d, name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			if err == nil {
+				_, err = fh.WriteString(body + "\n\n")
+				fh.Close()
+			}
 			if err != nil {
 				j.mgr.Hist.Log("WATCH    note     [%s] could not write log to %s: %v", j.ID, d, err)
-				continue
 			}
-			fh.WriteString(j.folderLogText() + "\n\n")
-			fh.Close()
 		}
 		return
 	}
@@ -92,8 +95,7 @@ func (j *Job) writeFolderLog(final bool) {
 		}
 		j.logName = fmt.Sprintf("%s%s %s.txt", folderLogPrefix, verb, j.created.Format("2006-01-02 150405"))
 	}
-	body := j.folderLogText()
-	for _, d := range j.logDirs() {
+	for _, d := range dirs {
 		p := filepath.Join(d, j.logName)
 		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
 			j.mgr.Hist.Log("%s note     [%s] could not write log to %s: %v", kindTag(j.Kind), j.ID, d, err)
@@ -101,7 +103,8 @@ func (j *Job) writeFolderLog(final bool) {
 	}
 }
 
-func (j *Job) folderLogText() string {
+// folderLogText renders the log; dirs is where an upload was taken from.
+func (j *Job) folderLogText(dirs []string) string {
 	rec := j.record()
 	files := j.files()
 	var b strings.Builder
@@ -127,7 +130,7 @@ func (j *Job) folderLogText() string {
 	w("Name         %s\n", rec.Title)
 	w("Status       %s\n", status)
 	if j.Kind == "upload" {
-		w("From         %s\n", strings.Join(j.logDirs(), ", "))
+		w("From         %s\n", strings.Join(dirs, ", "))
 		w("To           Frame.io / %s\n", rec.Dest)
 		if rec.Link != "" {
 			w("Frame.io     %s\n", rec.Link)
@@ -162,11 +165,11 @@ func (j *Job) folderLogText() string {
 	w("%s\n", strings.Repeat("-", 60))
 	for _, f := range rows {
 		f.mu.Lock()
-		st, e, note, url := f.status, f.err, f.note, f.ViewURL
+		st, e, note, url, size := f.status, f.err, f.note, f.ViewURL, f.Size
 		f.mu.Unlock()
 		label := map[Status]string{Done: "OK", Skipped: "SKIPPED", Failed: "FAILED", Canceled: "CANCELED",
-			Running: "ACTIVE", Finalizing: "ACTIVE", Queued: "PENDING"}[st]
-		w("%-10s %12s  %s", label, humanBytes(f.Size), f.RelPath)
+			Running: "ACTIVE", Queued: "PENDING"}[st]
+		w("%-10s %12s  %s", label, humanBytes(size), f.RelPath)
 		switch {
 		case e != "":
 			w("  — %s", e)

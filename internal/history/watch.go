@@ -83,6 +83,27 @@ func (s *Store) RequeueCanceled(id string) {
 	s.db.Exec(`DELETE FROM watch_files WHERE watch_id=? AND state='canceled'`, id)
 }
 
+// ForgetWatchFiles drops the failed and canceled records of these files so the
+// watch uploads them again.
+func (s *Store) ForgetWatchFiles(id string, rels []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`DELETE FROM watch_files WHERE watch_id=? AND rel_path=? AND state IN ('failed','canceled')`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, r := range rels {
+		if _, err := stmt.Exec(id, r); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) SetWatchEnabled(id string, on bool) {
 	s.db.Exec(`UPDATE watches SET enabled=? WHERE id=?`, on, id)
 }

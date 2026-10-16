@@ -1,5 +1,5 @@
-// Package auth implements Adobe IMS OAuth 2.0 (PKCE, public "Native App" client)
-// with a loopback redirect, and stores tokens in the macOS Keychain.
+// Package auth implements Adobe IMS OAuth 2.0 (PKCE, public "Single Page App"
+// client) with an https://localhost redirect, and stores tokens in the macOS Keychain.
 package auth
 
 import (
@@ -42,7 +42,10 @@ type Token struct {
 	Expiry  time.Time `json:"expiry"`
 }
 
-var ErrNotLoggedIn = errors.New("not signed in to Frame.io")
+var (
+	ErrNotLoggedIn   = errors.New("not signed in to Frame.io")
+	ErrLoginCanceled = errors.New("sign-in canceled")
+)
 
 // Manager hands out valid access tokens, refreshing as needed.
 type Manager struct {
@@ -220,7 +223,10 @@ func (m *Manager) Login(ctx context.Context, port int, openURL func(string)) err
 	var res result
 	select {
 	case <-ctx.Done():
-		return errors.New("timed out waiting for Adobe sign-in")
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return errors.New("timed out waiting for Adobe sign-in")
+		}
+		return ErrLoginCanceled
 	case res = <-resCh:
 	}
 	if res.err != nil {

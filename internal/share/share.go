@@ -15,7 +15,9 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"fiotransfer/internal/netx"
@@ -32,7 +34,10 @@ var (
 	ErrNotAShareLink    = errors.New("not a Frame.io link")
 )
 
-var uuidRe = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+var (
+	uuidRe   = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	inPageRe = regexp.MustCompile(`/(?:share|reviews)/` + uuidRe.String())
+)
 
 // Link kinds.
 const (
@@ -105,7 +110,7 @@ func ResolveLink(ctx context.Context, raw string) (Link, error) {
 	}
 	// Last resort: look for a share URL inside the page.
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if m := regexp.MustCompile(`/(?:share|reviews)/` + uuidRe.String()).Find(body); m != nil {
+	if m := inPageRe.Find(body); m != nil {
 		if l, ok := linkFromURL(string(m)); ok {
 			return l, nil
 		}
@@ -156,17 +161,18 @@ func (c *Client) query(ctx context.Context, op, q string, vars map[string]any, o
 		resp, err := netx.APIClient.Do(req)
 		if err != nil {
 			lastErr = err
-			if ctx.Err() != nil {
+			if err := netx.Sleep(ctx, netx.Backoff(attempt+1)); err != nil {
 				return err
 			}
-			time.Sleep(time.Duration(attempt+1) * time.Second)
 			continue
 		}
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		resp.Body.Close()
 		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
 			lastErr = fmt.Errorf("Frame.io returned %d", resp.StatusCode)
-			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			if err := netx.Sleep(ctx, netx.Backoff(attempt+1)); err != nil {
+				return err
+			}
 			continue
 		}
 		var env struct {
@@ -309,78 +315,159 @@ type File struct {
 
 // List walks the share recursively and returns every file with its relative path.
 func (c *Client) List(ctx context.Context, progress func(found int)) ([]File, error) {
-	var files []File
-	var walk func(folderID *string, prefix string, depth int) error
-	walk = func(folderID *string, prefix string, depth int) error {
-		if depth > 64 {
-			return errors.New("folder nesting too deep")
-		}
-		var after *string
-		for {
-			page := map[string]any{"first": 200}
-			if after != nil {
-				page["after"] = *after
-			}
-			vars := map[string]any{"shareId": c.ShareID, "page": page, "folderId": nil}
-			if folderID != nil {
-				vars["folderId"] = *folderID
-			}
-			var r struct {
-				Share *struct {
-					Assets *struct {
-						Nodes    []*node `json:"nodes"`
-						PageInfo struct {
-							EndCursor   *string `json:"endCursor"`
-							HasNextPage bool    `json:"hasNextPage"`
-						} `json:"pageInfo"`
-					} `json:"assets"`
-				} `json:"share"`
-			}
-			if err := c.query(ctx, "FioShareAssets", listQuery, vars, &r); err != nil {
-				return err
-			}
-			if r.Share == nil || r.Share.Assets == nil {
-				return nil
-			}
-			for _, n := range r.Share.Assets.Nodes {
-				if n == nil {
-					continue
-				}
-				name := safeName(n.Name)
-				if n.Typename == "FolderAsset" {
-					id := n.ID
-					if err := walk(&id, path.Join(prefix, name), depth+1); err != nil {
-						return err
-					}
-					continue
-				}
-				h := n.head()
-				u, size := h.url()
-				fileName := name
-				if h != n && h.Name != "" {
-					fileName = safeName(h.Name)
-				}
-				f := File{AssetID: h.ID, RelPath: path.Join(prefix, fileName), Size: size, URL: u}
-				if u == "" {
-					f.Problem = "original not available"
-				}
-				files = append(files, f)
-				if progress != nil {
-					progress(len(files))
-				}
-			}
-			pi := r.Share.Assets.PageInfo
-			if !pi.HasNextPage || pi.EndCursor == nil {
-				return nil
-			}
-			after = pi.EndCursor
-		}
-	}
-	if err := walk(nil, "", 0); err != nil {
+	l := newLister(ctx, progress)
+	defer l.cancel(nil)
+	files, err := c.walk(l, nil, "", 0)
+	if err != nil {
 		return nil, err
 	}
 	dedupePaths(files)
 	return files, nil
+}
+
+func (c *Client) walk(l *lister, folderID *string, prefix string, depth int) ([]File, error) {
+	if depth > 64 {
+		return nil, errors.New("folder nesting too deep")
+	}
+	nodes, err := c.folderNodes(l, folderID)
+	if err != nil {
+		return nil, err
+	}
+	parts := make([][]File, len(nodes))
+	var folders []int
+	for i, n := range nodes {
+		if n.Typename == "FolderAsset" {
+			folders = append(folders, i)
+			continue
+		}
+		h := n.head()
+		u, size := h.url()
+		fileName := SafeName(n.Name)
+		if h != n && h.Name != "" {
+			fileName = SafeName(h.Name)
+		}
+		f := File{AssetID: h.ID, RelPath: path.Join(prefix, fileName), Size: size, URL: u}
+		if u == "" {
+			f.Problem = "original not available"
+		}
+		parts[i] = []File{f}
+	}
+	l.found(len(nodes) - len(folders))
+	err = l.parallel(folders, func(i int) (err error) {
+		id := nodes[i].ID
+		parts[i], err = c.walk(l, &id, path.Join(prefix, SafeName(nodes[i].Name)), depth+1)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return slices.Concat(parts...), nil
+}
+
+// folderNodes fetches every page of one folder's listing (nil = share root).
+func (c *Client) folderNodes(l *lister, folderID *string) ([]*node, error) {
+	var all []*node
+	var after *string
+	for {
+		page := map[string]any{"first": 200}
+		if after != nil {
+			page["after"] = *after
+		}
+		vars := map[string]any{"shareId": c.ShareID, "page": page, "folderId": nil}
+		if folderID != nil {
+			vars["folderId"] = *folderID
+		}
+		var r struct {
+			Share *struct {
+				Assets *struct {
+					Nodes    []*node `json:"nodes"`
+					PageInfo struct {
+						EndCursor   *string `json:"endCursor"`
+						HasNextPage bool    `json:"hasNextPage"`
+					} `json:"pageInfo"`
+				} `json:"assets"`
+			} `json:"share"`
+		}
+		err := l.call(func(ctx context.Context) error { return c.query(ctx, "FioShareAssets", listQuery, vars, &r) })
+		if err != nil {
+			return nil, err
+		}
+		if r.Share == nil || r.Share.Assets == nil {
+			return all, nil
+		}
+		for _, n := range r.Share.Assets.Nodes {
+			if n != nil {
+				all = append(all, n)
+			}
+		}
+		pi := r.Share.Assets.PageInfo
+		if !pi.HasNextPage || pi.EndCursor == nil {
+			return all, nil
+		}
+		after = pi.EndCursor
+	}
+}
+
+// listConcurrency bounds the requests one listing has in flight.
+const listConcurrency = 6
+
+// lister walks a share's folder tree with several requests in flight. Callers
+// keep results in listing order: dedupePaths renames by position, so the same
+// share must always list the same way.
+type lister struct {
+	ctx      context.Context
+	cancel   context.CancelCauseFunc
+	sem      chan struct{}
+	mu       sync.Mutex
+	n        int
+	progress func(found int)
+}
+
+func newLister(ctx context.Context, progress func(int)) *lister {
+	ctx, cancel := context.WithCancelCause(ctx)
+	return &lister{ctx: ctx, cancel: cancel, sem: make(chan struct{}, listConcurrency), progress: progress}
+}
+
+// call runs one request within the concurrency bound.
+func (l *lister) call(fn func(context.Context) error) error {
+	select {
+	case l.sem <- struct{}{}:
+	case <-l.ctx.Done():
+		return context.Cause(l.ctx)
+	}
+	defer func() { <-l.sem }()
+	return fn(l.ctx)
+}
+
+// found reports n more files to the progress callback.
+func (l *lister) found(n int) {
+	if n == 0 || l.progress == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.n += n
+	l.progress(l.n)
+}
+
+// parallel runs fn for each index concurrently. The first failure stops the
+// rest and is the error returned.
+func (l *lister) parallel(idx []int, fn func(i int) error) error {
+	var wg sync.WaitGroup
+	for _, i := range idx {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := fn(i); err != nil {
+				l.cancel(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if l.ctx.Err() != nil {
+		return context.Cause(l.ctx)
+	}
+	return nil
 }
 
 // FreshURL re-queries a single asset's download URL (signed URLs expire).
@@ -422,7 +509,8 @@ func (c *Client) MarkDownloaded(ctx context.Context, assetIDs []string) error {
 
 var unsafeChars = strings.NewReplacer("/", "_", ":", "_", "\x00", "")
 
-func safeName(s string) string {
+// SafeName turns a name from Frame.io into a single safe path component.
+func SafeName(s string) string {
 	s = strings.TrimSpace(unsafeChars.Replace(s))
 	if s == "" || s == "." || s == ".." {
 		s = "untitled"
@@ -430,18 +518,30 @@ func safeName(s string) string {
 	return s
 }
 
-// dedupePaths renames files whose relative paths collide ("a.mov", "a (2).mov").
+// dedupePaths renames files whose relative paths collide ("a.mov", "a (2).mov"),
+// ignoring case as macOS does. A generated name never takes a path another
+// file in the share already has.
 func dedupePaths(files []File) {
-	seen := map[string]int{}
+	taken := make(map[string]bool, len(files))
+	for _, f := range files {
+		taken[strings.ToLower(f.RelPath)] = true
+	}
+	used := make(map[string]bool, len(files))
 	for i := range files {
 		p := strings.ToLower(files[i].RelPath)
-		n := seen[p]
-		seen[p] = n + 1
-		if n == 0 {
+		if !used[p] {
+			used[p] = true
 			continue
 		}
 		ext := path.Ext(files[i].RelPath)
 		base := strings.TrimSuffix(files[i].RelPath, ext)
-		files[i].RelPath = fmt.Sprintf("%s (%d)%s", base, n+1, ext)
+		for n := 2; ; n++ {
+			c := fmt.Sprintf("%s (%d)%s", base, n, ext)
+			if lc := strings.ToLower(c); !taken[lc] {
+				files[i].RelPath = c
+				taken[lc], used[lc] = true, true
+				break
+			}
+		}
 	}
 }

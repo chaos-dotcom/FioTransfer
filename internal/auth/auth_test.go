@@ -1,11 +1,18 @@
 package auth
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 )
@@ -19,7 +26,11 @@ func (m *memTokens) clear()        { m.t = nil }
 func TestMain(m *testing.M) {
 	store = &memTokens{} // never touch the real Keychain from tests
 	trustLocalCert = func(string) {}
-	m.Run()
+	home, _ := os.MkdirTemp("", "fio-auth-test") // nor the real certificates in Application Support
+	os.Setenv("HOME", home)
+	code := m.Run()
+	os.RemoveAll(home)
+	os.Exit(code)
 }
 
 func TestRejectedRefreshSignsOut(t *testing.T) {
@@ -74,5 +85,49 @@ func TestLoginHTTPSCallback(t *testing.T) {
 	}
 	if m.tok.Access != "acc" || m.tok.Refresh != "ref" {
 		t.Fatalf("token = %+v", m.tok)
+	}
+}
+
+// The local CA must only be able to vouch for localhost.
+func TestLocalCAIsNameConstrained(t *testing.T) {
+	// An unconstrained CA from an earlier build gets replaced.
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: serial(), Subject: pkix.Name{CommonName: "old"}, IsCA: true, BasicConstraintsValid: true,
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(5, 0, 0), KeyUsage: x509.KeyUsageCertSign}
+	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	kb, _ := x509.MarshalECPrivateKey(key)
+	writePEM(pemFile("local-ca.pem"), "CERTIFICATE", der, 0o644)
+	writePEM(pemFile("local-ca-key.pem"), "EC PRIVATE KEY", kb, 0o600)
+
+	cert, caPath, err := localCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pemFile(oldCAFile)); err != nil {
+		t.Error("replaced CA was not kept for removal from the keychain")
+	}
+	b, _ := os.ReadFile(caPath)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(b)
+	leaf, _ := x509.ParseCertificate(cert.Certificate[0])
+	for _, host := range []string{"localhost", "127.0.0.1", "::1"} {
+		if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, DNSName: host}); err != nil {
+			t.Errorf("localhost cert rejected for %s: %v", host, err)
+		}
+	}
+
+	// A certificate for another site signed with the CA key is not trusted.
+	ca, caKey, err := localCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := &x509.Certificate{SerialNumber: serial(), Subject: pkix.Name{CommonName: "example.com"}, DNSNames: []string{"example.com"},
+		IPAddresses: []net.IP{net.ParseIP("93.184.216.34")}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	ek, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ed, _ := x509.CreateCertificate(rand.Reader, evil, ca, &ek.PublicKey, caKey)
+	ec, _ := x509.ParseCertificate(ed)
+	if _, err := ec.Verify(x509.VerifyOptions{Roots: pool, DNSName: "example.com"}); err == nil {
+		t.Error("CA signed a trusted certificate for example.com")
 	}
 }

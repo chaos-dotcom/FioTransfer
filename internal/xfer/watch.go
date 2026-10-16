@@ -21,11 +21,17 @@ import (
 // Frame.io folder once they've stopped changing, keeping the subfolder tree.
 
 var (
-	watchInterval   = 5 * time.Second  // how often folders are scanned
+	watchInterval   = 5 * time.Second  // how often folders are checked
 	watchSettle     = 10 * time.Second // a file must be unchanged this long
+	watchWalkEvery  = 30 * time.Second // full walk even if no folder changed
 	watchMaxRetries = 3
 	watchBatchMax   = 500
 )
+
+// watchBackoff is how long a watch waits after its n-th batch in a row failed
+// before uploading anything (Frame.io unreachable, destination gone): 30s,
+// doubling up to 15 minutes, instead of a new failing batch every few seconds.
+func watchBackoff(n int) time.Duration { return min(30*time.Second<<min(n-1, 5), 15*time.Minute) }
 
 type obs struct {
 	size, mtime int64
@@ -34,11 +40,36 @@ type obs struct {
 
 type watchState struct {
 	w       history.Watch
-	seen    map[string]obs
-	job     *Job
+	seen    map[string]obs // files not uploaded yet, by relative path
+	job     *Job           // the latest batch
+	busy    bool           // job hasn't fully finished (including its onFinish)
 	err     string
-	pending int    // files waiting to settle
-	link    string // Frame.io page of the destination folder
+	fails   int       // batches in a row that failed before uploading
+	retryAt time.Time // no new batch before this (after such failures)
+	pending int       // files waiting to settle
+	link    string    // Frame.io page of the destination folder
+
+	// A scan walks the tree only when a folder's mtime changed (an entry was
+	// added, removed or renamed) or watchWalkEvery passed; otherwise it
+	// re-checks just the files in seen. Both caches are replaced, never
+	// changed in place, and gen counts invalidations.
+	scanMu   sync.Mutex                   // one scan at a time
+	known    map[string]history.WatchFile // watch_files rows; nil = reload
+	dirs     map[string]int64             // folder → mtime at the last walk; nil = walk
+	lastWalk time.Time
+	gen      int
+}
+
+// invalidate drops the cached watch_files rows after they changed, and with
+// rewalk also forces a full walk (for files the scan had stopped tracking).
+// w.mu must be held.
+func (s *watchState) invalidate(rewalk bool) {
+	s.known = nil
+	if rewalk {
+		s.dirs = nil
+		s.fails, s.retryAt = 0, time.Time{} // the user changed something: try again now
+	}
+	s.gen++
 }
 
 type Watcher struct {
@@ -61,6 +92,7 @@ func newWatcher(m *Manager, interval, settle time.Duration) *Watcher {
 			w.ws[x.ID] = &watchState{w: x, seen: map[string]obs{}}
 		}
 	}
+	m.RetryWatch = w.retryBatch
 	go w.loop()
 	return w
 }
@@ -115,11 +147,7 @@ func (w *Watcher) Add(local, acct, folder, label string, includeExisting bool) (
 		return x, err
 	}
 	if !includeExisting {
-		var base []history.WatchFile
-		walkWatch(local, func(rel string, info fs.FileInfo) {
-			base = append(base, history.WatchFile{RelPath: rel, Size: info.Size(), Mtime: info.ModTime().UnixNano(), State: history.WatchIgnored})
-		})
-		w.m.Hist.PutWatchFiles(x.ID, base)
+		w.m.Hist.PutWatchFiles(x.ID, existingFiles(local))
 	}
 	w.mu.Lock()
 	s := &watchState{w: x, seen: map[string]obs{}}
@@ -130,16 +158,22 @@ func (w *Watcher) Add(local, acct, folder, label string, includeExisting bool) (
 	return x, nil
 }
 
+// existingFiles lists what's in a folder now, to be ignored by its watch.
+func existingFiles(local string) []history.WatchFile {
+	var base []history.WatchFile
+	walkWatch(local, func(rel string, info fs.FileInfo) {
+		base = append(base, history.WatchFile{RelPath: rel, Size: info.Size(), Mtime: info.ModTime().UnixNano(), State: history.WatchIgnored})
+	}, nil)
+	return base
+}
+
 func (w *Watcher) SetEnabled(id string, on bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if s := w.ws[id]; s != nil {
 		s.w.Enabled = on
 		w.m.Hist.SetWatchEnabled(id, on)
-		if !on {
-			s.seen = map[string]obs{}
-			s.pending = 0
-		}
+		s.seen, s.pending, s.dirs = map[string]obs{}, 0, nil
 	}
 }
 
@@ -179,11 +213,12 @@ func (w *Watcher) Update(id, local, acct, folder, label string, includeExisting 
 	}
 	folderChanged := s.w.LocalPath != local
 	destChanged := s.w.FolderID != folder || s.w.AccountID != acct
-	if s.job != nil && !s.job.Status().terminal() {
+	if s.busy {
 		s.job.cancel() // not a user cancel: its files stay eligible under the new settings
 	}
 	s.w.LocalPath, s.w.AccountID, s.w.FolderID, s.w.DestLabel = local, acct, folder, label
 	s.seen, s.pending, s.err = map[string]obs{}, 0, ""
+	s.invalidate(true)
 	if destChanged {
 		s.link = ""
 	}
@@ -199,13 +234,13 @@ func (w *Watcher) Update(id, local, acct, folder, label string, includeExisting 
 	if folderChanged {
 		w.m.Hist.ResetWatchFiles(id)
 		if !includeExisting {
-			var base []history.WatchFile
-			walkWatch(local, func(rel string, info fs.FileInfo) {
-				base = append(base, history.WatchFile{RelPath: rel, Size: info.Size(), Mtime: info.ModTime().UnixNano(), State: history.WatchIgnored})
-			})
-			w.m.Hist.PutWatchFiles(id, base)
+			w.m.Hist.PutWatchFiles(id, existingFiles(local))
 		}
 	}
+	// A scan that read watch_files while they were being rewritten must not keep that copy.
+	w.mu.Lock()
+	s.invalidate(true)
+	w.mu.Unlock()
 	w.m.Hist.Log("WATCH    edited   [%s] %s -> %s", id, local, label)
 	return nil
 }
@@ -213,6 +248,48 @@ func (w *Watcher) Update(id, local, acct, folder, label string, includeExisting 
 // RequeueCanceled lets files from canceled batches upload again.
 func (w *Watcher) RequeueCanceled(id string) {
 	w.m.Hist.RequeueCanceled(id)
+	w.mu.Lock()
+	if s := w.ws[id]; s != nil {
+		s.invalidate(true)
+	}
+	w.mu.Unlock()
+}
+
+// retryBatch makes a batch's unfinished files eligible again in their watch
+// (found by ID, or by folder for batches recorded without one).
+func (w *Watcher) retryBatch(id, localPath string, rels []string) error {
+	w.mu.Lock()
+	s := w.ws[id]
+	if s == nil {
+		for _, o := range w.ws {
+			if o.w.LocalPath == localPath {
+				s = o
+				break
+			}
+		}
+	}
+	if s == nil {
+		w.mu.Unlock()
+		return errors.New("this watch folder no longer exists")
+	}
+	err := w.m.Hist.ForgetWatchFiles(s.w.ID, rels)
+	s.invalidate(true)
+	w.mu.Unlock()
+	go w.scan(s)
+	return err
+}
+
+// record saves file states for a batch, unless its watch was removed or pointed
+// at another folder since the batch started (the rows would describe files
+// that are no longer watched). Holding w.mu keeps this in step with Update.
+func (w *Watcher) record(s *watchState, x history.Watch, files []history.WatchFile) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ws[x.ID] != s || s.w.LocalPath != x.LocalPath {
+		return
+	}
+	w.m.Hist.PutWatchFiles(x.ID, files)
+	s.invalidate(false)
 }
 
 type WatchView struct {
@@ -251,7 +328,7 @@ func (w *Watcher) Views() []WatchView {
 		switch {
 		case !s.w.Enabled:
 			v.State = "paused"
-		case s.job != nil && !s.job.Status().terminal():
+		case s.busy:
 			v.State = "uploading"
 			v.Detail = plural(len(s.job.files()), "file")
 		case s.err != "":
@@ -276,7 +353,9 @@ func tempName(name string) bool {
 		strings.HasSuffix(n, ".download") || strings.HasSuffix(n, ".tmp") || strings.HasSuffix(n, ".temp")
 }
 
-func walkWatch(root string, fn func(rel string, info fs.FileInfo)) error {
+// walkWatch calls fn for every file a watch would consider, and dirFn (if
+// set) with every folder it descends into and that folder's mtime.
+func walkWatch(root string, fn func(rel string, info fs.FileInfo), dirFn func(dir string, mtime int64)) error {
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if p == root {
@@ -291,7 +370,15 @@ func walkWatch(root string, fn func(rel string, info fs.FileInfo)) error {
 			}
 			return nil
 		}
-		if d.IsDir() || !d.Type().IsRegular() {
+		if d.IsDir() {
+			if dirFn != nil {
+				if info, err := d.Info(); err == nil {
+					dirFn(p, info.ModTime().UnixNano())
+				}
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		info, err := d.Info()
@@ -304,6 +391,16 @@ func walkWatch(root string, fn func(rel string, info fs.FileInfo)) error {
 	})
 }
 
+// dirsChanged reports whether a folder seen at the last walk changed or went away.
+func dirsChanged(dirs map[string]int64) bool {
+	for d, mt := range dirs {
+		if st, err := os.Stat(d); err != nil || st.ModTime().UnixNano() != mt {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *Watcher) setErr(s *watchState, e string) {
 	w.mu.Lock()
 	s.err = e
@@ -311,55 +408,94 @@ func (w *Watcher) setErr(s *watchState, e string) {
 }
 
 func (w *Watcher) scan(s *watchState) {
+	if !s.scanMu.TryLock() {
+		return // already scanning
+	}
+	defer s.scanMu.Unlock()
 	w.mu.Lock()
-	if !s.w.Enabled || (s.job != nil && !s.job.Status().terminal()) {
+	if !s.w.Enabled || s.busy || time.Now().Before(s.retryAt) {
 		w.mu.Unlock()
 		return
 	}
-	x := s.w
+	x, prevSeen, known, dirs, gen := s.w, s.seen, s.known, s.dirs, s.gen
+	walk := dirs == nil || time.Since(s.lastWalk) >= watchWalkEvery
 	w.mu.Unlock()
 
-	known, err := w.m.Hist.WatchFiles(x.ID)
-	if err != nil {
-		w.setErr(s, err.Error())
-		return
+	if known == nil {
+		var err error
+		if known, err = w.m.Hist.WatchFiles(x.ID); err != nil {
+			w.setErr(s, err.Error())
+			return
+		}
+		w.mu.Lock()
+		if s.gen == gen {
+			s.known = known
+		}
+		w.mu.Unlock()
 	}
+	if !walk && dirsChanged(dirs) {
+		walk = true
+	}
+
 	now := time.Now()
-	var ready []scanned
 	seen := map[string]obs{}
+	var settled []scanned
 	pending := 0
-	err = walkWatch(x.LocalPath, func(rel string, info fs.FileInfo) {
-		size, mt := info.Size(), info.ModTime().UnixNano()
+	consider := func(rel string, size, mtime int64) {
 		if k, ok := known[rel]; ok {
 			switch k.State {
 			case history.WatchUploaded, history.WatchIgnored, history.WatchCanceled:
 				return
 			case history.WatchFailed:
-				if k.Attempts >= watchMaxRetries && k.Size == size && k.Mtime == mt {
+				if k.Attempts >= watchMaxRetries && k.Size == size && k.Mtime == mtime {
 					return // gave up on this version of the file
 				}
 			}
 		}
-		w.mu.Lock()
-		prev, ok := s.seen[rel]
-		w.mu.Unlock()
-		o := obs{size, mt, now}
-		if ok && prev.size == size && prev.mtime == mt {
+		o := obs{size, mtime, now}
+		if prev, ok := prevSeen[rel]; ok && prev.size == size && prev.mtime == mtime {
 			o.since = prev.since
 		}
 		seen[rel] = o
 		if now.Sub(o.since) >= w.settle {
-			if len(ready) < watchBatchMax {
-				ready = append(ready, scanned{local: filepath.Join(x.LocalPath, filepath.FromSlash(rel)), rel: rel, size: size})
-			}
+			settled = append(settled, scanned{local: filepath.Join(x.LocalPath, filepath.FromSlash(rel)), rel: rel, size: size, mtime: mtime})
 		} else {
 			pending++
 		}
-	})
+	}
+	var err error
+	if walk {
+		dirs = map[string]int64{}
+		err = walkWatch(x.LocalPath, func(rel string, info fs.FileInfo) {
+			consider(rel, info.Size(), info.ModTime().UnixNano())
+		}, func(dir string, mtime int64) { dirs[dir] = mtime })
+	} else {
+		for rel := range prevSeen {
+			info, e := os.Stat(filepath.Join(x.LocalPath, filepath.FromSlash(rel)))
+			if e == nil && info.Mode().IsRegular() && info.Size() > 0 {
+				consider(rel, info.Size(), info.ModTime().UnixNano())
+			}
+		}
+	}
+	sort.Slice(settled, func(a, b int) bool { return settled[a].rel < settled[b].rel })
+	ready := settled[:min(len(settled), watchBatchMax)]
+
 	w.mu.Lock()
-	s.seen = seen
-	s.pending = pending
+	// Paused, edited or removed while scanning: these results are stale.
+	current := w.ws[x.ID] == s && s.w == x && s.gen == gen
+	if current {
+		s.seen, s.pending = seen, pending
+		switch {
+		case err != nil:
+			s.dirs = nil
+		case walk:
+			s.dirs, s.lastWalk = dirs, now
+		}
+	}
 	w.mu.Unlock()
+	if !current {
+		return
+	}
 	if err != nil {
 		w.setErr(s, "folder unavailable")
 		return
@@ -381,7 +517,7 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 	j := m.newJob("upload")
 	j.AccountID, j.FolderID, j.Dest = x.AccountID, x.FolderID, x.DestLabel
 	j.paths = []string{x.LocalPath}
-	j.watchLog = true
+	j.watchID, j.watchLog = x.ID, true
 	j.Source = x.LocalPath
 	n := len(items)
 	if n == 1 {
@@ -389,22 +525,19 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 	} else {
 		j.Title = fmt.Sprintf("%s · %d files", filepath.Base(x.LocalPath), n)
 	}
-	w.mu.Lock()
-	s.job = j
-	w.mu.Unlock()
 
-	mtimes := map[string]int64{}
-	for _, it := range items {
-		if info, err := os.Stat(it.local); err == nil {
-			mtimes[it.rel] = info.ModTime().UnixNano()
-		}
+	// The file list is saved up front, so a retry from History knows the batch
+	// even if it fails before uploading anything.
+	attempts := make(map[string]int, n)
+	mtimes := make(map[string]int64, n)
+	list := make([]*File, 0, n)
+	for i, it := range items {
+		attempts[it.rel], mtimes[it.rel] = known[it.rel].Attempts, it.mtime
+		list = append(list, &File{job: j, idx: i, Name: path.Base(it.rel), RelPath: it.rel, LocalPath: it.local, Size: it.size, status: Queued})
+		j.addTotal(it.size)
 	}
-	w.mu.Lock()
-	link := s.link
-	w.mu.Unlock()
-	if link != "" {
-		j.setLink(link)
-	}
+	j.setFiles(list)
+
 	var recMu sync.Mutex
 	recorded := map[string]bool{}
 	// A batch the user cancels stays canceled: those files aren't picked up again.
@@ -416,27 +549,27 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 		recMu.Lock()
 		for _, it := range items {
 			if !recorded[it.rel] {
-				canceled = append(canceled, history.WatchFile{RelPath: it.rel, Size: it.size, Mtime: mtimes[it.rel], State: history.WatchCanceled})
+				canceled = append(canceled, history.WatchFile{RelPath: it.rel, Size: it.size, Mtime: it.mtime, State: history.WatchCanceled})
 			}
 		}
 		recMu.Unlock()
 		if len(canceled) > 0 {
-			m.Hist.PutWatchFiles(x.ID, canceled)
+			w.record(s, x, canceled)
 			m.Hist.Log("WATCH    canceled [%s] %d files won't be uploaded by %s", j.ID, len(canceled), x.LocalPath)
 		}
 	}
 	j.onFileDone = func(f *File) {
 		f.mu.Lock()
-		st, e, rid := f.status, f.err, f.RemoteID
+		st, e, rid, size := f.status, f.err, f.RemoteID, f.Size
 		f.mu.Unlock()
-		wf := history.WatchFile{RelPath: f.RelPath, Size: f.Size, Mtime: mtimes[f.RelPath], RemoteID: rid}
+		wf := history.WatchFile{RelPath: f.RelPath, Size: size, Mtime: mtimes[f.RelPath], RemoteID: rid}
 		switch st {
 		case Done, Skipped:
 			wf.State = history.WatchUploaded
 		case Failed:
 			wf.State, wf.Error = history.WatchFailed, e
-			wf.Attempts = known[f.RelPath].Attempts + 1
-			if strings.Contains(e, "404") { // remote folder was deleted: rebuild the folder map
+			wf.Attempts = attempts[f.RelPath] + 1
+			if strings.Contains(e, "Frame.io API error 404") { // remote folder was deleted: rebuild the folder map
 				m.Hist.ClearWatchDirs(x.ID)
 			}
 		default:
@@ -445,13 +578,39 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 		recMu.Lock()
 		recorded[f.RelPath] = true
 		recMu.Unlock()
-		m.Hist.PutWatchFiles(x.ID, []history.WatchFile{wf})
+		w.record(s, x, []history.WatchFile{wf})
 	}
-	m.Hist.Start(j.record(), nil)
+
+	w.mu.Lock()
+	// The watch may have been paused, edited or removed since the scan.
+	if w.ws[x.ID] != s || s.w != x || s.busy {
+		w.mu.Unlock()
+		return
+	}
+	s.job, s.busy = j, true
+	link := s.link
+	w.mu.Unlock()
+	if link != "" {
+		j.setLink(link)
+	}
+	m.add(j)
+	j.persistStart()
 	m.Hist.Log("WATCH    batch    [%s] %s — %d files -> %s", j.ID, x.LocalPath, n, x.DestLabel)
 
 	go func() {
-		defer j.finish()
+		setupFailed := false
+		defer func() {
+			j.finish()
+			w.mu.Lock()
+			s.busy = false
+			if setupFailed {
+				s.fails++
+				s.retryAt = time.Now().Add(watchBackoff(s.fails))
+			} else {
+				s.fails = 0
+			}
+			w.mu.Unlock()
+		}()
 		j.setStatus(Resolving)
 		if link == "" {
 			j.linkToFolder(x.FolderID)
@@ -470,18 +629,16 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 		}
 		ids, err := watchFolders(j.ctx, m.API, m.Hist, x, dirsFor(rels))
 		if err != nil {
+			setupFailed = j.ctx.Err() == nil
 			j.fail(err)
 			w.setErr(s, err.Error())
 			return
 		}
-		list := make([]*File, 0, n)
-		for i, it := range items {
-			list = append(list, &File{job: j, idx: i, Name: path.Base(it.rel), RelPath: it.rel, LocalPath: it.local,
-				Size: it.size, RemoteParent: ids[parentDir(it.rel)], status: Queued})
-			j.addTotal(it.size)
+		for _, f := range list {
+			f.mu.Lock()
+			f.RemoteParent = ids[parentDir(f.RelPath)]
+			f.mu.Unlock()
 		}
-		j.setFiles(list)
-		j.persistStart()
 		j.setStatus(Running)
 		j.runFiles(j.uploadFile)
 	}()
@@ -514,7 +671,7 @@ func watchFolders(ctx context.Context, c *api.Client, h *history.Store, x histor
 		}
 		id, ok := kids[baseName(d)]
 		if !ok {
-			f, err := c.CreateFolder(ctx, x.AccountID, pid, baseName(d))
+			f, err := createFolder(ctx, c, x.AccountID, pid, baseName(d))
 			if err != nil {
 				return nil, fmt.Errorf("creating folder %q: %w", d, err)
 			}

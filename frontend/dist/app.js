@@ -65,11 +65,11 @@ const initials = (name) => (name || '?').split(/\s+/).filter(Boolean).slice(0, 2
 function statusLabel(status, kind) {
   return {
     queued: 'Queued', resolving: 'Preparing', running: kind === 'upload' ? 'Uploading' : kind === 'download' ? 'Downloading' : 'In progress',
-    finalizing: 'Finalizing', done: 'Completed', partial: 'Completed with errors', failed: 'Failed', canceled: 'Canceled',
+    done: 'Completed', partial: 'Completed with errors', failed: 'Failed', canceled: 'Canceled',
     interrupted: 'Interrupted', skipped: 'Skipped',
   }[status] || status;
 }
-const statusHTML = (status, kind) => `<span class="status ${status}"><span class="dot"></span><span class="trunc">${statusLabel(status, kind)}</span></span>`;
+const statusHTML = (status, kind) => `<span class="status ${status}" title="${esc(statusLabel(status, kind))}"><span class="dot"></span><span class="trunc">${statusLabel(status, kind)}</span></span>`;
 
 function toast(msg, kind = 'info', ms = 5000) {
   const el = document.createElement('div');
@@ -240,7 +240,7 @@ function renderState() {
   acc.onclick = null;
   if (st.logged_in) {
     const u = st.user || { name: 'Signed in', email: '' };
-    acc.innerHTML = `<div class="avatar">${u.avatar_url ? `<img src="${esc(u.avatar_url)}" alt="">` : esc(initials(u.name))}</div>
+    acc.innerHTML = `<div class="avatar">${esc(initials(u.name))}</div>
       <div class="who"><span class="n">${esc(u.name)}</span><span class="e">${esc(u.email)}</span></div>`;
     acc.classList.add('clickable');
     acc.onclick = () => showView('settings');
@@ -313,15 +313,23 @@ async function saveSettings(patch, okMsg) {
   } catch (e) { toast(errMsg(e), 'err'); }
 }
 
+// Clicking a sign-in button again restarts sign-in (the backend cancels the
+// attempt still waiting for the browser); only the latest attempt's result counts.
+let loginSeq = 0;
 async function login() {
   if (!S.state.settings.client_id) { showView('settings'); $('#client-id').focus(); return; }
-  $$('#signin-btn, #cta-signin, #side-signin').forEach((b) => { b.disabled = true; b.textContent = 'Waiting for browser…'; });
+  const seq = ++loginSeq;
+  $$('#signin-btn, #cta-signin, #side-signin').forEach((b) => { b.textContent = 'Waiting for browser…'; b.title = 'Click to open the sign-in page again'; });
+  let st;
   try {
-    S.state = await call('Login');
+    st = await call('Login');
   } catch (e) {
+    if (seq !== loginSeq) return;
     toast(errMsg(e), 'err', 12000);
-    S.state = await call('GetState');
+    st = await call('GetState');
   }
+  if (seq !== loginSeq) return;
+  S.state = st;
   renderState();
 }
 
@@ -445,6 +453,9 @@ function renderSnapshot() {
     S.prevStatus[j.id] = j.status;
   });
   [...wrap.children].forEach((el) => { if (!seen.has(el.dataset.id)) el.remove(); });
+  for (const id of Object.keys(S.prevStatus)) {
+    if (!seen.has(id)) { delete S.prevStatus[id]; delete S.filesFetchedAt[id]; S.expanded.delete(id); }
+  }
 }
 
 function onJobFinished(j) {
@@ -512,7 +523,7 @@ function updateJob(el, j) {
   if (!terminal && j.eta > 0 && !preparing) status = `${fmtDur(j.eta)} left`;
   if (j.status === 'partial') status = `${j.files_failed} of ${j.files_total} failed`;
   if (j.status === 'done') status = `${j.files_total} file${j.files_total === 1 ? '' : 's'} · ${fmtDur(j.elapsed)}`;
-  setHTML($('.c-status', el), `<span class="status ${j.status}"><span class="dot"></span><span class="trunc">${esc(status)}</span></span>`);
+  setHTML($('.c-status', el), `<span class="status ${j.status}" title="${esc(status)}"><span class="dot"></span><span class="trunc">${esc(status)}</span></span>`);
 
   const err = $('.error-line', el);
   const showErr = j.status === 'failed' && j.error;
@@ -525,7 +536,7 @@ function updateJob(el, j) {
   $('.a-retry', el).classList.toggle('hidden', !(terminal && j.status !== 'done'));
   $('.a-reveal', el).classList.toggle('hidden', j.kind !== 'download' || !j.dest);
   $('.a-files', el).classList.toggle('hidden', j.files_total === 0);
-  $('.a-files', el).innerHTML = S.expanded.has(j.id) ? I.chevronUp : I.chevron;
+  setHTML($('.a-files', el), S.expanded.has(j.id) ? I.chevronUp : I.chevron);
   if (S.expanded.has(j.id) && !terminal) refreshFiles(j.id);
 }
 
@@ -539,7 +550,7 @@ function toggleFiles(id, el) {
 }
 
 function fileRows(files, kind) {
-  const order = { running: 0, finalizing: 0, failed: 1, queued: 2, canceled: 3, done: 4, skipped: 4 };
+  const order = { running: 0, failed: 1, queued: 2, canceled: 3, done: 4, skipped: 4 };
   const sorted = files.map((f, i) => ({ ...f, i })).sort((a, b) => (order[a.status] ?? 5) - (order[b.status] ?? 5) || a.i - b.i);
   const shown = sorted.slice(0, 400);
   const html = shown.map((f) => {
@@ -583,7 +594,8 @@ async function refreshFiles(id, force) {
 
 async function retry(id) {
   try {
-    await call('Retry', id, '');
+    const newId = await call('Retry', id, '');
+    if (!newId) { toast('Its watch folder will upload these files again', 'ok'); loadWatches(); return; }
     showView('transfers');
   } catch (e) { toast(errMsg(e), 'err'); }
 }
@@ -596,7 +608,7 @@ function openDest(mode = 'upload', onPick = null) {
   D.onPick = onPick;
   $('#dest-existing-wrap').classList.toggle('hidden', mode !== 'watch');
   $('#dest-existing').checked = false;
-  $('.modal-title').textContent = mode === 'watch' ? `${baseName(D.watchPath)} → Frame.io` : 'Upload to';
+  $('#dest-modal .modal-title').textContent = mode === 'watch' ? `${baseName(D.watchPath)} → Frame.io` : 'Upload to';
   $('#dest-choose').textContent = mode === 'watch' ? 'Watch' : mode === 'pick' ? 'Choose' : 'Upload here';
   $('#dest-modal').classList.remove('hidden');
   D.stack = [];
@@ -723,11 +735,11 @@ async function loadHistory() {
     return `<div class="row ${status}" data-id="${t.id}">
       <div class="row-main hist-grid clickable-row">
         <div class="cell-name"><div class="kind-icon">${t.kind === 'upload' ? I.up : I.down}</div><div class="names"><div class="name" title="${esc(t.title)}">${esc(t.title)}</div><div class="sub" title="${esc(sub)}">${esc(sub)}</div></div></div>
-        <div class="cell">${fmtDate(t.created_at)}</div>
-        <div class="cell r">${t.files_done}/${t.files_total}</div>
-        <div class="cell r">${fmtBytes(t.total_bytes)}</div>
-        <div class="cell r" title="${t.avg_bps ? fmtMbit(t.avg_bps) : ''}">${fmtSpeed(t.avg_bps)}</div>
-        <div class="cell r">${fmtDur(dur)}</div>
+        <div class="cell" title="${esc(new Date(t.created_at).toLocaleString())}">${fmtDate(t.created_at)}</div>
+        <div class="cell r h-files" title="${t.files_done} of ${t.files_total} files">${t.files_done}/${t.files_total}</div>
+        <div class="cell r h-size">${fmtBytes(t.total_bytes)}</div>
+        <div class="cell r h-speed" title="${t.avg_bps ? fmtMbit(t.avg_bps) : ''}">${fmtSpeed(t.avg_bps)}</div>
+        <div class="cell r h-dur">${fmtDur(dur)}</div>
         <div>${statusHTML(status, t.kind)}</div>
         <div class="actions">
           ${t.link ? `<button class="icon-btn h-open" title="Open in Frame.io">${I.open}</button>` : ''}
@@ -805,8 +817,8 @@ async function loadWatches() {
         <div class="cell-name"><div class="kind-icon">${I.folder}</div><div class="names"><div class="name">${esc(w.name)}</div><div class="sub" title="${esc(w.local_path)}">${esc(shortPath(w.local_path))}</div></div></div>
         <div class="cell" title="${esc(w.dest_label)}">${esc(w.dest_label)}</div>
         <div><span class="status ${w.state}" title="${esc(label)}"><span class="dot"></span><span class="trunc">${esc(label)}</span></span></div>
-        <div class="cell r">${w.uploaded}${w.failed ? ` <span style="color:var(--error-text)">· ${w.failed} failed</span>` : ''}${w.canceled ? ` <span class="muted-note">· ${w.canceled} canceled</span>` : ''}</div>
-        <div class="cell">${w.last_upload ? fmtDate(w.last_upload) : '—'}</div>
+        <div class="cell r w-uploaded" title="${w.uploaded} uploaded${w.failed ? ` · ${w.failed} failed` : ''}${w.canceled ? ` · ${w.canceled} canceled` : ''}">${w.uploaded}${w.failed ? ` <span style="color:var(--error-text)">· ${w.failed} failed</span>` : ''}${w.canceled ? ` <span class="muted-note">· ${w.canceled} canceled</span>` : ''}</div>
+        <div class="cell w-last">${w.last_upload ? fmtDate(w.last_upload) : '—'}</div>
         <div class="actions">
           <button class="icon-btn w-toggle" title="${w.enabled ? 'Pause' : 'Resume'}">${w.enabled ? pause : play}</button>
           <button class="icon-btn w-edit" title="Edit">${I.pencil}</button>

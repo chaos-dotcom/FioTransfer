@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -37,10 +38,17 @@ type App struct {
 	mgr  *xfer.Manager
 	wat  *xfer.Watcher
 
-	meMu sync.Mutex
-	me   *api.User
+	meMu       sync.Mutex
+	me         *api.User
+	meFetching bool
+	meTried    time.Time // last attempt to fetch me
 
-	started time.Time
+	loginMu     sync.Mutex // one sign-in at a time
+	cancelMu    sync.Mutex
+	loginCancel context.CancelFunc // stops the sign-in waiting for the browser
+
+	openAtLogin atomic.Bool // cached for the menu bar, refreshed every 30s
+	started     time.Time
 }
 
 func NewApp() *App {
@@ -64,21 +72,22 @@ func (a *App) startup(ctx context.Context) {
 		os.Exit(1)
 	}
 	a.hist = h
+	h.MarkInterrupted() // only the app does this: the CLI may run while the app is transferring
 	a.mgr = xfer.NewManager(a.api, h, a.Settings)
 	a.wat = xfer.NewWatcher(a.mgr)
-	var wasActive bool
+	busy := map[string]bool{} // jobs that ran since the last notification
 	a.mgr.OnUpdate = func(s xfer.Snapshot) {
 		runtime.EventsEmit(ctx, "snapshot", s)
 		active := false
 		for _, j := range s.Jobs {
-			if j.Status == xfer.Running || j.Status == xfer.Resolving || j.Status == xfer.Queued || j.Status == xfer.Finalizing {
-				active = true
+			if j.Status == xfer.Running || j.Status == xfer.Resolving || j.Status == xfer.Queued {
+				busy[j.ID], active = true, true
 			}
 		}
-		if wasActive && !active {
-			a.notifyFinished(s)
+		if !active && len(busy) > 0 {
+			a.notifyFinished(s, busy)
+			busy = map[string]bool{}
 		}
-		wasActive = active
 	}
 	runtime.OnFileDrop(ctx, func(x, y int, paths []string) {
 		runtime.EventsEmit(ctx, "files-dropped", paths)
@@ -103,7 +112,7 @@ func (a *App) onTray(action int) {
 			a.showWindow()
 		}
 	case trayLogin:
-		_ = setLogin(!loginEnabled())
+		_ = a.setOpenAtLogin(!loginEnabled())
 		runtime.EventsEmit(a.ctx, "state-changed")
 	case trayQuit:
 		runtime.Quit(a.ctx)
@@ -114,22 +123,12 @@ func (a *App) onTray(action int) {
 func (a *App) trayLoop() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	for range t.C {
-		syncDock()
-		var up, down float64
-		active := 0
-		for _, j := range a.mgr.Snapshot().Jobs {
-			switch j.Status {
-			case xfer.Done, xfer.Partial, xfer.Failed, xfer.Canceled:
-				continue
-			}
-			active++
-			if j.Kind == "upload" {
-				up += j.Speed
-			} else {
-				down += j.Speed
-			}
+	for n := 0; ; n++ {
+		if n%30 == 0 { // the login item can also be removed in System Settings
+			a.openAtLogin.Store(loginEnabled())
 		}
+		syncDock()
+		up, down, active := a.mgr.Activity()
 		status, title := "Idle", ""
 		if active > 0 {
 			var parts []string
@@ -145,8 +144,9 @@ func (a *App) trayLoop() {
 				status += " · " + title
 			}
 		}
-		traySet(status, title, loginEnabled())
+		traySet(status, title, a.openAtLogin.Load())
 		setTransfersActive(active > 0)
+		<-t.C
 	}
 }
 
@@ -190,15 +190,23 @@ func (a *App) beforeClose(ctx context.Context) bool {
 	return err != nil || res != "Quit"
 }
 
-func (a *App) notifyFinished(s xfer.Snapshot) {
-	var done, failed int
+// notifyFinished posts a notification for the jobs that ran since the last
+// one. Watch-folder batches only notify when something failed.
+func (a *App) notifyFinished(s xfer.Snapshot, ran map[string]bool) {
+	var ok, failed int
 	for _, j := range s.Jobs {
-		switch j.Status {
-		case xfer.Done:
-			done++
-		case xfer.Failed, xfer.Partial:
-			failed++
+		if !ran[j.ID] {
+			continue
 		}
+		switch {
+		case j.Status == xfer.Failed || j.Status == xfer.Partial:
+			failed++
+		case j.Status == xfer.Done && !j.Watch:
+			ok++
+		}
+	}
+	if ok+failed == 0 {
+		return
 	}
 	msg := "Transfers complete"
 	if failed > 0 {
@@ -231,24 +239,47 @@ func (a *App) GetState() State {
 		st.LogFile = a.hist.LogPath()
 	}
 	if st.LoggedIn {
-		st.User = a.user()
-		st.LoggedIn = a.auth.LoggedIn() // a dead session is cleared while fetching the user
+		st.User = a.cachedUser()
 	}
 	return st
 }
 
-func (a *App) user() *api.User {
+// cachedUser returns the signed-in user without waiting on the network. If it
+// isn't known yet it is fetched in the background (at most every 30s), and the
+// UI is told to refresh when the answer is in; a dead session is cleared then.
+func (a *App) cachedUser() *api.User {
 	a.meMu.Lock()
 	defer a.meMu.Unlock()
-	if a.me != nil {
-		return a.me
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if me, err := a.api.Me(ctx); err == nil {
-		a.me = me
+	if a.me == nil && !a.meFetching && time.Since(a.meTried) > 30*time.Second {
+		a.meFetching = true
+		go func() {
+			a.fetchUser()
+			runtime.EventsEmit(a.ctx, "state-changed")
+		}()
 	}
 	return a.me
+}
+
+// fetchUser asks Frame.io who is signed in and caches the answer.
+func (a *App) fetchUser() *api.User {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	me, err := a.api.Me(ctx)
+	a.meMu.Lock()
+	defer a.meMu.Unlock()
+	a.meFetching, a.meTried = false, time.Now()
+	if err != nil {
+		return nil
+	}
+	a.me = me
+	return me
+}
+
+// forgetUser drops the cached user (after signing in or out).
+func (a *App) forgetUser() {
+	a.meMu.Lock()
+	a.me, a.meTried = nil, time.Time{}
+	a.meMu.Unlock()
 }
 
 func (a *App) SaveSettings(s config.Settings) (State, error) {
@@ -266,28 +297,40 @@ func (a *App) SaveSettings(s config.Settings) (State, error) {
 	return a.GetState(), nil
 }
 
+// Login signs in through the browser. Clicking Sign in again restarts it: the
+// attempt still waiting for the browser (e.g. its tab was closed) is canceled,
+// which also frees the callback port.
 func (a *App) Login() (State, error) {
+	a.cancelMu.Lock()
+	if a.loginCancel != nil {
+		a.loginCancel()
+	}
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.loginCancel = cancel
+	a.cancelMu.Unlock()
+	defer cancel()
+
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	if ctx.Err() != nil { // a newer click took over while this one waited
+		return a.GetState(), auth.ErrLoginCanceled
+	}
 	s := a.Settings()
-	err := a.auth.Login(a.ctx, s.RedirectPort, func(u string) { runtime.BrowserOpenURL(a.ctx, u) })
+	err := a.auth.Login(ctx, s.RedirectPort, func(u string) { runtime.BrowserOpenURL(a.ctx, u) })
 	if err != nil {
 		return a.GetState(), err
 	}
-	a.meMu.Lock()
-	a.me = nil
-	a.meMu.Unlock()
+	a.forgetUser()
 	runtime.WindowShow(a.ctx)
-	st := a.GetState()
-	if st.User == nil {
-		return st, errors.New("Frame.io rejected the Adobe sign-in (is the Frame.io API added to the Adobe project?)")
+	if a.fetchUser() == nil {
+		return a.GetState(), errors.New("Frame.io rejected the Adobe sign-in (is the Frame.io API added to the Adobe project?)")
 	}
-	return st, nil
+	return a.GetState(), nil
 }
 
 func (a *App) Logout() State {
 	a.auth.Logout()
-	a.meMu.Lock()
-	a.me = nil
-	a.meMu.Unlock()
+	a.forgetUser()
 	return a.GetState()
 }
 
@@ -437,9 +480,11 @@ func (a *App) Snapshot() xfer.Snapshot { return a.mgr.Snapshot() }
 
 func (a *App) JobFiles(id string) []xfer.FileView { return a.mgr.Files(id) }
 
+// Retry re-runs a transfer and returns the new job's ID, or "" when a watch
+// folder took the files back to upload them itself.
 func (a *App) Retry(id, passphrase string) (string, error) {
 	j, err := a.mgr.Retry(id, passphrase)
-	if err != nil {
+	if err != nil || j == nil {
 		return "", err
 	}
 	return j.ID, nil
@@ -452,8 +497,6 @@ func (a *App) History(query, kind string, limit int) ([]history.Transfer, error)
 }
 
 func (a *App) HistoryFiles(id string) ([]history.File, error) { return a.hist.Files(id) }
-
-func (a *App) DeleteHistory(id string) { a.hist.Delete(id) }
 
 func (a *App) ExportHistory() (string, error) {
 	p, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{Title: "Export transfer history",
@@ -478,8 +521,6 @@ func (a *App) Reveal(path string) error {
 	return fmt.Errorf("%s no longer exists", path)
 }
 
-func (a *App) OpenPath(path string) error { return exec.Command("/usr/bin/open", path).Run() }
-
 func (a *App) OpenURL(url string) { runtime.BrowserOpenURL(a.ctx, url) }
 
 func (a *App) OpenLogs() error { return exec.Command("/usr/bin/open", config.LogDir()).Run() }
@@ -503,8 +544,14 @@ func (a *App) SetWatchEnabled(id string, on bool) { a.wat.SetEnabled(id, on) }
 func (a *App) RemoveWatch(id string) { a.wat.Remove(id) }
 
 func (a *App) SetOpenAtLogin(on bool) (State, error) {
-	err := setLogin(on)
+	err := a.setOpenAtLogin(on)
 	return a.GetState(), err
+}
+
+func (a *App) setOpenAtLogin(on bool) error {
+	err := setLogin(on)
+	a.openAtLogin.Store(loginEnabled())
+	return err
 }
 
 func (a *App) UpdateWatch(id, local, acct, folder, label string, includeExisting bool) error {

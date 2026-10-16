@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS transfer_files(
   transfer_id TEXT, idx INTEGER, rel_path TEXT, local_path TEXT, size INTEGER,
   status TEXT, error TEXT, note TEXT, remote_parent TEXT, remote_id TEXT, view_url TEXT,
   asset_id TEXT, finished_at INTEGER, PRIMARY KEY(transfer_id, idx));
+CREATE INDEX IF NOT EXISTS transfer_files_asset ON transfer_files(asset_id);
+CREATE INDEX IF NOT EXISTS transfer_files_local ON transfer_files(local_path);
 `
 
 func Open(dir, logDir string) (*Store, error) {
@@ -93,13 +95,11 @@ func Open(dir, logDir string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) LogDir() string { return s.logDir }
-
 // MarkInterrupted flags transfers that were running when the app last quit.
 func (s *Store) MarkInterrupted() {
 	now := time.Now().UnixMilli()
-	s.db.Exec(`UPDATE transfer_files SET status='interrupted' WHERE status IN ('queued','running','finalizing','resolving')`)
-	s.db.Exec(`UPDATE transfers SET status='interrupted', finished_at=? WHERE status IN ('queued','running','resolving','finalizing')`, now)
+	s.db.Exec(`UPDATE transfer_files SET status='interrupted' WHERE status IN ('queued','running','resolving')`)
+	s.db.Exec(`UPDATE transfers SET status='interrupted', finished_at=? WHERE status IN ('queued','running','resolving')`, now)
 }
 
 func (s *Store) Start(t Transfer, files []File) error {
@@ -221,9 +221,33 @@ func (s *Store) Files(id string) ([]File, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) Delete(id string) {
-	s.db.Exec(`DELETE FROM transfer_files WHERE transfer_id=?`, id)
-	s.db.Exec(`DELETE FROM transfers WHERE id=?`, id)
+// AssetPath returns where assetID was most recently downloaded inside dir by a
+// transfer other than exclude, or "" if never.
+func (s *Store) AssetPath(assetID, dir, exclude string) string {
+	if assetID == "" {
+		return ""
+	}
+	rows, err := s.db.Query(`SELECT local_path FROM transfer_files WHERE asset_id=? AND transfer_id<>? ORDER BY rowid DESC LIMIT 50`, assetID, exclude)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p sql.NullString
+		if rows.Scan(&p) == nil && filepath.Dir(p.String) == dir {
+			return p.String
+		}
+	}
+	return ""
+}
+
+// PathOwner returns the asset last downloaded to localPath by a transfer other
+// than exclude, or "" if history has no finished download there.
+func (s *Store) PathOwner(localPath, exclude string) string {
+	var id string
+	s.db.QueryRow(`SELECT asset_id FROM transfer_files WHERE local_path=? AND transfer_id<>? AND asset_id<>''
+		AND status IN ('done','skipped') ORDER BY rowid DESC LIMIT 1`, localPath, exclude).Scan(&id)
+	return id
 }
 
 // ExportCSV writes one row per file across all transfers.

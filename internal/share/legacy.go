@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"time"
 
@@ -52,10 +53,8 @@ func (c *LegacyClient) get(ctx context.Context, p string, q url.Values, out any)
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
 		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			if err := netx.Sleep(ctx, netx.Backoff(attempt)); err != nil {
+				return nil, err
 			}
 		}
 		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
@@ -147,8 +146,13 @@ func pages[T any](ctx context.Context, c *LegacyClient, p string, pageSize int) 
 			return nil, c.mapAuthErr(err)
 		}
 		all = append(all, batch...)
-		total, _ := strconv.Atoi(h.Get("total-pages"))
-		if len(batch) == 0 || page >= total || page > 10000 {
+		total, terr := strconv.Atoi(h.Get("total-pages"))
+		switch {
+		case len(batch) == 0 || page > 10000:
+			return all, nil
+		case terr == nil && page >= total:
+			return all, nil
+		case terr != nil && len(batch) < pageSize: // no page count: a short page is the last
 			return all, nil
 		}
 	}
@@ -158,71 +162,94 @@ func (c *LegacyClient) List(ctx context.Context, progress func(found int)) ([]Fi
 	type item struct {
 		Asset *legacyAsset `json:"asset"`
 	}
-	items, err := pages[item](ctx, c, "/review_links/"+c.ReviewID+"/items/shared", 100)
+	l := newLister(ctx, progress)
+	defer l.cancel(nil)
+	var items []item
+	err := l.call(func(ctx context.Context) (err error) {
+		items, err = pages[item](ctx, c, "/review_links/"+c.ReviewID+"/items/shared", 100)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	var files []File
-	add := func(a *legacyAsset, prefix string) {
-		f := File{AssetID: a.ID, RelPath: path.Join(prefix, safeName(a.Name)), Size: a.Filesize}
-		if a.Original != nil {
-			f.URL = *a.Original
-		} else {
-			f.Problem = "original not available"
-		}
-		files = append(files, f)
-		if progress != nil {
-			progress(len(files))
-		}
-	}
-	var walk func(a *legacyAsset, prefix string, depth int) error
-	walk = func(a *legacyAsset, prefix string, depth int) error {
-		if depth > 64 {
-			return errors.New("folder nesting too deep")
-		}
-		switch a.Type {
-		case "folder":
-			kids, err := pages[legacyAsset](ctx, c, "/assets/"+a.ID+"/children", 200)
-			if err != nil {
-				return err
-			}
-			for i := range kids {
-				if err := walk(&kids[i], path.Join(prefix, safeName(a.Name)), depth+1); err != nil {
-					return err
-				}
-			}
-		case "version_stack":
-			head := a.CoverAsset
-			if head == nil || head.Original == nil {
-				versions, err := pages[legacyAsset](ctx, c, "/assets/"+a.ID+"/children", 200)
-				if err != nil {
-					return err
-				}
-				for i := range versions {
-					if head == nil || head.Original == nil || versions[i].Index > head.Index {
-						head = &versions[i]
-					}
-				}
-			}
-			if head == nil {
-				return nil
-			}
-			add(head, prefix)
-		default:
-			add(a, prefix)
-		}
-		return nil
-	}
+	var top []*legacyAsset
 	for _, it := range items {
-		if it.Asset == nil {
-			continue
+		if it.Asset != nil {
+			top = append(top, it.Asset)
 		}
-		if err := walk(it.Asset, "", 0); err != nil {
-			return nil, err
-		}
+	}
+	files, err := c.walk(l, top, "", 0)
+	if err != nil {
+		return nil, err
 	}
 	dedupePaths(files)
 	return files, nil
+}
+
+// walk lists assets in order, descending into folders and picking each version
+// stack's newest version. Folders (and stacks without a usable cover) need a
+// request each; those run in parallel.
+func (c *LegacyClient) walk(l *lister, assets []*legacyAsset, prefix string, depth int) ([]File, error) {
+	if depth > 64 {
+		return nil, errors.New("folder nesting too deep")
+	}
+	parts := make([][]File, len(assets))
+	var fetch []int
+	for i, a := range assets {
+		switch {
+		case a.Type == "folder", a.Type == "version_stack" && (a.CoverAsset == nil || a.CoverAsset.Original == nil):
+			fetch = append(fetch, i)
+		case a.Type == "version_stack":
+			parts[i] = []File{legacyFile(a.CoverAsset, prefix)}
+		default:
+			parts[i] = []File{legacyFile(a, prefix)}
+		}
+	}
+	l.found(len(assets) - len(fetch))
+	err := l.parallel(fetch, func(i int) error {
+		a := assets[i]
+		var kids []legacyAsset
+		err := l.call(func(ctx context.Context) (err error) {
+			kids, err = pages[legacyAsset](ctx, c, "/assets/"+a.ID+"/children", 200)
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		if a.Type == "folder" {
+			sub := make([]*legacyAsset, len(kids))
+			for k := range kids {
+				sub[k] = &kids[k]
+			}
+			parts[i], err = c.walk(l, sub, path.Join(prefix, SafeName(a.Name)), depth+1)
+			return err
+		}
+		head := a.CoverAsset
+		for k := range kids {
+			if head == nil || head.Original == nil || kids[k].Index > head.Index {
+				head = &kids[k]
+			}
+		}
+		if head != nil {
+			parts[i] = []File{legacyFile(head, prefix)}
+			l.found(1)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return slices.Concat(parts...), nil
+}
+
+func legacyFile(a *legacyAsset, prefix string) File {
+	f := File{AssetID: a.ID, RelPath: path.Join(prefix, SafeName(a.Name)), Size: a.Filesize}
+	if a.Original != nil {
+		f.URL = *a.Original
+	} else {
+		f.Problem = "original not available"
+	}
+	return f
 }
 
 func (c *LegacyClient) FreshURL(ctx context.Context, assetID string) (string, error) {

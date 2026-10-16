@@ -70,6 +70,8 @@ func main() {
 		seg := fs.Int("seg", settings.SegmentMB, "segment size in MiB")
 		sub := fs.Bool("subfolder", false, "create a folder named after the share")
 		link := parseWithPositional(fs, args)
+		checkRange("-n", *streams, 1, 128)
+		checkRange("--seg", *seg, 8, 512)
 		settings.Streams, settings.SegmentMB = *streams, *seg
 		m := newManager(client, settings)
 		if err := os.MkdirAll(*out, 0o755); err != nil {
@@ -128,6 +130,7 @@ func main() {
 		if len(paths) == 0 {
 			usage()
 		}
+		checkRange("-n", *streams, 1, 128)
 		settings.Streams = *streams
 		m := newManager(client, settings)
 		j, err := m.StartUpload(xfer.UploadOptions{Paths: paths, AccountID: *acct, FolderID: *folder, DestLabel: "folder " + *folder})
@@ -176,7 +179,16 @@ func openHistory() *history.Store {
 }
 
 func newManager(c *api.Client, s config.Settings) *xfer.Manager {
-	return xfer.NewManager(c, openHistory(), func() config.Settings { return s })
+	m := xfer.NewManager(c, openHistory(), func() config.Settings { return s })
+	m.SetKeepAwake(true)
+	return m
+}
+
+// checkRange exits with an error if a numeric flag is out of bounds.
+func checkRange(flag string, v, lo, hi int) {
+	if v < lo || v > hi {
+		fatal(fmt.Sprintf("%s must be between %d and %d", flag, lo, hi))
+	}
 }
 
 // follow prints progress until the job finishes; returns an exit code.
@@ -193,13 +205,13 @@ func follow(ctx context.Context, m *xfer.Manager, id string) int {
 			ctx = context.Background()
 		case <-t.C:
 		}
+		snap := m.Snapshot()
 		var v xfer.JobView
-		for _, j := range m.Snapshot().Jobs {
+		for _, j := range snap.Jobs {
 			if j.ID == id {
 				v = j
 			}
 		}
-		snap := m.Snapshot()
 		line := fmt.Sprintf("%-9s %5.1f%%  %s / %s  %s/s  files %d/%d  streams %d",
 			v.Status, pct(v.Done, v.Total), human(v.Done), human(v.Total), human(int64(v.Speed)), v.FilesDone, v.FilesTotal, snap.ActiveStreams)
 		if v.Phase != "" {

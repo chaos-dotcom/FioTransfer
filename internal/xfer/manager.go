@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -31,15 +32,14 @@ import (
 type Status string
 
 const (
-	Queued     Status = "queued"
-	Resolving  Status = "resolving"
-	Running    Status = "running"
-	Finalizing Status = "finalizing"
-	Done       Status = "done"
-	Partial    Status = "partial"
-	Failed     Status = "failed"
-	Canceled   Status = "canceled"
-	Skipped    Status = "skipped"
+	Queued    Status = "queued"
+	Resolving Status = "resolving"
+	Running   Status = "running"
+	Done      Status = "done"
+	Partial   Status = "partial"
+	Failed    Status = "failed"
+	Canceled  Status = "canceled"
+	Skipped   Status = "skipped"
 )
 
 func (s Status) terminal() bool {
@@ -95,11 +95,26 @@ func (f *File) unwind(n int64) {
 
 func (f *File) setStatus(s Status, note string) {
 	f.mu.Lock()
-	f.status = s
+	f.setStatusLocked(s)
 	if note != "" {
 		f.note = note
 	}
 	f.mu.Unlock()
+}
+
+// setStatusLocked changes the status and keeps the job's per-status counts in
+// step, so views never have to walk the file list. f.mu must be held.
+func (f *File) setStatusLocked(s Status) {
+	if f.status == s {
+		return
+	}
+	if c := f.job.counter(f.status); c != nil {
+		c.Add(-1)
+	}
+	if c := f.job.counter(s); c != nil {
+		c.Add(1)
+	}
+	f.status = s
 }
 
 func (f *File) setNote(n string) {
@@ -135,11 +150,15 @@ type Job struct {
 	userCanceled atomic.Bool
 	verifyWG     sync.WaitGroup
 
+	watchID    string      // watch-folder batches: the watch they belong to
 	watchLog   bool        // append to a daily watch-folder log
 	onFileDone func(*File) // called after each file finishes (watch folders)
 	onFinish   func(*Job)
 
 	Files []*File
+
+	// Files per status, kept current by File.setStatusLocked.
+	nDone, nFailed, nSkipped, nCanceled, nActive atomic.Int32
 
 	total atomic.Int64
 	done  atomic.Int64
@@ -158,6 +177,22 @@ type Job struct {
 }
 
 func (j *Job) addTotal(n int64) { j.total.Add(n) }
+
+func (j *Job) counter(s Status) *atomic.Int32 {
+	switch s {
+	case Done:
+		return &j.nDone
+	case Failed:
+		return &j.nFailed
+	case Skipped:
+		return &j.nSkipped
+	case Canceled:
+		return &j.nCanceled
+	case Running:
+		return &j.nActive
+	}
+	return nil
+}
 
 func (j *Job) setLink(u string) {
 	if u == "" {
@@ -178,8 +213,14 @@ func (j *Job) linkToFolder(folderID string) {
 	}
 }
 
-// setFiles publishes the job's file list (read concurrently by the UI).
+// setFiles publishes the job's file list (read concurrently by the UI) and
+// seeds the per-status counts.
 func (j *Job) setFiles(fs []*File) {
+	for _, f := range fs {
+		if c := j.counter(f.status); c != nil {
+			c.Add(1)
+		}
+	}
 	j.mu.Lock()
 	j.Files = fs
 	j.mu.Unlock()
@@ -236,25 +277,38 @@ type Manager struct {
 	OnUpdate func(Snapshot)
 	// VerifyDelays spaces out the post-upload Frame.io status checks.
 	VerifyDelays []time.Duration
+	// RetryWatch re-queues a watch-folder batch's unfinished files in their
+	// watch instead of starting a separate upload (set by NewWatcher).
+	RetryWatch func(watchID, localPath string, rels []string) error
 
 	mu    sync.Mutex
 	jobs  []*Job
 	dirty atomic.Bool
 
+	inspectMu sync.Mutex
+	inspected *shareListing // last InspectLink result, for the download that follows
+
 	progressLogged map[string]time.Time // last progress line per running job
 
+	awake      atomic.Bool // hold a caffeinate assertion while transfers run
 	caffeinate *exec.Cmd
 }
+
+// keepWatchJobs is how many finished watch-folder batches stay in the list.
+const keepWatchJobs = 10
 
 func NewManager(a *api.Client, h *history.Store, settings func() config.Settings) *Manager {
 	s := settings()
 	m := &Manager{API: a, Hist: h, Settings: settings, Limiter: NewLimiter(s.Streams), Secrets: keychainStore{}, VerifyDelays: verifyDelays}
-	h.MarkInterrupted()
 	go m.loop()
 	return m
 }
 
 func (m *Manager) touch() { m.dirty.Store(true) }
+
+// SetKeepAwake makes the manager keep the Mac from idle-sleeping while
+// transfers run. The CLI needs it; the app does this from its menu bar item.
+func (m *Manager) SetKeepAwake(on bool) { m.awake.Store(on) }
 
 func (m *Manager) loop() {
 	t := time.NewTicker(500 * time.Millisecond)
@@ -270,7 +324,7 @@ func (m *Manager) loop() {
 			}
 		}
 		m.mu.Unlock()
-		m.keepAwake(active)
+		m.holdAwake(active && m.awake.Load())
 		m.logProgress()
 		if (active || m.dirty.Swap(false)) && m.OnUpdate != nil {
 			m.OnUpdate(m.Snapshot())
@@ -278,16 +332,16 @@ func (m *Manager) loop() {
 	}
 }
 
-// keepAwake holds a caffeinate assertion while transfers run so the Mac
-// doesn't idle-sleep mid-transfer.
-func (m *Manager) keepAwake(active bool) {
-	if active && m.caffeinate == nil {
+// holdAwake keeps a caffeinate assertion while on, so the Mac doesn't
+// idle-sleep mid-transfer.
+func (m *Manager) holdAwake(on bool) {
+	if on && m.caffeinate == nil {
 		cmd := exec.Command("/usr/bin/caffeinate", "-i", "-w", fmt.Sprint(os.Getpid()))
 		if cmd.Start() == nil {
 			m.caffeinate = cmd
 			go cmd.Wait()
 		}
-	} else if !active && m.caffeinate != nil {
+	} else if !on && m.caffeinate != nil {
 		_ = m.caffeinate.Process.Kill()
 		m.caffeinate = nil
 	}
@@ -301,14 +355,18 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// newJob makes a job; it appears in the list once its fields are set and add is called.
 func (m *Manager) newJob(kind string) *Job {
 	ctx, cancel := context.WithCancel(context.Background())
-	j := &Job{mgr: m, ID: newID(), Kind: kind, status: Queued, created: time.Now(), ctx: ctx, cancel: cancel}
+	return &Job{mgr: m, ID: newID(), Kind: kind, status: Queued, created: time.Now(), ctx: ctx, cancel: cancel}
+}
+
+// add publishes a job (the UI reads its fields from then on).
+func (m *Manager) add(j *Job) {
 	m.mu.Lock()
 	m.jobs = append(m.jobs, j)
 	m.mu.Unlock()
 	m.touch()
-	return j
 }
 
 func (m *Manager) job(id string) *Job {
@@ -341,15 +399,28 @@ func (m *Manager) CancelAll() {
 // ClearFinished removes finished jobs from the active list (history keeps them).
 func (m *Manager) ClearFinished() {
 	m.mu.Lock()
-	keep := m.jobs[:0]
-	for _, j := range m.jobs {
-		if !j.Status().terminal() {
-			keep = append(keep, j)
-		}
-	}
-	m.jobs = keep
+	m.jobs = slices.DeleteFunc(m.jobs, func(j *Job) bool { return j.Status().terminal() })
 	m.mu.Unlock()
 	m.touch()
+}
+
+// pruneWatchJobs drops all but the newest keepWatchJobs finished watch-folder
+// batches, so a long-running watch doesn't grow the list without end.
+func (m *Manager) pruneWatchJobs() {
+	m.mu.Lock()
+	n := 0
+	drop := map[*Job]bool{}
+	for i := len(m.jobs) - 1; i >= 0; i-- {
+		if j := m.jobs[i]; j.watchID != "" && j.Status().terminal() {
+			if n++; n > keepWatchJobs {
+				drop[j] = true
+			}
+		}
+	}
+	if len(drop) > 0 {
+		m.jobs = slices.DeleteFunc(m.jobs, func(j *Job) bool { return drop[j] })
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) Active() bool {
@@ -361,6 +432,26 @@ func (m *Manager) Active() bool {
 		}
 	}
 	return false
+}
+
+// Activity sums the speed of running transfers by direction, without
+// building full views (for the menu bar).
+func (m *Manager) Activity() (up, down float64, active int) {
+	m.mu.Lock()
+	jobs := slices.Clone(m.jobs)
+	m.mu.Unlock()
+	for _, j := range jobs {
+		if j.Status().terminal() {
+			continue
+		}
+		active++
+		if j.Kind == "upload" {
+			up += j.meter.Rate()
+		} else {
+			down += j.meter.Rate()
+		}
+	}
+	return up, down, active
 }
 
 // ---------- Download ----------
@@ -383,6 +474,7 @@ func (m *Manager) StartDownload(o DownloadOptions) (*Job, error) {
 	j := m.newJob("download")
 	j.Source, j.Dest, j.passphrase, j.subfolder = o.Link, o.DestDir, o.Passphrase, o.Subfolder
 	j.Title = "Share link"
+	m.add(j)
 	m.Hist.Start(j.record(), nil)
 	m.Hist.Log("DOWNLOAD queued   [%s] %s -> %s", j.ID, j.Source, j.Dest)
 	go j.runDownload()
@@ -391,63 +483,105 @@ func (m *Manager) StartDownload(o DownloadOptions) (*Job, error) {
 
 func passphraseKey(l share.Link) string { return l.Kind + "-" + l.ID }
 
+// shareListing is a resolved and listed share link.
+type shareListing struct {
+	key   string // link and passphrase as given
+	link  share.Link
+	pass  string // passphrase in use (given, or remembered in the Keychain)
+	info  *share.Info
+	files []share.File
+	at    time.Time
+}
+
+// inspectTTL is how long a preview's listing is reused by the download that follows.
+const inspectTTL = 5 * time.Minute
+
+func listingKey(raw, passphrase string) string { return strings.TrimSpace(raw) + "\x00" + passphrase }
+
+// listShare resolves a link and lists its files. The result is returned even
+// on error once the link resolved, so callers can report what it was.
+func (m *Manager) listShare(ctx context.Context, raw, passphrase string, phase func(string)) (*shareListing, error) {
+	phase("Opening share link…")
+	link, err := share.ResolveLink(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	l := &shareListing{key: listingKey(raw, passphrase), link: link, pass: passphrase}
+	if l.pass == "" {
+		if p, err := m.Secrets.Get(passphraseKey(link)); err == nil {
+			l.pass = p
+		}
+	}
+	sc := share.Open(link, l.pass)
+	if l.info, err = sc.Info(ctx); err != nil {
+		return l, err
+	}
+	if !l.info.DownloadingEnabled {
+		return l, share.ErrDownloadDisabled
+	}
+	if l.pass != "" {
+		_ = m.Secrets.Set(passphraseKey(link), l.pass)
+	}
+	phase("Listing files…")
+	if l.files, err = sc.List(ctx, func(n int) { phase(fmt.Sprintf("Listing files… %d found", n)) }); err != nil {
+		return l, err
+	}
+	l.at = time.Now()
+	return l, nil
+}
+
+// takeInspected returns (and forgets) the last InspectLink result if it is for
+// this link and passphrase and still fresh, so a download started from the
+// preview doesn't list the share a second time.
+func (m *Manager) takeInspected(raw, passphrase string) *shareListing {
+	m.inspectMu.Lock()
+	defer m.inspectMu.Unlock()
+	l := m.inspected
+	if l == nil || l.key != listingKey(raw, passphrase) || time.Since(l.at) > inspectTTL {
+		return nil
+	}
+	m.inspected = nil
+	return l
+}
+
 func (j *Job) runDownload() {
 	defer j.finish()
 	ctx := j.ctx
 	j.setStatus(Resolving)
-	j.setPhase("Opening share link…")
-	link, err := share.ResolveLink(ctx, j.Source)
+	l := j.mgr.takeInspected(j.Source, j.passphrase)
+	var err error
+	if l == nil {
+		l, err = j.mgr.listShare(ctx, j.Source, j.passphrase, j.setPhase)
+	}
+	if l != nil {
+		j.mu.Lock()
+		j.ShareID = l.link.ID
+		j.mu.Unlock()
+	}
 	if err != nil {
 		j.fail(err)
 		return
 	}
-	shareID := link.ID
-	j.mu.Lock()
-	j.ShareID = shareID
-	j.mu.Unlock()
-	pass := j.passphrase
-	if pass == "" {
-		if p, err := j.mgr.Secrets.Get(passphraseKey(link)); err == nil {
-			pass = p
-		}
-	}
-	sc := share.Open(link, pass)
-	info, err := sc.Info(ctx)
-	if err != nil {
-		j.fail(err)
-		return
-	}
-	if !info.DownloadingEnabled {
-		j.fail(share.ErrDownloadDisabled)
-		return
-	}
-	if pass != "" {
-		_ = j.mgr.Secrets.Set(passphraseKey(link), pass)
-	}
-	j.setPhase("Listing files…")
-	files, err := sc.List(ctx, func(n int) { j.setPhase(fmt.Sprintf("Listing files… %d found", n)) })
-	if err != nil {
-		j.fail(err)
-		return
-	}
+	files := l.files
 	if len(files) == 0 {
 		j.fail(errors.New("this share has no files"))
 		return
 	}
+	sc := share.Open(l.link, l.pass)
 
 	root := j.Dest
 	if j.subfolder {
-		name := info.Name
-		if name == "" {
-			name = "Frame.io share " + shareID[:8]
+		name := "Frame.io share " + l.link.ID[:8]
+		if l.info.Name != "" {
+			name = share.SafeName(l.info.Name)
 		}
-		root = filepath.Join(j.Dest, strings.NewReplacer("/", "_", ":", "_").Replace(name))
+		root = filepath.Join(j.Dest, name)
 	}
 	j.logRoot = root
 	j.mu.Lock()
 	switch {
-	case info.Name != "":
-		j.Title = info.Name
+	case l.info.Name != "":
+		j.Title = l.info.Name
 	case len(files) == 1:
 		j.Title = path.Base(files[0].RelPath)
 	default:
@@ -477,7 +611,7 @@ func (j *Job) runDownload() {
 	})
 
 	var ids []string
-	for _, f := range j.Files {
+	for _, f := range list {
 		if f.Status() == Done {
 			ids = append(ids, f.AssetID)
 		}
@@ -498,50 +632,33 @@ type LinkInfo struct {
 	Unavailable int    `json:"unavailable"`
 	TotalBytes  int64  `json:"total_bytes"`
 	NeedsPass   bool   `json:"needs_passphrase"`
-	Downloadble bool   `json:"downloadable"`
 	Error       string `json:"error"`
 }
 
 func (m *Manager) InspectLink(ctx context.Context, link, passphrase string) LinkInfo {
 	var li LinkInfo
-	l, err := share.ResolveLink(ctx, link)
-	if err != nil {
-		li.Error = err.Error()
-		return li
-	}
-	li.ShareID, li.Kind = l.ID, l.Kind
-	if passphrase == "" {
-		if p, err := m.Secrets.Get(passphraseKey(l)); err == nil {
-			passphrase = p
+	l, err := m.listShare(ctx, link, passphrase, func(string) {})
+	if l != nil {
+		li.ShareID, li.Kind = l.link.ID, l.link.Kind
+		if l.info != nil {
+			li.Name = l.info.Name
 		}
 	}
-	sc := share.Open(l, passphrase)
-	info, err := sc.Info(ctx)
 	if err != nil {
 		li.NeedsPass = errors.Is(err, share.ErrPassphrase) || errors.Is(err, share.ErrBadPassphrase)
 		li.Error = err.Error()
 		return li
 	}
-	li.Name, li.Downloadble = info.Name, info.DownloadingEnabled
-	if !info.DownloadingEnabled {
-		li.Error = share.ErrDownloadDisabled.Error()
-		return li
-	}
-	files, err := sc.List(ctx, nil)
-	if err != nil {
-		li.Error = err.Error()
-		return li
-	}
-	for _, f := range files {
+	for _, f := range l.files {
 		li.Files++
 		li.TotalBytes += f.Size
 		if f.Problem != "" {
 			li.Unavailable++
 		}
 	}
-	if passphrase != "" {
-		_ = m.Secrets.Set(passphraseKey(l), passphrase)
-	}
+	m.inspectMu.Lock()
+	m.inspected = l
+	m.inspectMu.Unlock()
 	return li
 }
 
@@ -568,6 +685,7 @@ func (m *Manager) StartUpload(o UploadOptions) (*Job, error) {
 	j.AccountID, j.FolderID, j.Dest, j.paths = o.AccountID, o.FolderID, o.DestLabel, o.Paths
 	j.Source = summarizePaths(o.Paths)
 	j.Title = j.Source
+	m.add(j)
 	m.Hist.Start(j.record(), nil)
 	m.Hist.Log("UPLOAD   queued   [%s] %s -> %s", j.ID, j.Source, j.Dest)
 	go j.runUpload()
@@ -585,6 +703,7 @@ func summarizePaths(p []string) string {
 func skipName(name string) bool {
 	return name == ".DS_Store" || strings.HasPrefix(name, "._") || name == "Thumbs.db" || name == "desktop.ini" ||
 		name == ".localized" || isFolderLog(name) || strings.HasSuffix(name, ".fiopart") || strings.HasSuffix(name, ".fiostate") ||
+		strings.HasSuffix(name, ".fiostate.tmp") ||
 		name == ".Spotlight-V100" || name == ".Trashes" || name == ".fseventsd" || name == ".TemporaryItems"
 }
 
@@ -592,6 +711,7 @@ type scanned struct {
 	local string
 	rel   string // slash-separated, includes the top folder for dropped folders
 	size  int64
+	mtime int64 // watch folders only
 }
 
 func scanPaths(paths []string) ([]scanned, error) {
@@ -604,7 +724,7 @@ func scanPaths(paths []string) ([]scanned, error) {
 		}
 		if !st.IsDir() {
 			if st.Mode().IsRegular() && !skipName(st.Name()) {
-				out = append(out, scanned{p, st.Name(), st.Size()})
+				out = append(out, scanned{local: p, rel: st.Name(), size: st.Size()})
 			}
 			continue
 		}
@@ -627,7 +747,7 @@ func scanPaths(paths []string) ([]scanned, error) {
 				return err
 			}
 			rel, _ := filepath.Rel(parent, fp)
-			out = append(out, scanned{fp, filepath.ToSlash(rel), info.Size()})
+			out = append(out, scanned{local: fp, rel: filepath.ToSlash(rel), size: info.Size()})
 			return nil
 		})
 		if err != nil {
@@ -719,17 +839,23 @@ func (j *Job) runUpload() {
 
 // ---------- Retry ----------
 
+// jobOptions are the transfer settings kept in history for retries.
+type jobOptions struct {
+	Subfolder bool     `json:"subfolder"`
+	Paths     []string `json:"paths"`
+	Watch     string   `json:"watch,omitempty"`
+}
+
 // Retry re-runs a transfer from history. Downloads resume (finished files are
-// skipped, partial ones continue); uploads resend only files that didn't finish.
+// skipped, partial ones continue); uploads resend only files that didn't
+// finish. A watch-folder batch goes back to its watch, which re-queues its
+// files, and no job is returned.
 func (m *Manager) Retry(id, passphrase string) (*Job, error) {
 	t, err := m.Hist.Get(id)
 	if err != nil {
 		return nil, err
 	}
-	var opts struct {
-		Subfolder bool     `json:"subfolder"`
-		Paths     []string `json:"paths"`
-	}
+	var opts jobOptions
 	_ = json.Unmarshal([]byte(t.Options), &opts)
 	if t.Kind == "download" {
 		return m.StartDownload(DownloadOptions{Link: t.Source, Passphrase: passphrase, DestDir: t.Dest, Subfolder: opts.Subfolder})
@@ -738,15 +864,27 @@ func (m *Manager) Retry(id, passphrase string) (*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(files) == 0 {
-		// Never got past scanning: start over with the original paths.
-		return m.StartUpload(UploadOptions{Paths: opts.Paths, AccountID: t.AccountID, FolderID: t.FolderID, DestLabel: t.Dest})
-	}
 	var todo []history.File
 	for _, f := range files {
 		if f.Status != string(Done) && f.Status != string(Skipped) {
 			todo = append(todo, f)
 		}
+	}
+	// Batches recorded before the watch ID was kept are recognizable by their
+	// source: the watched folder itself, where uploads show a file name.
+	if opts.Watch != "" || (len(opts.Paths) == 1 && t.Source == opts.Paths[0]) {
+		if m.RetryWatch == nil {
+			return nil, errors.New("watch folders aren't running")
+		}
+		rels := make([]string, len(todo))
+		for i, f := range todo {
+			rels[i] = f.RelPath
+		}
+		return nil, m.RetryWatch(opts.Watch, t.Source, rels)
+	}
+	if len(files) == 0 {
+		// Never got past scanning: start over with the original paths.
+		return m.StartUpload(UploadOptions{Paths: opts.Paths, AccountID: t.AccountID, FolderID: t.FolderID, DestLabel: t.Dest})
 	}
 	if len(todo) == 0 {
 		return nil, errors.New("every file in this transfer already finished")
@@ -755,6 +893,7 @@ func (m *Manager) Retry(id, passphrase string) (*Job, error) {
 	j.AccountID, j.FolderID, j.Dest, j.paths = t.AccountID, t.FolderID, t.Dest, opts.Paths
 	j.Source = t.Source
 	j.Title = "Retry: " + t.Title
+	m.add(j)
 	m.Hist.Start(j.record(), nil)
 	m.Hist.Log("UPLOAD   retry    [%s] of [%s] %d files", j.ID, t.ID, len(todo))
 	go func() {
@@ -846,11 +985,12 @@ loop:
 			f.finished = time.Now()
 			switch {
 			case err != nil && j.ctx.Err() != nil:
-				f.status = Canceled
+				f.setStatusLocked(Canceled)
 			case err != nil:
-				f.status, f.err = Failed, err.Error()
+				f.setStatusLocked(Failed)
+				f.err = err.Error()
 			case f.status != Skipped && f.status != Failed:
-				f.status = Done
+				f.setStatusLocked(Done)
 			}
 			st, e := f.status, f.err
 			f.mu.Unlock()
@@ -888,23 +1028,38 @@ func kindTag(kind string) string {
 }
 
 func (j *Job) counts() (done, failed, skipped, canceled int) {
-	for _, f := range j.Files {
-		switch f.Status() {
-		case Done:
-			done++
-		case Failed:
-			failed++
-		case Skipped:
-			skipped++
-		case Canceled:
-			canceled++
-		}
+	return int(j.nDone.Load()), int(j.nFailed.Load()), int(j.nSkipped.Load()), int(j.nCanceled.Load())
+}
+
+// settleFiles closes out files the job never got to (it failed or was canceled
+// before they started), so none is left "queued" in history.
+func (j *Job) settleFiles() {
+	j.mu.Lock()
+	reason := j.err
+	j.mu.Unlock()
+	if reason == "" {
+		reason = "not started"
 	}
-	return
+	for _, f := range j.files() {
+		f.mu.Lock()
+		if f.status.terminal() {
+			f.mu.Unlock()
+			continue
+		}
+		if j.ctx.Err() != nil {
+			f.setStatusLocked(Canceled)
+		} else {
+			f.setStatusLocked(Failed)
+			f.err = reason
+		}
+		f.mu.Unlock()
+		j.persistFile(f)
+	}
 }
 
 func (j *Job) finish() {
 	j.verifyWG.Wait()
+	j.settleFiles()
 	j.mu.Lock()
 	j.finished = time.Now()
 	if !j.status.terminal() {
@@ -950,13 +1105,16 @@ func (j *Job) finish() {
 	if j.onFinish != nil {
 		j.onFinish(j)
 	}
+	if j.watchID != "" {
+		j.mgr.pruneWatchJobs()
+	}
 }
 
 func (j *Job) record() history.Transfer {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	done, failed, skipped, _ := j.counts()
-	opts, _ := json.Marshal(map[string]any{"subfolder": j.subfolder, "paths": j.paths})
+	opts, _ := json.Marshal(jobOptions{Subfolder: j.subfolder, Paths: j.paths, Watch: j.watchID})
 	t := history.Transfer{
 		ID: j.ID, Kind: j.Kind, Title: j.Title, Source: j.Source, Dest: j.Dest,
 		AccountID: j.AccountID, FolderID: j.FolderID, ShareID: j.ShareID,
@@ -1036,6 +1194,7 @@ type JobView struct {
 	Elapsed     float64 `json:"elapsed"`
 	AvgSpeed    float64 `json:"avg_speed"`
 	Link        string  `json:"link"`
+	Watch       bool    `json:"watch"` // a watch-folder batch
 }
 
 type FileView struct {
@@ -1059,18 +1218,12 @@ type Snapshot struct {
 }
 
 func (j *Job) view() JobView {
+	done, failed, skipped, _ := j.counts()
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	done, failed, skipped, _ := j.counts()
-	active := 0
-	for _, f := range j.Files {
-		if s := f.Status(); s == Running || s == Finalizing {
-			active++
-		}
-	}
 	v := JobView{ID: j.ID, Kind: j.Kind, Title: j.Title, Source: j.Source, Dest: j.Dest, Status: j.status, Phase: j.phase,
 		Error: j.err, Total: j.total.Load(), Done: j.done.Load(), FilesTotal: len(j.Files), FilesDone: done + skipped,
-		FilesFailed: failed, FilesActive: active, Link: j.link}
+		FilesFailed: failed, FilesActive: int(j.nActive.Load()), Link: j.link, Watch: j.watchID != ""}
 	if !j.status.terminal() {
 		v.Speed = j.meter.Rate()
 		if v.Speed > 1 && v.Total > v.Done {
@@ -1094,7 +1247,7 @@ func (j *Job) view() JobView {
 
 func (m *Manager) Snapshot() Snapshot {
 	m.mu.Lock()
-	jobs := append([]*Job(nil), m.jobs...)
+	jobs := slices.Clone(m.jobs)
 	m.mu.Unlock()
 	s := Snapshot{Speed: m.Global.Rate(), ActiveStreams: m.Limiter.Active(), StreamLimit: m.Settings().Streams}
 	for i := len(jobs) - 1; i >= 0; i-- {
@@ -1166,26 +1319,23 @@ func topFolder(paths []string, items []scanned) string {
 // leaves a speed trace in the app log.
 func (m *Manager) logProgress() {
 	now := time.Now()
-	if m.progressLogged == nil {
-		m.progressLogged = map[string]time.Time{}
-	}
 	m.mu.Lock()
-	jobs := append([]*Job(nil), m.jobs...)
+	jobs := slices.Clone(m.jobs)
 	m.mu.Unlock()
+	next := map[string]time.Time{}
 	for _, j := range jobs {
 		if j.Status() != Running {
-			delete(m.progressLogged, j.ID)
 			continue
 		}
 		last, ok := m.progressLogged[j.ID]
-		if !ok {
-			m.progressLogged[j.ID] = now
+		if !ok || now.Sub(last) < time.Minute {
+			if !ok {
+				last = now
+			}
+			next[j.ID] = last
 			continue
 		}
-		if now.Sub(last) < time.Minute {
-			continue
-		}
-		m.progressLogged[j.ID] = now
+		next[j.ID] = now
 		v := j.view()
 		pct := 0.0
 		if v.Total > 0 {
@@ -1194,4 +1344,5 @@ func (m *Manager) logProgress() {
 		m.Hist.Log("%s progress [%s] %.0f%% %s of %s, %s/s, %d/%d streams busy", kindTag(j.Kind), j.ID, pct,
 			humanBytes(v.Done), humanBytes(v.Total), humanBytes(int64(v.Speed)), m.Limiter.Active(), m.Settings().Streams)
 	}
+	m.progressLogged = next
 }

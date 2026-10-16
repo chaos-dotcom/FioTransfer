@@ -43,7 +43,6 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 		return nil
 	}
 
-	f.setStatus(Running, "")
 	lu, err := j.mgr.API.CreateLocalUpload(ctx, j.AccountID, f.RemoteParent, f.Name, size)
 	if err != nil {
 		return fmt.Errorf("creating file on Frame.io: %w", err)
@@ -79,7 +78,6 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	defer cancel(nil)
 	var wg sync.WaitGroup
 	for _, p := range parts {
-		p := p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -113,8 +111,7 @@ func (j *Job) verifyLater(f *File, fileID string) {
 	go func() {
 		defer j.verifyWG.Done()
 		for _, d := range j.mgr.VerifyDelays {
-			sleepCtx(j.ctx, d)
-			if j.ctx.Err() != nil {
+			if netx.Sleep(j.ctx, d) != nil {
 				return
 			}
 			s, err := j.mgr.API.FileStatus(j.ctx, j.AccountID, fileID)
@@ -123,7 +120,8 @@ func (j *Job) verifyLater(f *File, fileID string) {
 			}
 			if s.UploadFailed {
 				f.mu.Lock()
-				f.status, f.err = Failed, "Frame.io reported the upload as failed"
+				f.setStatusLocked(Failed)
+				f.err = "Frame.io reported the upload as failed"
 				f.mu.Unlock()
 				j.persistFile(f)
 				j.mgr.Hist.Log("%s FAILED   [%s] %s — %s", kindTag(j.Kind), j.ID, f.RelPath, "Frame.io reported the upload as failed")
@@ -149,7 +147,7 @@ func putPart(ctx context.Context, f *File, fh *os.File, off, size int64, url, co
 			return ctx.Err()
 		}
 		if attempt > 0 {
-			sleepCtx(ctx, retryDelay(attempt))
+			netx.Sleep(ctx, netx.Backoff(attempt))
 		}
 		var sent atomic.Int64
 		status, err := putOnce(ctx, url, fh, off, size, contentType, func(n int64) {
@@ -239,7 +237,7 @@ func ensureFolders(ctx context.Context, c *api.Client, acct, root string, dirs [
 		if !ok {
 			return nil, nil, fmt.Errorf("internal error: parent of %q not created", d)
 		}
-		folder, err := c.CreateFolder(ctx, acct, pid, baseName(d))
+		folder, err := createFolder(ctx, c, acct, pid, baseName(d))
 		if err != nil {
 			return nil, nil, fmt.Errorf("creating folder %q: %w", d, err)
 		}
@@ -247,4 +245,28 @@ func ensureFolders(ctx context.Context, c *api.Client, acct, root string, dirs [
 		urls[d] = folder.ViewURL
 	}
 	return ids, urls, nil
+}
+
+// createFolder creates a folder. When a request fails in a way that leaves it
+// unclear whether Frame.io made the folder (a timeout or gateway error), the
+// parent is checked for it before trying again, so a retry never duplicates it.
+func createFolder(ctx context.Context, c *api.Client, acct, parent, name string) (*api.Asset, error) {
+	for attempt := 1; ; attempt++ {
+		f, err := c.CreateFolder(ctx, acct, parent, name)
+		if err == nil || !api.Ambiguous(err) || attempt > 3 || netx.Sleep(ctx, netx.Backoff(attempt)) != nil {
+			return f, err
+		}
+		kids, lerr := c.Children(ctx, acct, parent)
+		if lerr != nil {
+			continue
+		}
+		for _, k := range kids {
+			if k.Type == "folder" && k.Name == name {
+				if full, err := c.Folder(ctx, acct, k.ID); err == nil {
+					return full, nil // includes the view URL
+				}
+				return &k, nil
+			}
+		}
+	}
 }
