@@ -41,7 +41,7 @@ jobs:
           fi
 
       # Optional Developer ID signing + notarization. Without these secrets the
-      # app is ad-hoc signed (users right-click → Open the first time).
+      # app is ad-hoc signed and Gatekeeper blocks its first launch.
       # Step `if:` can't see a step's own env or `secrets`, so detect them here.
       - name: Check for signing secrets
         id: signing

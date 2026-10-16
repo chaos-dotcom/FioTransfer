@@ -21,12 +21,41 @@ PLIST="$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION#v}" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION#v}" "$PLIST"
 
+NOTARIZE=false
+if [[ -n "${MACOS_SIGN_IDENTITY:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+  NOTARIZE=true
+fi
+
+# Submit to Apple's notary service; print the log and fail unless Accepted.
+notarize() {
+  local out id status
+  out="$(xcrun notarytool submit "$1" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+    --password "$APPLE_APP_PASSWORD" --wait --output-format json)"
+  id="$(plutil -extract id raw -o - - <<<"$out")"
+  status="$(plutil -extract status raw -o - - <<<"$out")"
+  echo "notarization $id: $status"
+  if [[ "$status" != "Accepted" ]]; then
+    xcrun notarytool log "$id" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+    exit 1
+  fi
+}
+
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
   codesign --force --deep --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$APP"
 else
   codesign --force --deep --sign - "$APP"
 fi
 codesign --verify --deep --strict "$APP"
+
+# Notarize and staple the app itself first, so the copy in the .dmg and the
+# .zip both carry the ticket and open without an online check.
+if $NOTARIZE; then
+  rm -rf build/notarize && mkdir -p build/notarize
+  ditto -c -k --keepParent "$APP" build/notarize/FioTransfer.zip
+  notarize build/notarize/FioTransfer.zip
+  xcrun stapler staple "$APP"
+  rm -rf build/notarize
+fi
 
 rm -rf dist && mkdir -p dist/dmg
 ditto "$APP" "dist/dmg/FioTransfer.app"
@@ -35,11 +64,12 @@ hdiutil create -quiet -volname "FioTransfer" -srcfolder dist/dmg -ov -format UDZ
 rm -rf dist/dmg
 ditto -c -k --keepParent "$APP" "dist/${NAME}-macOS.zip"
 
-if [[ -n "${MACOS_SIGN_IDENTITY:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+if $NOTARIZE; then
   codesign --force --sign "$MACOS_SIGN_IDENTITY" --timestamp "dist/${NAME}.dmg"
-  xcrun notarytool submit "dist/${NAME}.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
-    --password "$APPLE_APP_PASSWORD" --wait
+  notarize "dist/${NAME}.dmg"
   xcrun stapler staple "dist/${NAME}.dmg"
+  spctl -a -vv -t exec "$APP"
+  spctl -a -vv -t open --context context:primary-signature "dist/${NAME}.dmg"
 fi
 
 (cd dist && shasum -a 256 * > SHA256SUMS.txt)

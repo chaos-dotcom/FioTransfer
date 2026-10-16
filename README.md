@@ -19,9 +19,15 @@ FioTransfer is a desktop app that replaces Frame.io's Transfer app. It moves fil
 
 ## Install
 
-Download the latest `.dmg` from [Releases](https://github.com/farbhaus/FioTransfer/releases) and drag FioTransfer to Applications. It needs macOS 13 or later and runs on Apple silicon and Intel Macs.
+Paste this into Terminal. It installs the latest release to Applications, and running it again updates the app:
 
-The app isn't notarized by Apple yet, so the first time you open it, right-click it and choose **Open**.
+```sh
+curl -fsSL https://raw.githubusercontent.com/farbhaus/FioTransfer/main/scripts/install.sh | sh
+```
+
+FioTransfer needs macOS 13 or later and runs on Apple silicon and Intel Macs.
+
+Or download the `.dmg` from [Releases](https://github.com/farbhaus/FioTransfer/releases) and drag FioTransfer to Applications. The app isn't notarized by Apple yet, so macOS blocks the first launch with "Apple could not verify…". Click **Done**, then open **System Settings → Privacy & Security** and click **Open Anyway**.
 
 ## Set up uploads
 
