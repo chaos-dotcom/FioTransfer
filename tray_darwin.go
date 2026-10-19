@@ -32,6 +32,7 @@ const (
 	trayQuit   = 3
 	trayReopen = 4
 	trayUpdate = 5
+	trayCheck  = 6 // Check for Updates… (menu bar menu and app menu)
 )
 
 func trayInit(h func(int)) {
@@ -40,7 +41,7 @@ func trayInit(h func(int)) {
 }
 
 // traySet updates the menu's status line, the text next to the icon and the
-// update item (hidden when update is "").
+// update item (hidden when update is "", with Check for Updates… shown instead).
 func traySet(status, title string, login bool, update string) {
 	cs, ct, cu := C.CString(status), C.CString(title), C.CString(update)
 	defer C.free(unsafe.Pointer(cs))

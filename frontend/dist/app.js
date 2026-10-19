@@ -252,7 +252,7 @@ function showView(v) {
 }
 
 function onMenu(what) {
-  if (what === 'update') { showView('settings'); return; }
+  if (what === 'update') { showView('settings'); $('#update-line').scrollIntoView({ block: 'nearest' }); return; }
   if (what === 'download') { showView('transfers'); $('#link').focus(); $('#link').select(); return; }
   if (what === 'upload-files') pickFiles();
   if (what === 'upload-folder') pickFolder();

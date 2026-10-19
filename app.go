@@ -122,9 +122,13 @@ func (a *App) onTray(action int) {
 	case trayLogin:
 		_ = a.setOpenAtLogin(!loginEnabled())
 		runtime.EventsEmit(a.ctx, "state-changed")
-	case trayUpdate:
+	case trayUpdate, trayCheck:
+		// Settings shows the check as it runs, then the result.
 		a.showWindow()
 		runtime.EventsEmit(a.ctx, "menu", "update")
+		if !a.UpdateStatus().Available {
+			a.CheckForUpdate()
+		}
 	case trayQuit:
 		runtime.Quit(a.ctx)
 	}
