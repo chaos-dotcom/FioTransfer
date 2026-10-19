@@ -6,6 +6,8 @@ app:
 	~/go/bin/wails build -platform darwin/arm64 -clean -trimpath
 	rm -rf $(APP)
 	cp -R build/bin/$(APP) $(APP)
+	cp LICENSE $(APP)/Contents/Resources/LICENSE.txt
+	cp THIRD_PARTY_NOTICES.txt $(APP)/Contents/Resources/
 	codesign --force --deep -s - $(APP)
 	@echo "Built ./$(APP)"
 

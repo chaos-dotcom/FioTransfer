@@ -52,4 +52,6 @@ make test   # runs the engine tests
 
 ---
 
+[MIT License](LICENSE), © 2026 farbhaus. Third-party software in FioTransfer and its licenses are listed in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+
 FioTransfer is an independent project, not affiliated with Adobe or Frame.io.

@@ -21,6 +21,14 @@ PLIST="$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION#v}" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION#v}" "$PLIST"
 
+# The third-party licenses must ship with the app; they're generated from what
+# this build compiled in, so a dependency change can't leave them stale.
+cp LICENSE "$APP/Contents/Resources/LICENSE.txt"
+scripts/notices.sh > "$APP/Contents/Resources/THIRD_PARTY_NOTICES.txt"
+if ! cmp -s "$APP/Contents/Resources/THIRD_PARTY_NOTICES.txt" THIRD_PARTY_NOTICES.txt; then
+  echo "::warning::THIRD_PARTY_NOTICES.txt is out of date; run scripts/notices.sh > THIRD_PARTY_NOTICES.txt"
+fi
+
 NOTARIZE=false
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
   NOTARIZE=true
