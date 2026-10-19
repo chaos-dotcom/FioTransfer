@@ -219,7 +219,8 @@ type Asset struct {
 	Name      string `json:"name"`
 	Type      string `json:"type"` // file | folder | version_stack
 	FileSize  int64  `json:"file_size"`
-	ParentID  string `json:"parent_id"`
+	ParentID  string `json:"parent_id"` // empty for a project's root folder
+	ProjectID string `json:"project_id"`
 	ViewURL   string `json:"view_url"`
 	Status    string `json:"status"` // files: created (still uploading) | uploaded | transcoded
 	CreatedAt string `json:"created_at"`
@@ -297,6 +298,77 @@ func (c *Client) FileStatus(ctx context.Context, acct, file string) (*FileStatus
 	var r struct{ Data FileStatus }
 	if err := c.do(ctx, "GET", "/v4/accounts/"+acct+"/files/"+file+"/status", nil, nil, &r); err != nil {
 		return nil, err
+	}
+	return &r.Data, nil
+}
+
+func (c *Client) Project(ctx context.Context, acct, id string) (*Project, error) {
+	var r struct{ Data Project }
+	if err := c.do(ctx, "GET", "/v4/accounts/"+acct+"/projects/"+id, nil, nil, &r); err != nil {
+		return nil, err
+	}
+	return &r.Data, nil
+}
+
+// SearchHit is a project or folder found by Search.
+type SearchHit struct {
+	Type   string `json:"type"` // project_result | folder_result
+	Result struct {
+		ID           string `json:"id"`
+		Name         string `json:"name"`
+		ParentID     string `json:"parent_id"`
+		ProjectID    string `json:"project_id"`
+		RootFolderID string `json:"root_folder_id"`
+		WorkspaceID  string `json:"workspace_id"`
+	} `json:"result"`
+	// Matches says why it was found: by its own name, or by its project's name
+	// (which brings up everything in that project).
+	Matches []struct {
+		Type    string `json:"type"` // name_match | project_match | …
+		Project *struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"project"`
+	} `json:"matches"`
+}
+
+// NameMatch reports whether the hit was found by its own name.
+func (h SearchHit) NameMatch() bool {
+	for _, m := range h.Matches {
+		if m.Type == "name_match" {
+			return true
+		}
+	}
+	return false
+}
+
+// Search finds projects and folders by name anywhere in an account (one page).
+func (c *Client) Search(ctx context.Context, acct, query string, n int) ([]SearchHit, error) {
+	var r struct{ Data []SearchHit }
+	in := map[string]any{"query": query, "engine": "lexical",
+		"filters": map[string]any{"projects": true, "folders": true, "files_and_version_stacks": false}}
+	q := url.Values{"page_size": {strconv.Itoa(n)}}
+	if err := c.do(ctx, "POST", "/v4/accounts/"+acct+"/search", q, in, &r); err != nil {
+		return nil, err
+	}
+	return r.Data, nil
+}
+
+type Share struct {
+	ID       string `json:"id"`
+	ShortURL string `json:"short_url"`
+}
+
+// CreateShare makes a public share link (downloads allowed) to up to 100 assets.
+func (c *Client) CreateShare(ctx context.Context, acct, project, name string, assets []string) (*Share, error) {
+	var r struct{ Data Share }
+	in := map[string]any{"data": map[string]any{"type": "asset", "name": name, "access": "public",
+		"asset_ids": assets, "downloading_enabled": true}}
+	if err := c.do(ctx, "POST", "/v4/accounts/"+acct+"/projects/"+project+"/shares", nil, in, &r); err != nil {
+		return nil, err
+	}
+	if r.Data.ShortURL == "" {
+		return nil, errors.New("Frame.io returned no share link")
 	}
 	return &r.Data, nil
 }

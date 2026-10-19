@@ -66,11 +66,12 @@ type File struct {
 	retries atomic.Int64
 	detail  string // e.g. part count and speed, for the log
 
-	mu       sync.Mutex
-	status   Status
-	note     string
-	err      string
-	finished time.Time
+	mu         sync.Mutex
+	status     Status
+	note       string
+	err        string
+	finished   time.Time
+	checkLater bool // Frame.io's confirmation is pending; its check logs the outcome
 }
 
 // add records bytes moved over the network.
@@ -146,6 +147,7 @@ type Job struct {
 	logName    string
 
 	link         string // Frame.io link to the uploaded files (guarded by mu)
+	shareLink    string // public share of them, once made (guarded by mu)
 	linkFromFile bool   // single-file upload: the file's own page is the link
 	userCanceled atomic.Bool
 	verifyWG     sync.WaitGroup
@@ -277,6 +279,8 @@ type Manager struct {
 	OnUpdate func(Snapshot)
 	// VerifyDelays spaces out the post-upload Frame.io status checks.
 	VerifyDelays []time.Duration
+	// UploadSettle is how long a file must go unmodified before it uploads.
+	UploadSettle time.Duration
 	// RetryWatch re-queues a watch-folder batch's unfinished files in their
 	// watch instead of starting a separate transfer (set by NewWatcher).
 	RetryWatch func(watchID, localPath string, files []history.File) error
@@ -287,6 +291,8 @@ type Manager struct {
 
 	inspectMu sync.Mutex
 	inspected *shareListing // last InspectLink result, for the download that follows
+
+	shareMu sync.Mutex // one share created at a time, so a double click makes one
 
 	progressLogged map[string]time.Time // last progress line per running job
 
@@ -299,7 +305,8 @@ const keepWatchJobs = 10
 
 func NewManager(a *api.Client, h *history.Store, settings func() config.Settings) *Manager {
 	s := settings()
-	m := &Manager{API: a, Hist: h, Settings: settings, Limiter: NewLimiter(s.Streams), Secrets: keychainStore{}, VerifyDelays: verifyDelays}
+	m := &Manager{API: a, Hist: h, Settings: settings, Limiter: NewLimiter(s.Streams), Secrets: keychainStore{},
+		VerifyDelays: verifyDelays, UploadSettle: uploadSettle}
 	go m.loop()
 	return m
 }
@@ -988,21 +995,18 @@ loop:
 			case f.status != Skipped && f.status != Failed:
 				f.setStatusLocked(Done)
 			}
-			st, e := f.status, f.err
+			st, e, later := f.status, f.err, f.checkLater
 			f.mu.Unlock()
 			j.persistFile(f)
 			if j.onFileDone != nil {
 				j.onFileDone(f)
 			}
-			switch st {
-			case Failed:
+			switch {
+			case later: // verifyLater logs it once Frame.io answers
+			case st == Failed:
 				j.mgr.Hist.Log("%s FAILED   [%s] %s — %s", kindTag(j.Kind), j.ID, f.RelPath, e)
-			case Done:
-				if f.detail != "" {
-					j.mgr.Hist.Log("%s file ok  [%s] %s (%s; %s)", kindTag(j.Kind), j.ID, f.RelPath, humanBytes(f.Size), f.detail)
-				} else {
-					j.mgr.Hist.Log("%s file ok  [%s] %s (%s)", kindTag(j.Kind), j.ID, f.RelPath, humanBytes(f.Size))
-				}
+			case st == Done:
+				j.logFileOK(f)
 			}
 			j.mgr.touch()
 		}(f)
@@ -1013,6 +1017,17 @@ loop:
 			f.setStatus(Canceled, "")
 			j.persistFile(f)
 		}
+	}
+}
+
+func (j *Job) logFileOK(f *File) {
+	f.mu.Lock()
+	detail := f.detail
+	f.mu.Unlock()
+	if detail != "" {
+		j.mgr.Hist.Log("%s file ok  [%s] %s (%s; %s)", kindTag(j.Kind), j.ID, f.RelPath, humanBytes(f.Size), detail)
+	} else {
+		j.mgr.Hist.Log("%s file ok  [%s] %s (%s)", kindTag(j.Kind), j.ID, f.RelPath, humanBytes(f.Size))
 	}
 }
 
@@ -1117,7 +1132,7 @@ func (j *Job) record() history.Transfer {
 		Status: string(j.status), Error: j.err,
 		TotalBytes: j.total.Load(), DoneBytes: j.done.Load(),
 		FilesTotal: len(j.Files), FilesDone: done + skipped, FilesFailed: failed,
-		CreatedAt: j.created.UnixMilli(), PeakBps: j.meter.Peak(), Options: string(opts), Link: j.link,
+		CreatedAt: j.created.UnixMilli(), PeakBps: j.meter.Peak(), Options: string(opts), Link: j.link, ShareLink: j.shareLink,
 	}
 	if !j.started.IsZero() {
 		t.StartedAt = j.started.UnixMilli()

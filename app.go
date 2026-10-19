@@ -47,6 +47,10 @@ type App struct {
 	cancelMu    sync.Mutex
 	loginCancel context.CancelFunc // stops the sign-in waiting for the browser
 
+	namesMu        sync.Mutex
+	names          map[string]string // account, workspace and project names by ID
+	projectsListed time.Time         // last full project listing for search results
+
 	openAtLogin atomic.Bool // cached for the menu bar, refreshed every 30s
 	started     time.Time
 
@@ -349,6 +353,27 @@ type Node struct {
 	Name     string `json:"name"`
 	Kind     string `json:"kind"` // account | workspace | project | folder
 	FolderID string `json:"folder_id,omitempty"`
+	Where    string `json:"where,omitempty"` // search results: the folder's project
+}
+
+// remember caches the names of accounts, workspaces and projects, so paths
+// and search results can show them without listing everything again.
+func (a *App) remember(ns ...Node) {
+	a.namesMu.Lock()
+	defer a.namesMu.Unlock()
+	if a.names == nil {
+		a.names = map[string]string{}
+	}
+	for _, n := range ns {
+		a.names[n.ID] = n.Name
+	}
+}
+
+func (a *App) knownName(id string) (string, bool) {
+	a.namesMu.Lock()
+	defer a.namesMu.Unlock()
+	n, ok := a.names[id]
+	return n, ok
 }
 
 func (a *App) apiCtx() (context.Context, context.CancelFunc) {
@@ -366,6 +391,7 @@ func (a *App) ListAccounts() ([]Node, error) {
 	for _, x := range accts {
 		out = append(out, Node{ID: x.ID, Name: x.DisplayName, Kind: "account"})
 	}
+	a.remember(out...)
 	return out, nil
 }
 
@@ -381,6 +407,7 @@ func (a *App) ListWorkspaces(acct string) ([]Node, error) {
 		out = append(out, Node{ID: x.ID, Name: x.Name, Kind: "workspace"})
 	}
 	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	a.remember(out...)
 	return out, nil
 }
 
@@ -395,6 +422,7 @@ func (a *App) ListProjects(acct, ws string) ([]Node, error) {
 	for _, x := range ps {
 		out = append(out, Node{ID: x.ID, Name: x.Name, Kind: "project", FolderID: x.RootFolderID})
 	}
+	a.remember(out...)
 	return out, nil
 }
 
@@ -424,9 +452,162 @@ func (a *App) CreateFolder(acct, parent, name string) (Node, error) {
 	return Node{ID: f.ID, Name: f.Name, Kind: "folder", FolderID: f.ID}, nil
 }
 
-func (a *App) SetUploadDestination(acct, folder, label string) (State, error) {
+// PathTo returns the picker path down to a project or folder: account,
+// workspace, project, then each folder below the project's root.
+func (a *App) PathTo(acct, kind, id string) ([]Node, error) {
+	ctx, cancel := a.apiCtx()
+	defer cancel()
+	var folders []Node
+	project := id
+	if kind == "folder" {
+		f, err := a.api.Folder(ctx, acct, id)
+		for err == nil && f.ParentID != "" { // the root folder has no parent; the project stands for it
+			if len(folders) == 64 {
+				return nil, errors.New("folder is nested too deep")
+			}
+			folders = append([]Node{{ID: f.ID, Name: f.Name, Kind: "folder", FolderID: f.ID}}, folders...)
+			f, err = a.api.Folder(ctx, acct, f.ParentID)
+		}
+		if err != nil {
+			return nil, gone(err)
+		}
+		project = f.ProjectID
+	}
+	p, err := a.api.Project(ctx, acct, project)
+	if err != nil {
+		return nil, gone(err)
+	}
+	a.remember(Node{ID: p.ID, Name: p.Name})
+	path := []Node{
+		{ID: acct, Name: a.accountName(ctx, acct), Kind: "account"},
+		{ID: p.WorkspaceID, Name: a.workspaceName(ctx, acct, p.WorkspaceID), Kind: "workspace"},
+		{ID: p.ID, Name: p.Name, Kind: "project", FolderID: p.RootFolderID},
+	}
+	return append(path, folders...), nil
+}
+
+// gone turns a 404 into plain words: search can still list deleted folders.
+func gone(err error) error {
+	var ae *api.Error
+	if errors.As(err, &ae) && ae.Status == 404 {
+		return errors.New("no longer on Frame.io")
+	}
+	return err
+}
+
+func (a *App) accountName(ctx context.Context, acct string) string {
+	if n, ok := a.knownName(acct); ok {
+		return n
+	}
+	if accts, err := a.api.Accounts(ctx); err == nil {
+		for _, x := range accts {
+			a.remember(Node{ID: x.ID, Name: x.DisplayName})
+		}
+	}
+	if n, ok := a.knownName(acct); ok {
+		return n
+	}
+	return "Account"
+}
+
+func (a *App) workspaceName(ctx context.Context, acct, ws string) string {
+	if n, ok := a.knownName(ws); ok {
+		return n
+	}
+	if list, err := a.api.Workspaces(ctx, acct); err == nil {
+		for _, x := range list {
+			a.remember(Node{ID: x.ID, Name: x.Name})
+		}
+	}
+	if n, ok := a.knownName(ws); ok {
+		return n
+	}
+	return "Workspace"
+}
+
+// projectNames looks up project names, listing the account's projects (at
+// most once a minute) when some aren't known yet.
+func (a *App) projectNames(ctx context.Context, acct string, ids []string) map[string]string {
+	lookup := func() (map[string]string, bool) {
+		a.namesMu.Lock()
+		defer a.namesMu.Unlock()
+		out, missing := map[string]string{}, false
+		for _, id := range ids {
+			if n, ok := a.names[id]; ok {
+				out[id] = n
+			} else {
+				missing = true
+			}
+		}
+		if missing && time.Since(a.projectsListed) < time.Minute {
+			missing = false
+		} else if missing {
+			a.projectsListed = time.Now()
+		}
+		return out, missing
+	}
+	names, missing := lookup()
+	if !missing {
+		return names
+	}
+	ws, err := a.api.Workspaces(ctx, acct)
+	if err != nil {
+		return names
+	}
+	for _, w := range ws {
+		a.remember(Node{ID: w.ID, Name: w.Name})
+		if ps, err := a.api.Projects(ctx, acct, w.ID); err == nil {
+			for _, p := range ps {
+				a.remember(Node{ID: p.ID, Name: p.Name})
+			}
+		}
+	}
+	names, _ = lookup()
+	return names
+}
+
+// Search finds projects and folders by name anywhere in an account.
+func (a *App) Search(acct, query string) ([]Node, error) {
+	query = strings.TrimSpace(query)
+	if acct == "" || len([]rune(query)) < 2 {
+		return []Node{}, nil
+	}
+	ctx, cancel := a.apiCtx()
+	defer cancel()
+	hits, err := a.api.Search(ctx, acct, query, 50)
+	if err != nil {
+		return nil, err
+	}
+	out := []Node{}
+	var projects []string // per folder in out
+	for _, h := range hits {
+		r := h.Result
+		if !h.NameMatch() { // found only because its project's name matches
+			continue
+		}
+		switch h.Type {
+		case "project_result":
+			a.remember(Node{ID: r.ID, Name: r.Name})
+			out = append(out, Node{ID: r.ID, Name: r.Name, Kind: "project", FolderID: r.RootFolderID})
+			projects = append(projects, "")
+		case "folder_result":
+			if r.ParentID == "" { // a project's root folder
+				continue
+			}
+			out = append(out, Node{ID: r.ID, Name: r.Name, Kind: "folder", FolderID: r.ID})
+			projects = append(projects, r.ProjectID)
+		}
+	}
+	names := a.projectNames(ctx, acct, projects)
+	for i, p := range projects {
+		out[i].Where = names[p]
+	}
+	return out, nil
+}
+
+func (a *App) SetUploadDestination(acct, folder, label string, path []config.Crumb) (State, error) {
 	saved, err := config.Update(func(s *config.Settings) {
-		s.LastAccountID, s.LastFolderID, s.LastFolderLabel = acct, folder, label
+		s.LastAccountID, s.LastFolderID, s.LastFolderLabel, s.LastFolderPath = acct, folder, label, path
 	})
 	if err == nil {
 		a.mu.Lock()
@@ -484,6 +665,14 @@ func (a *App) StartDownload(o xfer.DownloadOptions) (string, error) {
 		return "", err
 	}
 	return j.ID, nil
+}
+
+// ShareLink returns a public Frame.io share link to what a transfer moved,
+// making the share the first time it's asked for.
+func (a *App) ShareLink(id string) (string, error) {
+	ctx, cancel := a.apiCtx()
+	defer cancel()
+	return a.mgr.ShareLink(ctx, id)
 }
 
 func (a *App) Cancel(id string)        { a.mgr.Cancel(id) }

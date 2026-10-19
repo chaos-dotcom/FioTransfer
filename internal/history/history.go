@@ -38,7 +38,8 @@ type Transfer struct {
 	AvgBps      float64 `json:"avg_bps"`
 	PeakBps     float64 `json:"peak_bps"`
 	Options     string  `json:"options"`
-	Link        string  `json:"link"` // Frame.io link to the uploaded files
+	Link        string  `json:"link"`       // Frame.io link to the uploaded files
+	ShareLink   string  `json:"share_link"` // public share of them, made on request
 }
 
 type File struct {
@@ -90,6 +91,7 @@ func Open(dir, logDir string) (*Store, error) {
 	}
 	// Columns added after the first release.
 	addColumn(db, "transfers", "link", "TEXT")
+	addColumn(db, "transfers", "share_link", "TEXT")
 	addColumn(db, "watches", "direction", "TEXT NOT NULL DEFAULT 'upload'")
 	addColumn(db, "watches", "ignore_remote", "INTEGER NOT NULL DEFAULT 0")
 	return &Store{db: db, logDir: logDir}, nil
@@ -110,10 +112,10 @@ func (s *Store) Start(t Transfer, files []File) error {
 		return err
 	}
 	defer tx.Rollback()
-	_, err = tx.Exec(`INSERT OR REPLACE INTO transfers(`+cols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	_, err = tx.Exec(`INSERT OR REPLACE INTO transfers(`+cols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.Kind, t.Title, t.Source, t.Dest, t.AccountID, t.FolderID, t.ShareID, t.Status, t.Error,
 		t.TotalBytes, t.DoneBytes, t.FilesTotal, t.FilesDone, t.FilesFailed,
-		t.CreatedAt, t.StartedAt, t.FinishedAt, t.AvgBps, t.PeakBps, t.Options, t.Link)
+		t.CreatedAt, t.StartedAt, t.FinishedAt, t.AvgBps, t.PeakBps, t.Options, t.Link, t.ShareLink)
 	if err != nil {
 		return err
 	}
@@ -139,24 +141,30 @@ func (s *Store) UpdateFile(f File) {
 		f.LocalPath, f.Size, f.Status, f.Error, f.Note, f.RemoteParent, f.RemoteID, f.ViewURL, f.FinishedAt, f.TransferID, f.Idx)
 }
 
+// Update saves a transfer's progress. It never clears a share link made meanwhile.
 func (s *Store) Update(t Transfer) {
-	s.db.Exec(`UPDATE transfers SET title=?, source=?, dest=?, status=?, error=?, total_bytes=?, done_bytes=?, files_total=?, files_done=?, files_failed=?, started_at=?, finished_at=?, avg_bps=?, peak_bps=?, share_id=?, options=?, link=? WHERE id=?`,
+	s.db.Exec(`UPDATE transfers SET title=?, source=?, dest=?, status=?, error=?, total_bytes=?, done_bytes=?, files_total=?, files_done=?, files_failed=?, started_at=?, finished_at=?, avg_bps=?, peak_bps=?, share_id=?, options=?, link=?, share_link=COALESCE(NULLIF(?, ''), share_link) WHERE id=?`,
 		t.Title, t.Source, t.Dest, t.Status, t.Error, t.TotalBytes, t.DoneBytes, t.FilesTotal, t.FilesDone, t.FilesFailed,
-		t.StartedAt, t.FinishedAt, t.AvgBps, t.PeakBps, t.ShareID, t.Options, t.Link, t.ID)
+		t.StartedAt, t.FinishedAt, t.AvgBps, t.PeakBps, t.ShareID, t.Options, t.Link, t.ShareLink, t.ID)
 }
 
-const cols = `id, kind, title, source, dest, account_id, folder_id, share_id, status, error, total_bytes, done_bytes, files_total, files_done, files_failed, created_at, started_at, finished_at, avg_bps, peak_bps, options, link`
+func (s *Store) SetShareLink(id, link string) error {
+	_, err := s.db.Exec(`UPDATE transfers SET share_link=? WHERE id=?`, link, id)
+	return err
+}
+
+const cols = `id, kind, title, source, dest, account_id, folder_id, share_id, status, error, total_bytes, done_bytes, files_total, files_done, files_failed, created_at, started_at, finished_at, avg_bps, peak_bps, options, link, share_link`
 
 func scanTransfer(sc interface{ Scan(...any) error }) (Transfer, error) {
 	var t Transfer
-	var title, source, dest, acct, folder, share, status, errS, opts, link sql.NullString
+	var title, source, dest, acct, folder, share, status, errS, opts, link, shareLink sql.NullString
 	var started, finished sql.NullInt64
 	var avg, peak sql.NullFloat64
 	err := sc.Scan(&t.ID, &t.Kind, &title, &source, &dest, &acct, &folder, &share, &status, &errS,
 		&t.TotalBytes, &t.DoneBytes, &t.FilesTotal, &t.FilesDone, &t.FilesFailed,
-		&t.CreatedAt, &started, &finished, &avg, &peak, &opts, &link)
+		&t.CreatedAt, &started, &finished, &avg, &peak, &opts, &link, &shareLink)
 	t.Title, t.Source, t.Dest, t.AccountID, t.FolderID, t.ShareID = title.String, source.String, dest.String, acct.String, folder.String, share.String
-	t.Status, t.Error, t.Options, t.Link = status.String, errS.String, opts.String, link.String
+	t.Status, t.Error, t.Options, t.Link, t.ShareLink = status.String, errS.String, opts.String, link.String, shareLink.String
 	t.StartedAt, t.FinishedAt, t.AvgBps, t.PeakBps = started.Int64, finished.Int64, avg.Float64, peak.Float64
 	return t, err
 }

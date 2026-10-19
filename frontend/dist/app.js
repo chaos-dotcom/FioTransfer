@@ -80,9 +80,15 @@ function toast(msg, kind = 'info', ms = 5000) {
   setTimeout(() => el.remove(), ms);
 }
 const errMsg = (e) => (e && e.message) || String(e);
-function copyLink(url) {
-  window.runtime.ClipboardSetText(url);
-  toast('Link copied', 'ok', 2000);
+// copyShare copies a public share link to a transfer's files; Frame.io makes
+// the share on first use, so later copies give the same link.
+async function copyShare(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    window.runtime.ClipboardSetText(await call('ShareLink', id));
+    toast('Share link copied', 'ok', 2500);
+  } catch (e) { toast(errMsg(e), 'err'); }
+  if (btn) btn.disabled = false;
 }
 
 // ---------- state ----------
@@ -229,6 +235,8 @@ function bindUI() {
   $('#dest-cancel').addEventListener('click', closeDest);
   $('#dest-choose').addEventListener('click', chooseDest);
   $('#newfolder-btn').addEventListener('click', newFolder);
+  $('#dest-q').addEventListener('input', onDestQuery);
+  $('#dest-q').addEventListener('keydown', onDestKey);
   $('#newfolder-name').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') newFolder();
     if (e.key === 'Escape') { e.stopPropagation(); $('#newfolder-name').classList.add('hidden'); }
@@ -313,12 +321,18 @@ function renderUploadRow() {
     return;
   }
   const label = s.last_folder_id ? s.last_folder_label : '';
-  const crumbs = label ? label.split(' / ').map(esc).join('<span class="sep">/</span>') : '<span class="ph">Choose destination</span>';
+  // Each part opens the picker at its level: the icon at the project list.
+  const path = storedPath(s);
+  const names = path ? path.slice(path.findIndex((x) => x.kind === 'project')).map((x) => x.name) : label ? label.split(' / ') : [];
+  const crumbs = names.length ? names.map((n, k) => `<span class="seg" data-seg="${k}">${esc(n)}</span>`).join('<span class="sep">/</span>') : '<span class="ph">Choose destination</span>';
   body.innerHTML = `
-    <button class="dest-pick" id="dest-btn" title="${esc(label || 'Choose destination')}">${I.project}<span class="path">${crumbs}</span><span class="chev">${I.chevron}</span></button>
+    <button class="dest-pick" id="dest-btn" title="${esc(label || 'Choose destination')}"><span class="seg root" data-seg="-1" title="All projects">${I.project}</span><span class="path">${crumbs}</span><span class="chev">${I.chevron}</span></button>
     <button class="btn" id="pick-files">Files…</button>
     <button class="btn" id="pick-folder">Folder…</button>`;
-  $('#dest-btn').onclick = () => openDest();
+  $('#dest-btn').onclick = (e) => {
+    const seg = e.target.closest('[data-seg]');
+    openDestAt(seg ? +seg.dataset.seg : null);
+  };
   $('#pick-files').onclick = pickFiles;
   $('#pick-folder').onclick = pickFolder;
   $('#drop-dest').textContent = label;
@@ -538,7 +552,7 @@ function createJob(j) {
       <div class="c-status"></div>
       <div class="actions">
         <button class="icon-btn a-open" title="Open in Frame.io">${I.open}</button>
-        <button class="icon-btn a-copy" title="Copy Frame.io link">${I.copy}</button>
+        <button class="icon-btn a-copy" title="Copy share link">${I.copy}</button>
         <button class="icon-btn a-reveal" title="Show in Finder">${I.reveal}</button>
         <button class="icon-btn a-retry" title="Retry">${I.retry}</button>
         <button class="icon-btn a-cancel" title="Cancel">${I.x}</button>
@@ -549,7 +563,7 @@ function createJob(j) {
     <div class="row-detail hidden"><div class="files"></div></div>`;
   $('.a-cancel', el).onclick = () => call('Cancel', j.id);
   $('.a-open', el).onclick = () => el.dataset.link && call('OpenURL', el.dataset.link);
-  $('.a-copy', el).onclick = () => el.dataset.link && copyLink(el.dataset.link);
+  $('.a-copy', el).onclick = () => copyShare(j.id, $('.a-copy', el));
   $('.a-retry', el).onclick = () => retry(j.id);
   $('.a-reveal', el).onclick = () => call('Reveal', el.dataset.dest || '').catch((e) => toast(errMsg(e), 'err'));
   $('.a-files', el).onclick = () => toggleFiles(j.id, el);
@@ -582,6 +596,7 @@ function updateJob(el, j) {
 
   let status = statusLabel(j.status, j.kind);
   if (!terminal && j.eta > 0 && !preparing) status = `${fmtDur(j.eta)} left`;
+  if (!terminal && j.kind === 'upload' && j.total > 0 && j.done >= j.total) status = 'Verifying';
   if (j.status === 'partial') status = `${j.files_failed} of ${j.files_total} failed`;
   if (j.status === 'done') status = `${j.files_total} file${j.files_total === 1 ? '' : 's'} · ${fmtDur(j.elapsed)}`;
   setHTML($('.c-status', el), `<span class="status ${j.status}" title="${esc(status)}"><span class="dot"></span><span class="trunc">${esc(status)}</span></span>`);
@@ -620,7 +635,7 @@ function fileRows(files, kind) {
     let st = statusLabel(f.status, kind);
     if (f.status === 'failed') st = f.error || 'Failed';
     else if (f.status === 'skipped') st = f.note || 'Skipped';
-    else if (f.status === 'done' && f.note) st = f.note;
+    else if ((f.status === 'done' || f.status === 'running') && f.note) st = f.note;
     if (f.retries > 0 && !TERMINAL.has(f.status)) st += ` · ${f.retries} retr${f.retries === 1 ? 'y' : 'ies'}`;
     const open = f.view_url ? `<a data-url="${esc(f.view_url)}" title="Open in Frame.io">${I.external}</a>` : '';
     const reveal = f.local_path && TERMINAL.has(f.status) && f.status !== 'failed' ? `<a class="reveal" data-path="${esc(f.local_path)}" title="Show in Finder">${I.external}</a>` : '';
@@ -662,10 +677,13 @@ async function retry(id) {
 }
 
 // ---------- destination picker ----------
-const D = { stack: [], mode: 'upload', watchPath: '', watchDir: 'upload' };
+// items: the current level; q: the search text, matched against items here and
+// (hits) against the whole account; rows: what the list shows, for the keyboard.
+const D = { stack: [], mode: 'upload', watchPath: '', watchDir: 'upload', items: null, err: '', q: '', hits: null, hitsErr: '', rows: [], sel: 0, kbd: false, seq: 0, qseq: 0 };
 const DIR_ARROW = { upload: '→', download: '←', mirror: '↔' };
 
-function openDest(mode = 'upload', onPick = null) {
+// start: the path to open at, or a function returning a promise of one.
+function openDest(mode = 'upload', onPick = null, start = null) {
   D.mode = mode;
   D.onPick = onPick;
   $('#dest-existing-wrap').classList.toggle('hidden', mode !== 'watch');
@@ -676,7 +694,51 @@ function openDest(mode = 'upload', onPick = null) {
   $('#dest-modal').classList.remove('hidden');
   D.stack = [];
   $('#newfolder-name').classList.add('hidden');
-  loadLevel(true);
+  clearQuery();
+  $('#dest-q').focus();
+  if (!start) return loadLevel(true);
+  const seq = ++D.seq;
+  D.items = null;
+  D.err = '';
+  renderCrumbs();
+  renderList();
+  $('#dest-choose').disabled = $('#newfolder-btn').disabled = true;
+  Promise.resolve(typeof start === 'function' ? start() : start).then((path) => {
+    if (seq !== D.seq) return;
+    D.stack = path ? path.slice() : [];
+    loadLevel(!path);
+  });
+}
+
+// openDestAt opens the picker at a level of the upload destination: -1 is the
+// project list, 0 the project, 1… its folders, null the destination itself.
+function openDestAt(k) {
+  if (!S.state.settings.last_folder_id) return openDest();
+  openDest('upload', null, async () => {
+    const path = await destPath();
+    if (!path || k === null) return path;
+    const pi = path.findIndex((x) => x.kind === 'project');
+    return path.slice(0, Math.min(path.length, pi + 1 + k));
+  });
+}
+
+function storedPath(s) {
+  const p = s.last_folder_path;
+  return p && p.length && p[p.length - 1].folder_id === s.last_folder_id ? p : null;
+}
+
+// destPath returns the path down to the upload destination, asking Frame.io
+// for it once if it was chosen before paths were saved.
+async function destPath() {
+  const s = S.state.settings;
+  const stored = storedPath(s);
+  if (stored) return stored;
+  try {
+    const path = await call('PathTo', s.last_account_id, 'folder', s.last_folder_id);
+    S.state = await call('SetUploadDestination', s.last_account_id, s.last_folder_id, s.last_folder_label, path);
+    renderState();
+    return path;
+  } catch (e) { return null; }
 }
 function renderDestTitle() {
   $$('#dest-dir button').forEach((b) => b.classList.toggle('active', b.dataset.dir === D.watchDir));
@@ -689,14 +751,17 @@ function closeDest() {
 }
 const destTop = () => D.stack[D.stack.length - 1];
 
+const inFolderLevel = () => { const t = destTop(); return !!(t && (t.kind === 'project' || t.kind === 'folder')); };
+
 async function loadLevel(autoSkip) {
-  const list = $('#dest-list');
+  const seq = ++D.seq;
   renderCrumbs();
   const t = destTop();
-  const inFolder = !!(t && (t.kind === 'project' || t.kind === 'folder'));
-  $('#dest-choose').disabled = !inFolder;
-  $('#newfolder-btn').disabled = !inFolder;
-  list.innerHTML = '<div class="dest-msg"><span class="spinner"></span></div>';
+  $('#dest-choose').disabled = !inFolderLevel();
+  $('#newfolder-btn').disabled = !inFolderLevel();
+  D.items = null;
+  D.err = '';
+  renderList();
   let items;
   try {
     if (!t) items = await call('ListAccounts');
@@ -704,27 +769,132 @@ async function loadLevel(autoSkip) {
     else if (t.kind === 'workspace') items = await call('ListProjects', D.stack[0].id, t.id);
     else items = await call('ListFolders', D.stack[0].id, t.folder_id);
   } catch (e) {
+    if (seq !== D.seq) return;
     S.state = await call('GetState');
     renderState();
     if (!S.state.logged_in) { closeDest(); toast('Signed out — sign in again', 'err'); return; }
-    list.innerHTML = `<div class="dest-msg" style="color:var(--error-text)">${esc(errMsg(e))}</div>`;
+    D.items = [];
+    D.err = errMsg(e);
+    renderList();
     return;
   }
+  if (seq !== D.seq) return;
   items = items || [];
   if (autoSkip && items.length === 1 && (!t || t.kind === 'account')) {
     D.stack.push(items[0]);
     return loadLevel(true);
   }
-  if (!items.length) {
-    list.innerHTML = `<div class="dest-msg">${inFolder ? 'No folders' : 'Empty'}</div>`;
-    return;
-  }
+  D.items = items;
+  renderList();
+}
+
+// hl marks the part of a name that matches the search.
+function hl(name) {
+  const q = D.q.trim();
+  const i = q ? name.toLowerCase().indexOf(q.toLowerCase()) : -1;
+  if (i < 0) return esc(name);
+  return `${esc(name.slice(0, i))}<mark>${esc(name.slice(i, i + q.length))}</mark>${esc(name.slice(i + q.length))}`;
+}
+
+function renderList() {
+  const list = $('#dest-list');
+  if (D.err) { list.innerHTML = `<div class="dest-msg" style="color:var(--error-text)">${esc(D.err)}</div>`; return; }
+  if (!D.items) { list.innerHTML = '<div class="dest-msg"><span class="spinner"></span></div>'; return; }
+  const q = D.q.trim().toLowerCase();
+  const here = D.items.filter((it) => !q || it.name.toLowerCase().includes(q));
+  const ids = new Set(here.map((it) => it.id));
+  const there = q && D.hits ? D.hits.filter((h) => !ids.has(h.id)) : [];
+  const everywhere = q.length >= 2 && !!searchAcct();
+  D.rows = [...here, ...there];
+  D.sel = Math.max(0, Math.min(D.sel, D.rows.length - 1));
+  const mark = q || D.kbd;
   const ico = { account: I.team, workspace: I.team, project: I.project, folder: I.folder };
-  list.innerHTML = items.map((it, i) => `<div class="dest-item" data-i="${i}">${ico[it.kind]}<span class="nm">${esc(it.name)}</span><span class="chev">›</span></div>`).join('');
-  $$('.dest-item', list).forEach((row) => row.addEventListener('click', () => {
-    D.stack.push(items[+row.dataset.i]);
-    loadLevel(true);
-  }));
+  const row = (it, i) => `<div class="dest-item${mark && i === D.sel ? ' sel' : ''}" data-i="${i}">${ico[it.kind]}<span class="nm">${hl(it.name)}</span>${it.where ? `<span class="where">${esc(it.where)}</span>` : ''}<span class="chev">›</span></div>`;
+  let html = here.map(row).join('');
+  if (!q && !here.length) html = `<div class="dest-msg">${inFolderLevel() ? 'No folders' : 'Empty'}</div>`;
+  else if (everywhere && (D.hitsErr || !D.hits || there.length)) {
+    html += '<div class="dest-sec">All projects</div>';
+    if (D.hitsErr) html += `<div class="dest-note err">${esc(D.hitsErr)}</div>`;
+    else if (!D.hits) html += '<div class="dest-note"><span class="spinner"></span></div>';
+    else html += there.map((it, k) => row(it, here.length + k)).join('');
+  } else if (!here.length) html = '<div class="dest-msg">No matches</div>';
+  list.innerHTML = html;
+  $$('.dest-item', list).forEach((el) => el.addEventListener('click', () => openRow(D.rows[+el.dataset.i])));
+  const sel = $('.dest-item.sel', list);
+  if (sel) sel.scrollIntoView({ block: 'nearest' });
+}
+
+// openRow goes into a row: a level below this one, or a search result anywhere.
+async function openRow(it) {
+  if (!it) return;
+  clearQuery();
+  if (!it.remote) {
+    D.stack.push(it);
+    return loadLevel(true);
+  }
+  const seq = ++D.seq;
+  D.items = null;
+  renderList();
+  try {
+    const path = await call('PathTo', searchAcct(), it.kind, it.id);
+    if (seq !== D.seq) return;
+    D.stack = path;
+  } catch (e) {
+    if (seq !== D.seq) return;
+    toast(errMsg(e), 'err');
+  }
+  loadLevel(false);
+}
+
+function searchAcct() {
+  const a = D.stack.find((x) => x.kind === 'account');
+  return a ? a.id : S.state.settings.last_account_id || '';
+}
+
+function clearQuery() {
+  Object.assign(D, { q: '', hits: null, hitsErr: '', sel: 0, kbd: false });
+  D.qseq++;
+  $('#dest-q').value = '';
+}
+
+const searchSoon = debounce(searchEverywhere, 300);
+function onDestQuery() {
+  Object.assign(D, { q: $('#dest-q').value, hits: null, hitsErr: '', sel: 0 });
+  D.qseq++;
+  renderList();
+  if (D.q.trim().length >= 2 && searchAcct()) searchSoon();
+}
+
+async function searchEverywhere() {
+  const q = D.q.trim(), acct = searchAcct();
+  if (q.length < 2 || !acct) return;
+  const seq = ++D.qseq;
+  try {
+    const hits = (await call('Search', acct, q)) || [];
+    if (seq !== D.qseq) return;
+    D.hits = hits.map((h) => ({ ...h, remote: true }));
+  } catch (e) {
+    if (seq !== D.qseq) return;
+    D.hitsErr = errMsg(e);
+  }
+  renderList();
+}
+
+function onDestKey(e) {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!D.rows.length) return;
+    if (D.q || D.kbd) D.sel = Math.max(0, Math.min(D.rows.length - 1, D.sel + (e.key === 'ArrowDown' ? 1 : -1)));
+    D.kbd = true;
+    renderList();
+  } else if (e.key === 'Enter' && (D.q || D.kbd)) {
+    e.preventDefault();
+    openRow(D.rows[D.sel]);
+  } else if (e.key === 'Escape' && D.q) {
+    e.stopPropagation();
+    clearQuery();
+    renderList();
+  }
 }
 
 function renderCrumbs() {
@@ -732,6 +902,7 @@ function renderCrumbs() {
   const parts = [{ name: 'Frame.io' }, ...D.stack];
   c.innerHTML = parts.map((p, i) => `${i ? '<span>/</span>' : ''}<button data-i="${i}" class="${i === parts.length - 1 ? 'cur' : ''}">${esc(p.name)}</button>`).join('');
   $$('button', c).forEach((b) => b.addEventListener('click', () => {
+    clearQuery();
     D.stack = D.stack.slice(0, +b.dataset.i);
     loadLevel(false);
   }));
@@ -759,7 +930,8 @@ async function chooseDest() {
     return;
   }
   try {
-    S.state = await call('SetUploadDestination', D.stack[0].id, t.folder_id, destLabel());
+    const path = D.stack.map(({ id, name, kind, folder_id }) => ({ id, name, kind, folder_id }));
+    S.state = await call('SetUploadDestination', D.stack[0].id, t.folder_id, destLabel(), path);
     renderState();
     const pending = S.pendingPaths;
     $('#dest-modal').classList.add('hidden');
@@ -781,6 +953,7 @@ async function newFolder() {
   try {
     const f = await call('CreateFolder', D.stack[0].id, destTop().folder_id, name);
     input.classList.add('hidden');
+    clearQuery();
     D.stack.push(f);
     loadLevel(false);
   } catch (e) { toast(errMsg(e), 'err'); }
@@ -845,11 +1018,12 @@ async function renderHistoryDetails(t, box) {
     ['Transfer ID', t.id],
   ];
   if (t.link) meta.splice(2, 0, ['Frame.io', t.link]);
+  if (t.share_link) meta.splice(t.link ? 3 : 2, 0, ['Share', t.share_link]);
   if (t.error) meta.push(['Error', t.error]);
-  box.innerHTML = `<div class="meta">${meta.map(([k, v]) => `<span class="k">${esc(k)}</span>${k === 'Frame.io' ? `<span class="v"><a data-url="${esc(v)}">${esc(v)}</a> · <a class="copy-link" data-link="${esc(v)}">Copy</a></span>` : `<span class="v selectable">${esc(v)}</span>`}`).join('')}</div>
+  box.innerHTML = `<div class="meta">${meta.map(([k, v]) => `<span class="k">${esc(k)}</span>${k === 'Frame.io' ? `<span class="v"><a data-url="${esc(v)}">${esc(v)}</a> · <a class="copy-share">Copy share link</a></span>` : k === 'Share' ? `<span class="v"><a data-url="${esc(v)}">${esc(v)}</a></span>` : `<span class="v selectable">${esc(v)}</span>`}`).join('')}</div>
     <div class="files">${files.length ? fileRows(files, t.kind) : '<div class="files-more">No files</div>'}</div>`;
   bindReveal(box);
-  $$('a.copy-link', box).forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); copyLink(a.dataset.link); }));
+  $$('a.copy-share', box).forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); copyShare(t.id); }));
 }
 
 // ---------- watch folders ----------

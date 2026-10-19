@@ -26,6 +26,7 @@ var documentedLimits = map[string]limitSpec{
 	"GET /v4/accounts/:id/files/:id/status":                {5, time.Second},
 	"GET /v4/accounts/:id/files/:id":                       {10, time.Second},
 	"POST /v4/accounts/:id/folders/:id/folders":            {3, time.Second},
+	"POST /v4/accounts/:id/projects/:id/shares":            {10, time.Minute},
 }
 
 var defaultLimit = limitSpec{100, time.Minute}

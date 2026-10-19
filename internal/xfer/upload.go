@@ -15,22 +15,26 @@ import (
 	"fiotransfer/internal/netx"
 )
 
-// verifyDelays spaces out the post-upload status checks. They run in the
-// background so a finished file frees its slot for the next one immediately.
-var verifyDelays = []time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second}
+// verifyDelays spaces out the post-upload status checks (about 3 minutes in
+// all). They run in the background so a finished file frees its slot for the
+// next one immediately.
+var verifyDelays = []time.Duration{3 * time.Second, 6 * time.Second, 12 * time.Second, 24 * time.Second, 45 * time.Second, 90 * time.Second}
+
+// uploadSettle is how long a file must go unmodified before it uploads.
+var uploadSettle = 10 * time.Second
 
 // uploadFile creates the file on Frame.io and PUTs all parts in parallel to
 // the presigned URLs Frame.io hands back.
 func (j *Job) uploadFile(ctx context.Context, f *File) error {
+	st, err := j.waitWritten(ctx, f)
+	if err != nil {
+		return err
+	}
 	fh, err := os.Open(f.LocalPath)
 	if err != nil {
 		return err
 	}
 	defer fh.Close()
-	st, err := fh.Stat()
-	if err != nil {
-		return err
-	}
 	size := st.Size()
 	if size != f.Size {
 		j.addTotal(size - f.Size)
@@ -94,6 +98,11 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	if err := context.Cause(ctx); err != nil {
 		return err
 	}
+	// Frame.io only knows the bytes it was sent, so it would accept a copy taken
+	// while something was still writing the file.
+	if now, err := os.Stat(f.LocalPath); err != nil || now.Size() != size || !now.ModTime().Equal(st.ModTime()) {
+		return errors.New("file changed while uploading; Frame.io's copy is incomplete")
+	}
 	secs := time.Since(started).Seconds()
 	f.mu.Lock()
 	f.detail = fmt.Sprintf("%d parts × %s, %.1fs, %s/s", len(parts), humanBytes(parts[0].size), secs, humanBytes(int64(float64(size)/max(secs, 0.001))))
@@ -104,40 +113,94 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	return nil
 }
 
-// verifyLater checks Frame.io's assembly status without holding an upload slot.
-// A failure reported by Frame.io turns the file into a failed one.
+// waitWritten returns the file's info once nothing has written to it for the
+// settle time, so a render or copy still in progress isn't sent half-finished.
+// It counts as settled by the file's own timestamp or, should the source's
+// clock be off, by watching it stay unchanged for that long.
+func (j *Job) waitWritten(ctx context.Context, f *File) (os.FileInfo, error) {
+	settle := j.mgr.UploadSettle
+	var last os.FileInfo
+	var steady time.Time
+	waiting := false
+	defer func() {
+		if waiting {
+			f.setNote("")
+			j.mgr.touch()
+		}
+	}()
+	for {
+		st, err := os.Stat(f.LocalPath)
+		if err != nil {
+			return nil, err
+		}
+		if last == nil || st.Size() != last.Size() || !st.ModTime().Equal(last.ModTime()) {
+			last, steady = st, time.Now()
+		}
+		if time.Since(st.ModTime()) >= settle || time.Since(steady) >= settle {
+			return st, nil
+		}
+		if !waiting {
+			waiting = true
+			f.setNote("still being written")
+			j.mgr.touch()
+		}
+		if err := netx.Sleep(ctx, min(time.Second, settle/4)); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// verifyLater waits for Frame.io to confirm it assembled the file, without
+// holding an upload slot. The file is logged as uploaded only once Frame.io
+// confirms it; a failure it reports, or no confirmation at all, fails it.
 func (j *Job) verifyLater(f *File, fileID string) {
+	f.mu.Lock()
+	f.checkLater = true
+	f.note = "verifying on Frame.io"
+	f.mu.Unlock()
 	j.verifyWG.Add(1)
 	go func() {
 		defer j.verifyWG.Done()
+		var lastErr error
 		for _, d := range j.mgr.VerifyDelays {
 			if netx.Sleep(j.ctx, d) != nil {
+				f.setNote("not verified")
+				j.persistFile(f)
 				return
 			}
 			s, err := j.mgr.API.FileStatus(j.ctx, j.AccountID, fileID)
-			if err != nil {
-				continue
-			}
-			if s.UploadFailed {
-				f.mu.Lock()
-				f.setStatusLocked(Failed)
-				f.err = "Frame.io reported the upload as failed"
-				f.mu.Unlock()
+			switch {
+			case err != nil:
+				lastErr = err
+			case s.UploadFailed:
+				j.verifyFailed(f, "Frame.io reported the upload as failed", nil)
+				return
+			case s.UploadComplete:
+				f.setNote("")
 				j.persistFile(f)
-				j.mgr.Hist.Log("%s FAILED   [%s] %s — %s", kindTag(j.Kind), j.ID, f.RelPath, "Frame.io reported the upload as failed")
-				if j.onFileDone != nil {
-					j.onFileDone(f)
-				}
+				j.logFileOK(f)
 				j.mgr.touch()
 				return
 			}
-			if s.UploadComplete {
-				return
-			}
 		}
-		f.setNote("processing on Frame.io")
-		j.persistFile(f)
+		j.verifyFailed(f, "Frame.io didn't confirm the upload", lastErr)
 	}()
+}
+
+func (j *Job) verifyFailed(f *File, msg string, cause error) {
+	f.mu.Lock()
+	f.setStatusLocked(Failed)
+	f.err, f.note = msg, ""
+	f.mu.Unlock()
+	j.persistFile(f)
+	if cause != nil {
+		msg += " (last check: " + cause.Error() + ")"
+	}
+	j.mgr.Hist.Log("%s FAILED   [%s] %s — %s", kindTag(j.Kind), j.ID, f.RelPath, msg)
+	if j.onFileDone != nil {
+		j.onFileDone(f)
+	}
+	j.mgr.touch()
 }
 
 func putPart(ctx context.Context, f *File, fh *os.File, off, size int64, url, contentType string) error {

@@ -78,6 +78,7 @@ type fakeFrameio struct {
 	putDelay     atomic.Int64  // slow storage (ns)
 	assemblyTime time.Duration // Frame.io reports complete this long after the last part
 	failAssembly string        // Frame.io reports this file name as failed after upload
+	madeShares   []madeShare   // POST projects/{id}/shares
 
 	// files in the account (download watches)
 	seedSeq   atomic.Int64
@@ -88,6 +89,12 @@ type fakeFrameio struct {
 }
 
 type fakeFolder struct{ parent, name string }
+
+type madeShare struct {
+	project, name, access string
+	assets                []string
+	downloads             bool
+}
 
 // fakeRemote is a file or version stack in the account.
 type fakeRemote struct {
@@ -418,7 +425,34 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": id, "name": in.Data.Name, "media_type": up.mediaType,
 			"file_size": in.Data.FileSize, "status": "created", "view_url": "https://next.frame.io/view/" + id, "upload_urls": urls}})
 	case r.Method == "GET" && len(parts) == 5 && parts[3] == "folders":
-		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": parts[4], "name": "dest", "type": "folder", "view_url": "https://next.frame.io/folder/" + parts[4]}})
+		f.mu.Lock()
+		fd, ok := f.folders[parts[4]]
+		f.mu.Unlock()
+		name, parent := "dest", any(nil) // unknown folders stand for a destination at a project's root
+		if ok {
+			name, parent = fd.name, fd.parent
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": parts[4], "name": name, "type": "folder", "parent_id": parent,
+			"project_id": "proj", "view_url": "https://next.frame.io/folder/" + parts[4]}})
+	case r.Method == "POST" && len(parts) == 6 && parts[3] == "projects" && parts[5] == "shares":
+		var in struct {
+			Data struct {
+				Type, Name, Access string
+				AssetIDs           []string `json:"asset_ids"`
+				Downloads          bool     `json:"downloading_enabled"`
+			}
+		}
+		json.NewDecoder(r.Body).Decode(&in)
+		if in.Data.Type != "asset" || in.Data.Name == "" || len(in.Data.AssetIDs) == 0 {
+			http.Error(w, `{"errors":[{"detail":"bad share"}]}`, 422)
+			return
+		}
+		f.mu.Lock()
+		f.madeShares = append(f.madeShares, madeShare{parts[4], in.Data.Name, in.Data.Access, in.Data.AssetIDs, in.Data.Downloads})
+		n := len(f.madeShares)
+		f.mu.Unlock()
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": fmt.Sprintf("share-%d", n), "short_url": fmt.Sprintf("https://f.io/s%d", n)}})
 	case r.Method == "GET" && len(parts) == 6 && parts[3] == "folders" && parts[5] == "children":
 		if f.failChildren.Load() {
 			http.Error(w, `{"errors":[{"detail":"forbidden"}]}`, 403)
@@ -641,6 +675,7 @@ func newTestManager(t *testing.T, fake *fakeFrameio, streams, segMB int) *Manage
 	m := NewManager(c, h, settings)
 	m.Secrets = &memSecrets{m: map[string]string{}}
 	m.VerifyDelays = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 50 * time.Millisecond}
+	m.UploadSettle = 0
 	return m
 }
 

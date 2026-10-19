@@ -27,10 +27,20 @@ type Settings struct {
 	// The last release a notification was shown for.
 	UpdateNotified string `json:"update_notified"`
 
-	// Last upload destination, remembered for convenience.
-	LastAccountID   string `json:"last_account_id"`
-	LastFolderID    string `json:"last_folder_id"`
-	LastFolderLabel string `json:"last_folder_label"`
+	// Last upload destination, remembered for convenience. The path down to
+	// it lets the picker open at any of its levels.
+	LastAccountID   string  `json:"last_account_id"`
+	LastFolderID    string  `json:"last_folder_id"`
+	LastFolderLabel string  `json:"last_folder_label"`
+	LastFolderPath  []Crumb `json:"last_folder_path,omitempty"`
+}
+
+// Crumb is one level of a Frame.io path: account, workspace, project or folder.
+type Crumb struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	FolderID string `json:"folder_id,omitempty"`
 }
 
 func (s Settings) FolderLogs() bool { return !s.NoFolderLogs }
