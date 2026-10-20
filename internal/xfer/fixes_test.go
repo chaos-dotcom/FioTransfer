@@ -124,6 +124,8 @@ func TestWatchCancelPersists(t *testing.T) {
 	fake.putDelay.Store(0)
 	w2.RequeueCanceled(x.ID)
 	waitFor(t, "requeued files", 15*time.Second, func() bool { return len(fake.assembled("dest")) == 6 })
+	// The batch keeps writing logs after the uploads land; let it finish before the temp dirs go.
+	waitFor(t, "idle watch", 5*time.Second, func() bool { v := w2.Views()[0]; return v.Uploaded == 6 && v.State == "watching" })
 }
 
 func TestWatchShutdownDoesNotCancelFiles(t *testing.T) {
@@ -144,6 +146,7 @@ func TestWatchShutdownDoesNotCancelFiles(t *testing.T) {
 	w2 := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond) // relaunch
 	defer w2.Close()
 	waitFor(t, "files after relaunch", 15*time.Second, func() bool { return len(fake.assembled("dest")) == 4 })
+	waitFor(t, "idle watch", 5*time.Second, func() bool { v := w2.Views()[0]; return v.Uploaded == 4 && v.State == "watching" })
 }
 
 func TestWatchEdit(t *testing.T) {
