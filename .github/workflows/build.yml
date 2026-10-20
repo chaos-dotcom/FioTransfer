@@ -91,7 +91,22 @@ jobs:
           name: FioTransfer-${{ needs.build.outputs.version }}
           path: dist
 
+      # The body goes above the generated notes. Drop the notice once releases
+      # are notarized.
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           generate_release_notes: true
+          body: |
+            ### First launch
+
+            FioTransfer isn't notarized by Apple yet, so macOS blocks the first launch with "Apple could not verify…". After copying it to Applications, run this in Terminal:
+
+            ```sh
+            xattr -dr com.apple.quarantine /Applications/FioTransfer.app
+            ```
+
+            Or click **Done**, then **Open Anyway** in **System Settings → Privacy & Security**.
+
+            Updates installed from inside the app aren't affected.
+
