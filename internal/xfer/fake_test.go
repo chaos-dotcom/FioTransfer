@@ -71,7 +71,7 @@ type fakeFrameio struct {
 	partSize     int64
 	putCount     atomic.Int64
 	putFailEvery int64
-	rejectName   string // PUTs for this file name fail permanently (400)
+	rejectName   atomic.Value // string; PUTs for this file name fail permanently (400)
 	apiCalls     atomic.Int64
 	listCalls    atomic.Int64  // share folder listings (GraphQL)
 	failChildren atomic.Bool   // folder listings are refused (403)
@@ -574,7 +574,7 @@ func (f *fakeFrameio) s3(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad headers", 400)
 		return
 	}
-	if up.name == f.rejectName {
+	if up.name == f.rejectName.Load() {
 		http.Error(w, "rejected", 400)
 		return
 	}

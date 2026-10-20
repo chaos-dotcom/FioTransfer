@@ -132,7 +132,7 @@ func TestUploadLoggedOKAfterConfirmation(t *testing.T) {
 // skips failed files, and is made only once.
 func TestShareLink(t *testing.T) {
 	fake := newFake(t)
-	fake.rejectName = "bad.mov"
+	fake.rejectName.Store("bad.mov")
 	m := newTestManager(t, fake, 4, 1)
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, "Shoot/a.bin"), randBytes(1, 1000))

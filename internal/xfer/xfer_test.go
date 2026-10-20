@@ -294,7 +294,7 @@ func TestUploadTreeWithRetries(t *testing.T) {
 
 func TestUploadRetryResendsOnlyFailed(t *testing.T) {
 	fake := newFake(t)
-	fake.rejectName = "y.bin"
+	fake.rejectName.Store("y.bin")
 	m := newTestManager(t, fake, 8, 1)
 	src := t.TempDir()
 	x, y := randBytes(31, 4<<20), randBytes(32, 5<<20)
@@ -305,7 +305,7 @@ func TestUploadRetryResendsOnlyFailed(t *testing.T) {
 	if v.Status != Partial || v.FilesFailed != 1 {
 		t.Fatalf("status=%s failed=%d", v.Status, v.FilesFailed)
 	}
-	fake.rejectName = ""
+	fake.rejectName.Store("")
 	uploadsBefore := fake.fileSeq.Load()
 	j2, err := m.Retry(j.ID, "")
 	if err != nil {
