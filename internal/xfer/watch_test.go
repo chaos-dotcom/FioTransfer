@@ -25,7 +25,9 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 func TestWatchFolder(t *testing.T) {
 	fake := newFake(t)
 	m := newTestManager(t, fake, 8, 1)
-	w := newWatcher(m, 50*time.Millisecond, 200*time.Millisecond)
+	// settle is far above the 80 ms between writes to the growing file below,
+	// so a stalled CI runner can't make it look finished.
+	w := newWatcher(m, 50*time.Millisecond, time.Second)
 	defer w.Close()
 
 	root := t.TempDir()
@@ -59,7 +61,7 @@ func TestWatchFolder(t *testing.T) {
 	final, _ := os.ReadFile(grow)
 	waitFor(t, "second upload", 10*time.Second, func() bool { return bytes.Equal(fake.assembled("dest")["Day 1/A/b.mov"], final) })
 
-	time.Sleep(500 * time.Millisecond) // more scans: nothing new should go up
+	time.Sleep(1500 * time.Millisecond) // more scans: nothing new should go up
 	got := fake.assembled("dest")
 	if len(got) != 2 || !bytes.Equal(got["Day 1/A/a.mov"], a) {
 		t.Errorf("uploaded set: %d files", len(got))
@@ -81,7 +83,7 @@ func TestWatchFolder(t *testing.T) {
 	// Paused watches don't upload.
 	w.SetEnabled(x.ID, false)
 	writeFile(t, filepath.Join(root, "c.mov"), randBytes(54, 500))
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 	if fake.assembled("dest")["c.mov"] != nil {
 		t.Error("paused watch uploaded a file")
 	}
@@ -91,9 +93,9 @@ func TestWatchFolder(t *testing.T) {
 	// Watches survive a restart without re-uploading.
 	before := fake.fileSeq.Load()
 	w.Close()
-	w2 := newWatcher(m, 50*time.Millisecond, 200*time.Millisecond)
+	w2 := newWatcher(m, 50*time.Millisecond, time.Second)
 	defer w2.Close()
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 	if fake.fileSeq.Load() != before {
 		t.Error("restarted watcher re-uploaded files")
 	}

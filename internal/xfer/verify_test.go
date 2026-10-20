@@ -22,7 +22,7 @@ func readLog(t *testing.T, m *Manager) string {
 func TestUploadWaitsForFileStillBeingWritten(t *testing.T) {
 	fake := newFake(t)
 	m := newTestManager(t, fake, 4, 1)
-	m.UploadSettle = 400 * time.Millisecond
+	m.UploadSettle = time.Second // far above the 100 ms between writes, even on a stalled CI runner
 	p := filepath.Join(t.TempDir(), "render.mov")
 	full := randBytes(7, 4<<20)
 	writeFile(t, p, full[:1<<20])
@@ -56,7 +56,7 @@ func TestUploadWaitsForFileStillBeingWritten(t *testing.T) {
 
 func TestUploadFailsWhenFileChangesMidUpload(t *testing.T) {
 	fake := newFake(t)
-	fake.putDelay.Store(int64(300 * time.Millisecond))
+	fake.putDelay.Store(int64(time.Second)) // the upload is still running when the file changes
 	m := newTestManager(t, fake, 4, 1)
 	p := filepath.Join(t.TempDir(), "grade.mov")
 	writeFile(t, p, randBytes(8, 2<<20))
