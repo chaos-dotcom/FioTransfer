@@ -294,6 +294,11 @@ func (c *Client) CreateLocalUpload(ctx context.Context, acct, folder, name strin
 	return &r.Data, nil
 }
 
+// DeleteFile deletes a file, such as an upload that didn't finish.
+func (c *Client) DeleteFile(ctx context.Context, acct, file string) error {
+	return c.do(ctx, "DELETE", "/v4/accounts/"+acct+"/files/"+file, nil, nil, nil)
+}
+
 func (c *Client) FileStatus(ctx context.Context, acct, file string) (*FileStatus, error) {
 	var r struct{ Data FileStatus }
 	if err := c.do(ctx, "GET", "/v4/accounts/"+acct+"/files/"+file+"/status", nil, nil, &r); err != nil {

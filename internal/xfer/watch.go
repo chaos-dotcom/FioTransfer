@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,6 +34,11 @@ var (
 	watchListEvery  = 6                // Frame.io is listed every 6th check (more rarely for big trees)
 	watchMaxRetries = 3
 	watchBatchMax   = 500
+
+	// On a network share, a file mediaState can't check must stay unchanged
+	// this many times the settle time: the share's view of a file another
+	// machine is writing can stand still for longer than the settle time.
+	netSettleFactor = 6
 )
 
 // watchBackoff is how long a watch waits after its n-th batch in a row failed
@@ -127,6 +133,8 @@ type Watcher struct {
 	settle   time.Duration
 	poll     time.Duration // Frame.io listings at most this often
 
+	onNetwork func(path string) bool // whether a watched folder is on a network share
+
 	ctx      context.Context // canceled by Close, for listings in flight
 	cancel   context.CancelFunc
 	stop     chan struct{}
@@ -138,7 +146,7 @@ func NewWatcher(m *Manager) *Watcher { return newWatcher(m, watchInterval, watch
 func newWatcher(m *Manager, interval, settle time.Duration) *Watcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &Watcher{m: m, ws: map[string]*watchState{}, stop: make(chan struct{}), interval: interval, settle: settle,
-		poll: time.Duration(watchListEvery) * interval, ctx: ctx, cancel: cancel}
+		poll: time.Duration(watchListEvery) * interval, onNetwork: onNetworkVolume, ctx: ctx, cancel: cancel}
 	if list, err := m.Hist.Watches(); err == nil {
 		for _, x := range list {
 			w.ws[x.ID] = &watchState{w: x, seen: map[string]obs{}}
@@ -640,6 +648,7 @@ func (w *Watcher) scan(s *watchState) {
 	var settled []scanned
 	var onFrameio []history.WatchFile // mirror: already there with the same name and size
 	pending := 0
+	netVol := w.onNetwork(x.LocalPath)
 	consider := func(rel string, size, mtime int64) {
 		if k, ok := known[rel]; ok {
 			switch k.State {
@@ -656,13 +665,16 @@ func (w *Watcher) scan(s *watchState) {
 			o.since = prev.since
 		}
 		seen[rel] = o
+		local := filepath.Join(x.LocalPath, filepath.FromSlash(rel))
 		switch {
 		case now.Sub(o.since) < w.settle:
 			pending++
 		case mirror && l.same[sameKey(rel, size)]:
 			onFrameio = append(onFrameio, history.WatchFile{RelPath: rel, Size: size, Mtime: mtime, State: history.WatchIgnored})
+		case !w.written(local, size, now.Sub(o.since), netVol):
+			pending++
 		default:
-			settled = append(settled, scanned{local: filepath.Join(x.LocalPath, filepath.FromSlash(rel)), rel: rel, size: size, mtime: mtime})
+			settled = append(settled, scanned{local: local, rel: rel, size: size, mtime: mtime})
 		}
 	}
 	var err error
@@ -717,6 +729,28 @@ func (w *Watcher) scan(s *watchState) {
 	w.startBatch(s, x, ready, known)
 }
 
+// written reports whether a file that has held still for steady is done being
+// written. A QuickTime/MXF file must be finished; another file on a network
+// share must hold still netSettleFactor times the settle time.
+func (w *Watcher) written(path string, size int64, steady time.Duration, netVol bool) bool {
+	switch mediaState(path, size) {
+	case formatFinished:
+		return true
+	case formatUnfinished:
+		return false
+	}
+	return !netVol || steady >= time.Duration(netSettleFactor)*w.settle
+}
+
+// unsee forgets a file's last size and mtime, so it has to settle again.
+func (w *Watcher) unsee(s *watchState, rel string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	seen := maps.Clone(s.seen) // scans read the map without the lock
+	delete(seen, rel)
+	s.seen = seen
+}
+
 func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, known map[string]history.WatchFile) {
 	m := w.m
 	j := m.newJob("upload")
@@ -765,8 +799,12 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 	}
 	j.onFileDone = func(f *File) {
 		f.mu.Lock()
-		st, e, rid, size := f.status, f.err, f.RemoteID, f.Size
+		st, e, rid, size, writing := f.status, f.err, f.RemoteID, f.Size, f.stillWriting
 		f.mu.Unlock()
+		if writing { // back to settling, not a failed attempt
+			w.unsee(s, f.RelPath)
+			return
+		}
 		wf := history.WatchFile{RelPath: f.RelPath, Size: size, Mtime: mtimes[f.RelPath], RemoteID: rid}
 		switch st {
 		case Done, Skipped:

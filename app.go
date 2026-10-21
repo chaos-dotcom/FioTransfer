@@ -82,6 +82,7 @@ func (a *App) startup(ctx context.Context) {
 	h.MarkInterrupted() // only the app does this: the CLI may run while the app is transferring
 	a.mgr = xfer.NewManager(a.api, h, a.Settings)
 	a.wat = xfer.NewWatcher(a.mgr)
+	go a.mgr.CleanUp()
 	busy := map[string]bool{} // jobs that ran since the last notification
 	a.mgr.OnUpdate = func(s xfer.Snapshot) {
 		runtime.EventsEmit(ctx, "snapshot", s)

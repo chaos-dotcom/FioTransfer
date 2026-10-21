@@ -78,6 +78,9 @@ func TestUploadFailsWhenFileChangesMidUpload(t *testing.T) {
 	if log := readLog(t, m); strings.Contains(log, "file ok") {
 		t.Errorf("log calls the file ok:\n%s", log)
 	}
+	if d := fake.deletedFiles(); len(d) != 1 {
+		t.Errorf("deleted %v; Frame.io's incomplete copy should go", d)
+	}
 }
 
 func TestUploadUnconfirmedByFrameioFails(t *testing.T) {
@@ -98,6 +101,9 @@ func TestUploadUnconfirmedByFrameioFails(t *testing.T) {
 	log := readLog(t, m)
 	if strings.Contains(log, "file ok") || !strings.Contains(log, "FAILED") {
 		t.Errorf("log:\n%s", log)
+	}
+	if d := fake.deletedFiles(); len(d) != 1 {
+		t.Errorf("deleted %v; the unconfirmed file should go", d)
 	}
 }
 

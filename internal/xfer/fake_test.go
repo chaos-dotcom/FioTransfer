@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,6 +80,8 @@ type fakeFrameio struct {
 	assemblyTime time.Duration // Frame.io reports complete this long after the last part
 	failAssembly string        // Frame.io reports this file name as failed after upload
 	madeShares   []madeShare   // POST projects/{id}/shares
+	deleted      []string      // DELETE files/{id}, in order
+	failDelete   atomic.Bool   // deletes are refused (403)
 
 	// files in the account (download watches)
 	seedSeq   atomic.Int64
@@ -531,6 +534,24 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": id, "name": a.name, "type": "file",
 				"media_links": map[string]any{"original": map[string]any{"download_url": url}}}})
 		}
+	case r.Method == "DELETE" && len(parts) == 5 && parts[3] == "files":
+		if f.failDelete.Load() {
+			http.Error(w, `{"errors":[{"detail":"forbidden"}]}`, 403)
+			return
+		}
+		f.mu.Lock()
+		_, ok := f.uploads[parts[4]]
+		if ok {
+			delete(f.uploads, parts[4])
+			delete(f.assets, parts[4])
+			f.deleted = append(f.deleted, parts[4])
+		}
+		f.mu.Unlock()
+		if !ok {
+			http.Error(w, `{"errors":[{"detail":"not found"}]}`, 404)
+			return
+		}
+		w.WriteHeader(204)
 	case r.Method == "GET" && len(parts) == 6 && parts[3] == "files" && parts[5] == "status":
 		f.mu.Lock()
 		up := f.uploads[parts[4]]
@@ -596,6 +617,13 @@ func (f *fakeFrameio) s3(w http.ResponseWriter, r *http.Request) {
 	up.lastPart = time.Now()
 	f.mu.Unlock()
 	w.WriteHeader(200)
+}
+
+// deletedFiles returns the IDs of files deleted so far.
+func (f *fakeFrameio) deletedFiles() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.deleted)
 }
 
 // assembled returns uploaded content by "parentFolderPath/name".

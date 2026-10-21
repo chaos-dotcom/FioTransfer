@@ -66,12 +66,13 @@ type File struct {
 	retries atomic.Int64
 	detail  string // e.g. part count and speed, for the log
 
-	mu         sync.Mutex
-	status     Status
-	note       string
-	err        string
-	finished   time.Time
-	checkLater bool // Frame.io's confirmation is pending; its check logs the outcome
+	mu           sync.Mutex
+	status       Status
+	note         string
+	err          string
+	finished     time.Time
+	checkLater   bool // Frame.io's confirmation is pending; its check logs the outcome
+	stillWriting bool // it changed while uploading; a watch sends it again once it settles
 }
 
 // add records bytes moved over the network.
@@ -281,6 +282,11 @@ type Manager struct {
 	VerifyDelays []time.Duration
 	// UploadSettle is how long a file must go unmodified before it uploads.
 	UploadSettle time.Duration
+	// StallLimit is how long an upload waits for an unfinished QuickTime/MXF
+	// file that has stopped changing before failing it.
+	StallLimit time.Duration
+	// ChangeCheck is how often a file being uploaded is checked for changes.
+	ChangeCheck time.Duration
 	// RetryWatch re-queues a watch-folder batch's unfinished files in their
 	// watch instead of starting a separate transfer (set by NewWatcher).
 	RetryWatch func(watchID, localPath string, files []history.File) error
@@ -298,6 +304,8 @@ type Manager struct {
 
 	awake      atomic.Bool // hold a caffeinate assertion while transfers run
 	caffeinate *exec.Cmd
+
+	run string // tells this process's unfinished uploads from an earlier one's with the same PID
 }
 
 // keepWatchJobs is how many finished watch-folder batches stay in the list.
@@ -306,7 +314,7 @@ const keepWatchJobs = 10
 func NewManager(a *api.Client, h *history.Store, settings func() config.Settings) *Manager {
 	s := settings()
 	m := &Manager{API: a, Hist: h, Settings: settings, Limiter: NewLimiter(s.Streams), Secrets: keychainStore{},
-		VerifyDelays: verifyDelays, UploadSettle: uploadSettle}
+		VerifyDelays: verifyDelays, UploadSettle: uploadSettle, StallLimit: stallLimit, ChangeCheck: changeCheck, run: newID()}
 	go m.loop()
 	return m
 }

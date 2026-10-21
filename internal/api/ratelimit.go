@@ -25,6 +25,7 @@ var documentedLimits = map[string]limitSpec{
 	"POST /v4/accounts/:id/folders/:id/files/local_upload": {5, time.Second},
 	"GET /v4/accounts/:id/files/:id/status":                {5, time.Second},
 	"GET /v4/accounts/:id/files/:id":                       {10, time.Second},
+	"DELETE /v4/accounts/:id/files/:id":                    {100, time.Minute},
 	"POST /v4/accounts/:id/folders/:id/folders":            {3, time.Second},
 	"POST /v4/accounts/:id/projects/:id/shares":            {10, time.Minute},
 }

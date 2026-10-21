@@ -9,9 +9,11 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"fiotransfer/internal/api"
+	"fiotransfer/internal/history"
 	"fiotransfer/internal/netx"
 )
 
@@ -23,8 +25,19 @@ var verifyDelays = []time.Duration{3 * time.Second, 6 * time.Second, 12 * time.S
 // uploadSettle is how long a file must go unmodified before it uploads.
 var uploadSettle = 10 * time.Second
 
+// stallLimit is how long an upload waits for an unfinished render that has
+// stopped changing (paused, or its renderer quit) before failing it.
+var stallLimit = 2 * time.Minute
+
+// changeCheck is how often a file being uploaded is checked for changes.
+var changeCheck = 2 * time.Second
+
+// errChanged stops an upload whose file changed while it was being sent.
+var errChanged = errors.New("file changed while uploading")
+
 // uploadFile creates the file on Frame.io and PUTs all parts in parallel to
-// the presigned URLs Frame.io hands back.
+// the presigned URLs Frame.io hands back. If the upload doesn't get all the
+// bytes there, the file is deleted from Frame.io again.
 func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	st, err := j.waitWritten(ctx, f)
 	if err != nil {
@@ -58,6 +71,16 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	if j.linkFromFile {
 		j.setLink(lu.ViewURL)
 	}
+	// Until every byte is sent, Frame.io holds an unusable file. The row lets
+	// CleanUp delete it should the app quit or crash first.
+	j.mgr.Hist.AddUnfinished(history.Unfinished{FileID: lu.ID, AccountID: j.AccountID, TransferID: j.ID, RelPath: f.RelPath,
+		PID: os.Getpid(), Run: j.mgr.run})
+	sent := false
+	defer func() {
+		if !sent {
+			j.discard(f, lu.ID)
+		}
+	}()
 	started := time.Now()
 
 	contentType := "application/octet-stream"
@@ -80,6 +103,21 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	go func() { // stop as soon as the file changes, rather than after sending all of it
+		t := time.NewTicker(j.mgr.ChangeCheck)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if changedSince(f.LocalPath, st) {
+					cancel(errChanged)
+					return
+				}
+			}
+		}
+	}()
 	var wg sync.WaitGroup
 	for _, p := range parts {
 		wg.Add(1)
@@ -95,14 +133,15 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 		}()
 	}
 	wg.Wait()
-	if err := context.Cause(ctx); err != nil {
-		return err
-	}
 	// Frame.io only knows the bytes it was sent, so it would accept a copy taken
 	// while something was still writing the file.
-	if now, err := os.Stat(f.LocalPath); err != nil || now.Size() != size || !now.ModTime().Equal(st.ModTime()) {
-		return errors.New("file changed while uploading; Frame.io's copy is incomplete")
+	if err := context.Cause(ctx); errors.Is(err, errChanged) || (err == nil && changedSince(f.LocalPath, st)) {
+		return j.stillWriting(f)
+	} else if err != nil {
+		return err
 	}
+	sent = true
+	j.mgr.Hist.UploadSent(lu.ID)
 	secs := time.Since(started).Seconds()
 	f.mu.Lock()
 	f.detail = fmt.Sprintf("%d parts × %s, %.1fs, %s/s", len(parts), humanBytes(parts[0].size), secs, humanBytes(int64(float64(size)/max(secs, 0.001))))
@@ -116,7 +155,9 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 // waitWritten returns the file's info once nothing has written to it for the
 // settle time, so a render or copy still in progress isn't sent half-finished.
 // It counts as settled by the file's own timestamp or, should the source's
-// clock be off, by watching it stay unchanged for that long.
+// clock be off, by watching it stay unchanged for that long. A QuickTime/MXF
+// file must also be finished (see mediaState); one that stops changing before
+// it is fails after StallLimit.
 func (j *Job) waitWritten(ctx context.Context, f *File) (os.FileInfo, error) {
 	settle := j.mgr.UploadSettle
 	var last os.FileInfo
@@ -137,17 +178,118 @@ func (j *Job) waitWritten(ctx context.Context, f *File) (os.FileInfo, error) {
 			last, steady = st, time.Now()
 		}
 		if time.Since(st.ModTime()) >= settle || time.Since(steady) >= settle {
-			return st, nil
+			if mediaState(f.LocalPath, st.Size()) != formatUnfinished {
+				return st, nil
+			}
+			if time.Since(steady) >= j.mgr.StallLimit {
+				return nil, errors.New("file is incomplete and stopped changing")
+			}
 		}
 		if !waiting {
 			waiting = true
 			f.setNote("still being written")
 			j.mgr.touch()
 		}
-		if err := netx.Sleep(ctx, min(time.Second, settle/4)); err != nil {
+		if err := netx.Sleep(ctx, max(10*time.Millisecond, min(time.Second, settle/4))); err != nil {
 			return nil, err
 		}
 	}
+}
+
+// changedSince reports whether a file's size or mtime differ from st.
+func changedSince(path string, st os.FileInfo) bool {
+	now, err := os.Stat(path)
+	return err != nil || now.Size() != st.Size() || !now.ModTime().Equal(st.ModTime())
+}
+
+// stillWriting marks a file that changed while it was being sent.
+func (j *Job) stillWriting(f *File) error {
+	f.mu.Lock()
+	f.stillWriting = true
+	f.mu.Unlock()
+	if j.watchID != "" {
+		return errors.New("still being written; uploads once finished")
+	}
+	return errChanged
+}
+
+// discard deletes a file's copy on Frame.io after its upload didn't get all
+// the bytes there, so nothing unusable is left behind. If Frame.io can't be
+// reached, CleanUp tries again later.
+func (j *Job) discard(f *File, id string) {
+	h := j.mgr.Hist
+	h.AddUnfinished(history.Unfinished{FileID: id, AccountID: j.AccountID, TransferID: j.ID, RelPath: f.RelPath}) // no owner: delete it
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := j.mgr.deleteFile(ctx, j.AccountID, id); err != nil {
+		h.Log("%s cleanup  [%s] %s — couldn't delete the unfinished copy from Frame.io (will retry): %v", kindTag(j.Kind), j.ID, f.RelPath, err)
+		return
+	}
+	h.UploadDeleted(id)
+	f.mu.Lock()
+	view := f.ViewURL
+	if f.RemoteID == id {
+		f.RemoteID, f.ViewURL = "", ""
+	}
+	f.mu.Unlock()
+	j.mu.Lock()
+	if view != "" && j.link == view { // a single file's page: gone now
+		j.link = ""
+	}
+	j.mu.Unlock()
+	h.Log("%s cleanup  [%s] %s — deleted the unfinished copy from Frame.io", kindTag(j.Kind), j.ID, f.RelPath)
+}
+
+// deleteFile deletes a file on Frame.io; one that's already gone counts as deleted.
+func (m *Manager) deleteFile(ctx context.Context, acct, id string) error {
+	err := m.API.DeleteFile(ctx, acct, id)
+	var ae *api.Error
+	if errors.As(err, &ae) && ae.Status == 404 {
+		return nil
+	}
+	return err
+}
+
+// cleanUpEvery is how often CleanUp looks for unfinished uploads to delete.
+const cleanUpEvery = 10 * time.Minute
+
+// CleanUp deletes Frame.io copies of uploads that never finished, 30 s after
+// it starts and then every 10 minutes: ones whose delete failed, and ones left
+// by a run that quit or crashed mid-upload. The app runs it.
+func (m *Manager) CleanUp() {
+	time.Sleep(30 * time.Second)
+	for {
+		m.cleanUp(context.Background())
+		time.Sleep(cleanUpEvery)
+	}
+}
+
+func (m *Manager) cleanUp(ctx context.Context) {
+	if !m.API.Auth.LoggedIn() {
+		return
+	}
+	list, err := m.Hist.UnfinishedUploads()
+	if err != nil {
+		return
+	}
+	for _, u := range list {
+		if u.PID != 0 && (u.Run == m.run || (u.PID != os.Getpid() && processAlive(u.PID))) {
+			continue // still being sent (here, or by the CLI)
+		}
+		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := m.deleteFile(dctx, u.AccountID, u.FileID)
+		cancel()
+		if err != nil {
+			continue
+		}
+		m.Hist.UploadDeleted(u.FileID)
+		m.Hist.Log("UPLOAD   cleanup  [%s] %s — deleted the unfinished copy from Frame.io", u.TransferID, u.RelPath)
+	}
+}
+
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // verifyLater waits for Frame.io to confirm it assembled the file, without
@@ -188,6 +330,12 @@ func (j *Job) verifyLater(f *File, fileID string) {
 }
 
 func (j *Job) verifyFailed(f *File, msg string, cause error) {
+	f.mu.Lock()
+	id := f.RemoteID
+	f.mu.Unlock()
+	if id != "" {
+		j.discard(f, id)
+	}
 	f.mu.Lock()
 	f.setStatusLocked(Failed)
 	f.err, f.note = msg, ""

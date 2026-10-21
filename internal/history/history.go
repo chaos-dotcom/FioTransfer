@@ -85,7 +85,7 @@ func Open(dir, logDir string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema + watchSchema); err != nil {
+	if _, err := db.Exec(schema + watchSchema + unfinishedSchema); err != nil {
 		db.Close()
 		return nil, err
 	}
