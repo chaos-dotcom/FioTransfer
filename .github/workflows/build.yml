@@ -86,27 +86,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: FioTransfer-${{ needs.build.outputs.version }}
           path: dist
 
-      # The body goes above the generated notes. Drop the notice once releases
-      # are notarized.
+      # The first-launch notice, then what's new: the tag's message (git tag -a
+      # vX.Y.Z -F notes.md), or the commit subjects since the previous tag when
+      # the tag has none. Drop the notice once releases are notarized.
+      - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/release-notes.sh "$TAG" > release-notes.md
+
+      # The generated notes (the "Full Changelog" link) go below the body.
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           generate_release_notes: true
-          body: |
-            ### First launch
-
-            FioTransfer isn't notarized by Apple yet, so macOS blocks the first launch with "Apple could not verify…". After copying it to Applications, run this in Terminal:
-
-            ```sh
-            xattr -dr com.apple.quarantine /Applications/FioTransfer.app
-            ```
-
-            Or click **Done**, then **Open Anyway** in **System Settings → Privacy & Security**.
-
-            Updates installed from inside the app aren't affected.
+          body_path: release-notes.md
 
