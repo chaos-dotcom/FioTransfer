@@ -169,6 +169,7 @@ type Job struct {
 
 	mu       sync.Mutex
 	status   Status
+	final    Status // the outcome; finish makes it the status once it's saved
 	err      string
 	phase    string // human-readable sub-status while resolving
 	created  time.Time
@@ -959,9 +960,9 @@ func (m *Manager) Retry(id, passphrase string) (*Job, error) {
 func (j *Job) fail(err error) {
 	j.mu.Lock()
 	if j.ctx.Err() != nil {
-		j.status = Canceled
+		j.final = Canceled
 	} else {
-		j.status = Failed
+		j.final = Failed
 		j.err = err.Error()
 	}
 	j.mu.Unlock()
@@ -1081,18 +1082,18 @@ func (j *Job) finish() {
 	j.settleFiles()
 	j.mu.Lock()
 	j.finished = time.Now()
-	if !j.status.terminal() {
+	if j.final == "" {
 		done, failed, skipped, canceled := j.counts()
 		switch {
 		case j.ctx.Err() != nil && (canceled > 0 || len(j.Files) == 0):
-			j.status = Canceled
+			j.final = Canceled
 		case failed == 0:
-			j.status = Done
+			j.final = Done
 		case done+skipped > 0:
-			j.status = Partial
+			j.final = Partial
 			j.err = fmt.Sprintf("%d of %d files failed", failed, len(j.Files))
 		default:
-			j.status = Failed
+			j.final = Failed
 			if j.err == "" {
 				for _, f := range j.Files {
 					f.mu.Lock()
@@ -1120,7 +1121,9 @@ func (j *Job) finish() {
 		msg += " — " + rec.Error
 	}
 	j.mgr.Hist.Log("%s", msg)
-	j.mgr.touch()
+	// Only now does the job look finished, so whatever waits for that (the
+	// CLI exits) finds its history row and folder log complete.
+	j.setStatus(j.final)
 	if j.onFinish != nil {
 		j.onFinish(j)
 	}
@@ -1134,10 +1137,14 @@ func (j *Job) record() history.Transfer {
 	defer j.mu.Unlock()
 	done, failed, skipped, _ := j.counts()
 	opts, _ := json.Marshal(jobOptions{Subfolder: j.subfolder, Paths: j.paths, Watch: j.watchID})
+	status := j.status
+	if j.final != "" {
+		status = j.final
+	}
 	t := history.Transfer{
 		ID: j.ID, Kind: j.Kind, Title: j.Title, Source: j.Source, Dest: j.Dest,
 		AccountID: j.AccountID, FolderID: j.FolderID, ShareID: j.ShareID,
-		Status: string(j.status), Error: j.err,
+		Status: string(status), Error: j.err,
 		TotalBytes: j.total.Load(), DoneBytes: j.done.Load(),
 		FilesTotal: len(j.Files), FilesDone: done + skipped, FilesFailed: failed,
 		CreatedAt: j.created.UnixMilli(), PeakBps: j.meter.Peak(), Options: string(opts), Link: j.link, ShareLink: j.shareLink,
