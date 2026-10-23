@@ -168,6 +168,7 @@ func TestWeTransfer(t *testing.T) {
 func TestDropbox(t *testing.T) {
 	var srv *httptest.Server
 	var lists, refusals atomic.Int64
+	var fileUA atomic.Value
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == "HEAD" && r.URL.Path == "/":
@@ -208,12 +209,14 @@ func TestDropbox(t *testing.T) {
 				http.NotFound(w, r)
 				return
 			}
-			http.Redirect(w, r, "/content"+strings.TrimPrefix(r.URL.Path, "/scl/fo/k3y/h4sh"), http.StatusFound)
+			fileUA.Store(r.UserAgent())
+			http.Redirect(w, r, "/content"+strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/scl/fo/k3y/h4sh"), "/scl/fi/f1l3"), http.StatusFound)
 		case strings.HasPrefix(r.URL.Path, "/content/"):
 			if r.Header.Get("Range") != "bytes=0-0" {
 				t.Errorf("content request without Range: %v", r.Header)
 			}
 			w.Header().Set("Content-Range", "bytes 0-0/10")
+			w.Header().Set("Content-Disposition", `inline; filename="Grade v3.mov"`)
 			w.WriteHeader(206)
 			w.Write([]byte("x"))
 		default:
@@ -242,6 +245,20 @@ func TestDropbox(t *testing.T) {
 	if err != nil || u != srv.URL+"/content/a.mov" {
 		t.Errorf("FreshURL = %q, %v", u, err)
 	}
+	if ua, _ := fileUA.Load().(string); !strings.HasPrefix(ua, "Wget/") {
+		t.Errorf("file links resolved as %q; Dropbox serves parallel ranges only to curl and Wget", ua)
+	}
+
+	// A shared file is resolved once: its name, size and download URL.
+	one := Open(Link{Kind: KindDropbox, ID: "f1l3", URL: srv.URL + "/scl/fi/f1l3/grade.mov?rlkey=rl"}, "")
+	if _, err := one.Info(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	files, err = one.List(t.Context(), nil)
+	if err != nil || len(files) != 1 || files[0].RelPath != "Grade v3.mov" || files[0].Size != 10 || files[0].URL != srv.URL+"/content/grade.mov" {
+		t.Errorf("shared file = %+v, %v", files, err)
+	}
+
 	bad := Open(Link{Kind: KindDropbox, ID: "nope", URL: srv.URL + "/scl/fo/nope/h4sh?rlkey=x"}, "")
 	if _, err := bad.Info(t.Context()); !errors.Is(err, ErrInvalidShare) {
 		t.Errorf("unknown folder: %v", err)

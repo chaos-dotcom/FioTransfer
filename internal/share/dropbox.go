@@ -93,7 +93,8 @@ func dropboxClient(ctx context.Context, stale string) (*http.Client, string, err
 type DropboxClient struct {
 	URL string
 
-	first *dropboxPage // the root listing from Info, reused by List
+	first  *dropboxPage // the root listing from Info, reused by List
+	single *File        // a shared file, from Info, with its download URL
 }
 
 type dropboxPage struct {
@@ -173,10 +174,11 @@ func (c *DropboxClient) folderPage(ctx context.Context, secureHash, subPath, vou
 func (c *DropboxClient) Info(ctx context.Context) (*Info, error) {
 	p, _, folder := c.parts()
 	if !folder {
-		// A single file: make sure the link works.
-		if _, err := c.FreshURL(ctx, c.URL); err != nil {
+		f, err := c.fileHead(ctx)
+		if err != nil {
 			return nil, err
 		}
+		c.single = f
 		return &Info{ShareID: p[len(p)-2], DownloadingEnabled: true}, nil
 	}
 	pg, err := c.folderPage(ctx, p[len(p)-1], "", "")
@@ -196,14 +198,15 @@ func (c *DropboxClient) Info(ctx context.Context) (*Info, error) {
 func (c *DropboxClient) List(ctx context.Context, progress func(found int)) ([]File, error) {
 	p, _, folder := c.parts()
 	if !folder {
-		name, size, err := c.fileHead(ctx)
-		if err != nil {
-			return nil, err
+		if c.single == nil {
+			if _, err := c.Info(ctx); err != nil {
+				return nil, err
+			}
 		}
 		if progress != nil {
 			progress(1)
 		}
-		return []File{{AssetID: c.URL, RelPath: relPath(name), Size: size}}, nil
+		return []File{*c.single}, nil
 	}
 	l := newLister(ctx, progress)
 	defer l.cancel(nil)
@@ -285,14 +288,16 @@ func dropboxDownload(href string) (string, error) {
 	return u.String(), nil
 }
 
+// dropboxFileUA is the user agent that resolves file links. Dropbox sends
+// curl and Wget to a /cd/0/inline/ URL that serves parallel ranges; browsers
+// and other clients get a /cd/0/get/ URL that refuses all but one or two (403),
+// which held a 390 MB file to 5 MB/s instead of line rate (2026-10-23).
+const dropboxFileUA = "Wget/1.24.5"
+
 // fetchFirstByte asks for a file's first byte, following Dropbox's redirect
-// to its content server.
+// to its content server. No session is needed.
 func fetchFirstByte(ctx context.Context, href string) (*http.Response, error) {
 	u, err := dropboxDownload(href)
-	if err != nil {
-		return nil, err
-	}
-	client, _, err := dropboxClient(ctx, "")
 	if err != nil {
 		return nil, err
 	}
@@ -300,8 +305,8 @@ func fetchFirstByte(ctx context.Context, href string) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
 		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
 		req.Header.Set("Range", "bytes=0-0")
-		req.Header.Set("User-Agent", webUA)
-		resp, err = client.Do(req)
+		req.Header.Set("User-Agent", dropboxFileUA)
+		resp, err = netx.APIClient.Do(req)
 		if err == nil && resp.StatusCode != 429 && resp.StatusCode < 500 || attempt == 5 {
 			break
 		}
@@ -325,11 +330,11 @@ func fetchFirstByte(ctx context.Context, href string) (*http.Response, error) {
 	return resp, nil
 }
 
-// fileHead returns a shared file's name and size.
-func (c *DropboxClient) fileHead(ctx context.Context) (string, int64, error) {
+// fileHead resolves a shared file: its name, size and download URL.
+func (c *DropboxClient) fileHead(ctx context.Context) (*File, error) {
 	resp, err := fetchFirstByte(ctx, c.URL)
 	if err != nil {
-		return "", 0, err
+		return nil, err
 	}
 	p, _, _ := c.parts()
 	name, _ := url.PathUnescape(p[len(p)-1])
@@ -340,7 +345,7 @@ func (c *DropboxClient) fileHead(ctx context.Context) (string, int64, error) {
 	if cr := resp.Header.Get("Content-Range"); strings.Contains(cr, "/") {
 		size, _ = strconv.ParseInt(cr[strings.LastIndex(cr, "/")+1:], 10, 64)
 	}
-	return name, size, nil
+	return &File{AssetID: c.URL, RelPath: relPath(name), Size: size, URL: resp.Request.URL.String()}, nil
 }
 
 // FreshURL resolves a file's link (its href) to the content server URL that serves it.
