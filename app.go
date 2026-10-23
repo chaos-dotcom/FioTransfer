@@ -19,6 +19,7 @@ import (
 	"fiotransfer/internal/auth"
 	"fiotransfer/internal/config"
 	"fiotransfer/internal/history"
+	"fiotransfer/internal/share"
 	"fiotransfer/internal/xfer"
 )
 
@@ -82,6 +83,16 @@ func (a *App) startup(ctx context.Context) {
 	h.MarkInterrupted() // only the app does this: the CLI may run while the app is transferring
 	a.mgr = xfer.NewManager(a.api, h, a.Settings)
 	a.wat = xfer.NewWatcher(a.mgr)
+	share.Viewer = func(context.Context) (string, string) { // portal links that ask who's downloading
+		me := a.cachedUser()
+		if me == nil {
+			me = a.fetchUser()
+		}
+		if me == nil {
+			return "", ""
+		}
+		return me.Name, me.Email
+	}
 	go a.mgr.CleanUp()
 	busy := map[string]bool{} // jobs that ran since the last notification
 	a.mgr.OnUpdate = func(s xfer.Snapshot) {

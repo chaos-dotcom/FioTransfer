@@ -6,8 +6,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"fiotransfer/internal/config"
 )
 
 const shareA = "11111111-2222-4333-8444-555555555555"
@@ -185,6 +188,39 @@ func TestDownloadResumesAfterCancel(t *testing.T) {
 	}
 	resent := fake.bytesServed.Load() - before
 	if resent > 44<<20 {
+		t.Errorf("resume re-downloaded %d MiB of 64; expected only the remainder", resent>>20)
+	}
+	checkTree(t, dest, map[string][]byte{"big.mov": big.data})
+}
+
+// An interrupted download resumes with the segment size it started with after
+// the setting changes, instead of starting the file over.
+func TestDownloadResumesAfterSegmentSizeChange(t *testing.T) {
+	fake := newFake(t)
+	big := &fakeAsset{typename: "VideoAsset", id: "B1", name: "big.mov", data: randBytes(9, 64<<20)}
+	fake.addShare(&fakeShare{id: shareA, name: "Big", root: []*fakeAsset{big}})
+	m := newTestManager(t, fake, 2, 1)
+	var segMB atomic.Int64
+	segMB.Store(1)
+	m.Settings = func() config.Settings { return config.Settings{Streams: 2, SegmentMB: int(segMB.Load())} }
+	dest := t.TempDir()
+	j, _ := m.StartDownload(DownloadOptions{Link: shareA, DestDir: dest})
+	for m.Snapshot().Jobs[0].Done <= 24<<20 {
+		if m.Snapshot().Jobs[0].Status.terminal() {
+			t.Fatal("finished too early")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.Cancel(j.ID)
+	waitJob(t, m, j.ID, 10*time.Second)
+
+	segMB.Store(8)
+	before := fake.bytesServed.Load()
+	j2, _ := m.StartDownload(DownloadOptions{Link: shareA, DestDir: dest})
+	if v := waitJob(t, m, j2.ID, 30*time.Second); v.Status != Done {
+		t.Fatalf("resume status = %s (%s)", v.Status, v.Error)
+	}
+	if resent := fake.bytesServed.Load() - before; resent > 44<<20 {
 		t.Errorf("resume re-downloaded %d MiB of 64; expected only the remainder", resent>>20)
 	}
 	checkTree(t, dest, map[string][]byte{"big.mov": big.data})

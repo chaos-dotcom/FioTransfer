@@ -481,7 +481,7 @@ type DownloadOptions struct {
 func (m *Manager) StartDownload(o DownloadOptions) (*Job, error) {
 	o.Link = strings.TrimSpace(o.Link)
 	if o.Link == "" {
-		return nil, errors.New("paste a Frame.io share link")
+		return nil, errors.New("paste a share link")
 	}
 	if st, err := os.Stat(o.DestDir); err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("destination folder not found: %s", o.DestDir)
@@ -586,7 +586,7 @@ func (j *Job) runDownload() {
 
 	root := j.Dest
 	if j.subfolder {
-		name := "Frame.io share " + l.link.ID[:8]
+		name := share.SafeName(l.link.Label())
 		if l.info.Name != "" {
 			name = share.SafeName(l.info.Name)
 		}

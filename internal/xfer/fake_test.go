@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -89,6 +90,16 @@ type fakeFrameio struct {
 	forbidden map[string]bool // GET files/{id} answers 403 (original not served yet)
 	noHeads   atomic.Bool     // listings leave out version stacks' head_version
 	fileGets  sync.Map        // file id -> *atomic.Int64, GET files/{id} calls
+
+	// Smash transfers (/smash/…)
+	smash     map[string]*fakeSmash // transfer ID -> transfer
+	smashURLs atomic.Int64          // PUT transfer/{id}/urls calls
+}
+
+// fakeSmash is a Smash transfer. File names keep their folders ("Reel/a.mov").
+type fakeSmash struct {
+	id, title, password string
+	files               []*fakeAsset
 }
 
 type fakeFolder struct{ parent, name string }
@@ -117,7 +128,7 @@ type fakeUpload struct {
 func newFake(t *testing.T) *fakeFrameio {
 	f := &fakeFrameio{t: t, shares: map[string]*fakeShare{}, assets: map[string]*fakeAsset{}, sig: map[string]int{},
 		pageSize: 2, folders: map[string]fakeFolder{}, uploads: map[string]*fakeUpload{}, partSize: 3 << 20,
-		remote: map[string]*fakeRemote{}, forbidden: map[string]bool{}}
+		remote: map[string]*fakeRemote{}, forbidden: map[string]bool{}, smash: map[string]*fakeSmash{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -216,6 +227,84 @@ func (f *fakeFrameio) seedSeqOf(id string) int64 {
 	return n
 }
 
+// addSmash adds a Smash transfer; its files are served like share assets.
+func (f *fakeFrameio) addSmash(t *fakeSmash) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.smash[t.id] = t
+	for _, a := range t.files {
+		f.assets[a.id] = a
+	}
+}
+
+// useSmash points the Smash client at this fake.
+func (f *fakeFrameio) useSmash() {
+	share.SmashIAMURL, share.SmashLinkURL = f.srv.URL+"/smash", f.srv.URL+"/smash"
+	share.SmashTransferURL = f.srv.URL + "/smash/{region}"
+}
+
+// smashAPI serves Smash's IAM, link and transfer calls.
+func (f *fakeFrameio) smashAPI(w http.ResponseWriter, r *http.Request) {
+	fail := func(code int, name string) {
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(map[string]any{"name": name, "code": code})
+	}
+	p := strings.TrimPrefix(r.URL.EscapedPath(), "/smash/")
+	if p == "account" {
+		w.WriteHeader(201)
+		json.NewEncoder(w).Encode(map[string]any{"account": map[string]any{"token": map[string]any{
+			"token": "smash-token", "expiration": time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339)}}})
+		return
+	}
+	if r.Header.Get("Authorization") != "Bearer smash-token" {
+		fail(401, "UnauthorizedError")
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if target, ok := strings.CutPrefix(p, "target/"); ok {
+		target, _ = url.PathUnescape(target)
+		id := strings.TrimPrefix(target, "fromsmash.com/")
+		if f.smash[id] == nil {
+			fail(404, "NotFound")
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"target": map[string]any{"target": id}})
+		return
+	}
+	parts := strings.Split(p, "/") // <region>/transfer/<id>/…
+	if len(parts) < 4 || parts[1] != "transfer" || f.smash[parts[2]] == nil {
+		fail(404, "NotFoundError")
+		return
+	}
+	t := f.smash[parts[2]]
+	if pass, _ := url.PathUnescape(r.Header.Get("smash-authorization")); pass != t.password {
+		fail(403, "PasswordDoesNotMatchError")
+		return
+	}
+	switch strings.Join(parts[3:], "/") {
+	case "preview":
+		json.NewEncoder(w).Encode(map[string]any{"transfer": map[string]any{"id": t.id, "title": t.title, "status": "Uploaded"}})
+	case "files/preview":
+		var files []any
+		for _, a := range t.files {
+			files = append(files, map[string]any{"id": a.id, "name": a.name, "size": len(a.data)})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"files": files})
+	case "urls":
+		f.smashURLs.Add(1)
+		var body struct{ Files []struct{ ID string } }
+		json.NewDecoder(r.Body).Decode(&body)
+		var out []any
+		for _, x := range body.Files {
+			out = append(out, map[string]any{"id": x.ID, "url": fmt.Sprintf("%s/data/%s?sig=%d", f.srv.URL, x.ID, f.sig[x.ID])})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"transfer": map[string]any{"id": t.id, "files": out}})
+	default:
+		fail(404, "NotFoundError")
+	}
+}
+
 func (f *fakeFrameio) bumpSig(id string) {
 	f.mu.Lock()
 	f.sig[id]++
@@ -232,6 +321,8 @@ func (f *fakeFrameio) handle(w http.ResponseWriter, r *http.Request) {
 		f.s3(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v4/"):
 		f.rest(w, r)
+	case strings.HasPrefix(r.URL.Path, "/smash/"):
+		f.smashAPI(w, r)
 	default:
 		http.NotFound(w, r)
 	}

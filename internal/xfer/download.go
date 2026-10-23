@@ -63,6 +63,14 @@ func (s *urlSource) renew(ctx context.Context, seenGen int) error {
 	return nil
 }
 
+// ensure gets a URL when the listing gave none (Smash hands them out per file).
+func (s *urlSource) ensure(ctx context.Context) error {
+	if u, gen := s.get(); u == "" {
+		return s.renew(ctx, gen)
+	}
+	return nil
+}
+
 type dlState struct {
 	Size    int64  `json:"size"`
 	SegSize int64  `json:"seg_size"`
@@ -77,6 +85,9 @@ func (j *Job) downloadFile(ctx context.Context, f *File, segSize int64, src *url
 	}
 	size := f.Size
 	if size <= 0 { // unknown (or empty) in the listing: ask the server
+		if err := src.ensure(ctx); err != nil {
+			return err
+		}
 		s, err := probeSize(ctx, src)
 		if err != nil {
 			return err
@@ -92,6 +103,9 @@ func (j *Job) downloadFile(ctx context.Context, f *File, segSize int64, src *url
 	}
 	if size == 0 {
 		return os.WriteFile(f.LocalPath, nil, 0o644)
+	}
+	if err := src.ensure(ctx); err != nil {
+		return err
 	}
 	prefix := sidecar(f.LocalPath)
 	partPath, statePath := prefix+".fiopart", prefix+".fiostate"
@@ -175,10 +189,11 @@ func (j *Job) downloadSegments(ctx context.Context, f *File, size, segSize int64
 	st := dlState{Size: size, SegSize: segSize, Done: make([]bool, nseg)}
 	resumed := false
 	if b, err := os.ReadFile(statePath); err == nil {
+		// Resume with the segment size the download started with, even if the setting has changed since.
 		var old dlState
-		if json.Unmarshal(b, &old) == nil && old.Size == size && old.SegSize == segSize && len(old.Done) == nseg {
+		if json.Unmarshal(b, &old) == nil && old.Size == size && old.SegSize > 0 && len(old.Done) == int((size+old.SegSize-1)/old.SegSize) {
 			if _, err := os.Stat(partPath); err == nil {
-				st, resumed = old, true
+				st, resumed, segSize, nseg = old, true, old.SegSize, len(old.Done)
 			}
 		}
 	}
@@ -288,7 +303,7 @@ func fetchRange(ctx context.Context, f *File, src *urlSource, fh *os.File, start
 			}
 			lastErr = fmt.Errorf("HTTP %d", status)
 		case status == 404:
-			return errors.New("file not found on Frame.io (HTTP 404)")
+			return errors.New("file not found on the server (HTTP 404)")
 		case status == 416:
 			return errors.New("server rejected byte range (HTTP 416)")
 		case err != nil:
@@ -303,7 +318,7 @@ func fetchRange(ctx context.Context, f *File, src *urlSource, fh *os.File, start
 
 // getInto performs one GET for [off, off+length) and writes the body at off.
 // It returns bytes written, the HTTP status, and any error.
-func getInto(ctx context.Context, url string, fh *os.File, off, length int64, ranged bool, progress func(int64)) (int64, int, error) {
+func getInto(ctx context.Context, url string, fh io.WriterAt, off, length int64, ranged bool, progress func(int64)) (int64, int, error) {
 	actx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	req, err := http.NewRequestWithContext(actx, "GET", url, nil)
@@ -347,22 +362,27 @@ func getInto(ctx context.Context, url string, fh *os.File, off, length int64, ra
 		}
 	}()
 
+	// Write whole blocks that end on a block boundary of the file. The network
+	// hands over ~16 KB at a time, and on an SMB share each small write that
+	// covers part of a page makes macOS read the page back from the server and
+	// send it again (measured: 1 byte read and 2 written per byte downloaded).
 	w := io.NewOffsetWriter(fh, off)
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
+	block := int64(len(*buf))
 	var written int64
-	body := io.LimitReader(resp.Body, length)
-	for {
-		n, rerr := body.Read(*buf)
-		if n > 0 {
-			if _, werr := w.Write((*buf)[:n]); werr != nil {
+	body := stampReader{io.LimitReader(resp.Body, length), &last}
+	for written < length {
+		n := min(block-(off+written)%block, length-written)
+		m, rerr := io.ReadFull(body, (*buf)[:n])
+		if m > 0 {
+			if _, werr := w.Write((*buf)[:m]); werr != nil {
 				return written, resp.StatusCode, fmt.Errorf("writing to disk: %w", werr)
 			}
-			written += int64(n)
-			progress(int64(n))
-			last.Store(time.Now().UnixNano())
+			written += int64(m)
+			progress(int64(m))
 		}
-		if rerr == io.EOF {
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
 		}
 		if rerr != nil {
@@ -375,6 +395,21 @@ func getInto(ctx context.Context, url string, fh *os.File, off, length int64, ra
 	return written, resp.StatusCode, nil
 }
 
+// stampReader records when bytes last arrived, for the idle watchdog.
+type stampReader struct {
+	r    io.Reader
+	last *atomic.Int64
+}
+
+func (s stampReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		s.last.Store(time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// bufPool holds the write blocks, one per stream.
 var bufPool = sync.Pool{New: func() any { b := make([]byte, 1<<20); return &b }}
 
 // probeSize asks for the first byte to learn the total size from Content-Range.

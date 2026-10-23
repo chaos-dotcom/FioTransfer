@@ -1,10 +1,15 @@
 package xfer
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -272,5 +277,59 @@ func TestLimiterNeverZero(t *testing.T) {
 func TestWatchBackoff(t *testing.T) {
 	if watchBackoff(1) != 30*time.Second || watchBackoff(2) != time.Minute || watchBackoff(20) != 15*time.Minute {
 		t.Errorf("backoff = %s, %s, %s", watchBackoff(1), watchBackoff(2), watchBackoff(20))
+	}
+}
+
+// writeLog records a download's writes.
+type writeLog struct {
+	mu     sync.Mutex
+	data   []byte
+	writes [][2]int64 // offset, length
+}
+
+func (w *writeLog) WriteAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if end := off + int64(len(p)); end > int64(len(w.data)) {
+		w.data = append(w.data, make([]byte, end-int64(len(w.data)))...)
+	}
+	copy(w.data[off:], p)
+	w.writes = append(w.writes, [2]int64{off, int64(len(p))})
+	return len(p), nil
+}
+
+// A download that arrives in small pieces is written in whole blocks aligned
+// to the file. On an SMB share, small unaligned writes made macOS read each
+// page back from the NAS and send it twice, capping downloads at ~35 MB/s.
+func TestDownloadWritesWholeAlignedBlocks(t *testing.T) {
+	data := randBytes(7, 5<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var start, end int
+		if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+			t.Errorf("range %q: %v", r.Header.Get("Range"), err)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.WriteHeader(206)
+		for b := data[start : end+1]; len(b) > 0; b = b[min(1000, len(b)):] {
+			w.Write(b[:min(1000, len(b))])
+			w.(http.Flusher).Flush()
+		}
+	}))
+	defer srv.Close()
+
+	const block = 1 << 20
+	off, length := int64(block+500), int64(3*block) // a segment resumed mid-block
+	var w writeLog
+	var reported int64
+	n, status, err := getInto(t.Context(), srv.URL, &w, off, length, true, func(n int64) { reported += n })
+	if err != nil || status != 206 || n != length || reported != length {
+		t.Fatalf("getInto = %d, %d, %v (progress %d)", n, status, err, reported)
+	}
+	if !bytes.Equal(w.data[off:], data[off:off+length]) {
+		t.Fatal("content mismatch")
+	}
+	want := [][2]int64{{off, block - 500}, {2 * block, block}, {3 * block, block}, {4 * block, 500}}
+	if fmt.Sprint(w.writes) != fmt.Sprint(want) {
+		t.Errorf("writes (offset, length) = %v, want %v", w.writes, want)
 	}
 }

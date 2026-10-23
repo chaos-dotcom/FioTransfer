@@ -22,6 +22,7 @@ import (
 	"fiotransfer/internal/auth"
 	"fiotransfer/internal/config"
 	"fiotransfer/internal/history"
+	"fiotransfer/internal/share"
 	"fiotransfer/internal/xfer"
 )
 
@@ -49,6 +50,12 @@ func main() {
 	settings := config.Load()
 	am := auth.NewManager(func() string { return config.Load().ClientID })
 	client := api.New(am)
+	share.Viewer = func(ctx context.Context) (string, string) { // portal links that ask who's downloading
+		if me, err := client.Me(ctx); err == nil {
+			return me.Name, me.Email
+		}
+		return "", ""
+	}
 
 	switch cmd {
 	case "inspect":

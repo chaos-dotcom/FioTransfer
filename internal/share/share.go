@@ -1,6 +1,7 @@
 // Package share resolves Frame.io share links (including links from other
-// people's accounts) into downloadable files, using the same anonymous share
-// access the Frame.io share web page uses.
+// people's accounts), Smash and WeTransfer transfers, and Dropbox and Google
+// Drive shared links into downloadable files, using the same anonymous access
+// their web pages use.
 package share
 
 import (
@@ -31,7 +32,7 @@ var (
 	ErrBadPassphrase    = errors.New("wrong passphrase")
 	ErrDownloadDisabled = errors.New("downloads disabled by sender")
 	ErrInvalidShare     = errors.New("link not found or expired")
-	ErrNotAShareLink    = errors.New("not a Frame.io link")
+	ErrNotAShareLink    = errors.New("not a Frame.io, Smash, WeTransfer, Dropbox, Google Drive or Portal link")
 )
 
 var (
@@ -43,11 +44,38 @@ var (
 const (
 	KindShare  = "share"  // Frame.io V4 share (next.frame.io/share/<id>)
 	KindReview = "review" // legacy Frame.io review link (app.frame.io/reviews/<id>)
+	KindSmash  = "smash"  // Smash transfer (fromsmash.com/<id or custom name>)
+
+	KindWeTransfer = "wetransfer" // WeTransfer transfer (wetransfer.com/downloads/<id>/…, we.tl/<code>)
+	KindDropbox    = "dropbox"    // Dropbox shared file or folder (dropbox.com/scl/…, /sh/…, /s/…)
+	KindDrive      = "drive"      // Google Drive file or folder shared with anyone who has the link
+	KindPortal     = "portal"     // Portal download link (<host>/d/<token>, github.com/farbhaus/portal)
 )
 
+// Link is a resolved link. URL is the link itself, kept for kinds that need
+// more than the ID to open it.
 type Link struct {
 	Kind string `json:"kind"`
 	ID   string `json:"id"`
+	URL  string `json:"url,omitempty"`
+}
+
+// Label names a share that has no name of its own (its download folder).
+func (l Link) Label() string {
+	short := l.ID[:min(8, len(l.ID))]
+	switch l.Kind {
+	case KindSmash:
+		return "Smash " + l.ID
+	case KindWeTransfer:
+		return "WeTransfer " + short
+	case KindDropbox:
+		return "Dropbox " + short
+	case KindDrive:
+		return "Google Drive " + short
+	case KindPortal:
+		return "Portal " + short
+	}
+	return "Frame.io share " + short
 }
 
 // Source is a share link that can be listed and downloaded.
@@ -60,22 +88,37 @@ type Source interface {
 
 // Open returns the right client for a resolved link.
 func Open(l Link, passphrase string) Source {
-	if l.Kind == KindReview {
+	switch l.Kind {
+	case KindReview:
 		return &LegacyClient{ReviewID: l.ID, Passphrase: passphrase}
+	case KindSmash:
+		return &SmashClient{TransferID: l.ID, Passphrase: passphrase}
+	case KindWeTransfer:
+		return newWeTransfer(l, passphrase)
+	case KindDropbox:
+		return &DropboxClient{URL: l.URL}
+	case KindDrive:
+		return newDrive(l)
+	case KindPortal:
+		return &PortalClient{URL: l.URL, Passphrase: passphrase}
 	}
 	return &Client{ShareID: l.ID, Passphrase: passphrase}
 }
 
 // ResolveLink turns any Frame.io link (next.frame.io/share/<id>,
-// app.frame.io/reviews/<id>, f.io/<code>, or a bare V4 share ID) into a Link,
-// following redirects for short links.
+// app.frame.io/reviews/<id>, f.io/<code>, or a bare V4 share ID), Smash,
+// WeTransfer, Dropbox, Google Drive or Portal link into a Link, following
+// redirects for short links.
 func ResolveLink(ctx context.Context, raw string) (Link, error) {
 	raw = strings.TrimSpace(raw)
 	if l, ok := linkFromURL(raw); ok {
 		return l, nil
 	}
+	if t, ok := smashTarget(raw); ok {
+		return resolveSmash(ctx, t)
+	}
 	if uuidRe.MatchString(raw) && len(raw) == 36 {
-		return Link{KindShare, strings.ToLower(raw)}, nil
+		return Link{Kind: KindShare, ID: strings.ToLower(raw)}, nil
 	}
 	if !strings.Contains(raw, "://") {
 		raw = "https://" + raw
@@ -87,7 +130,11 @@ func ResolveLink(ctx context.Context, raw string) (Link, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if _, ok := linkFromURL(req.URL.String()); ok || len(via) > 10 {
+			s := req.URL.String()
+			if _, ok := linkFromURL(s); ok || len(via) > 10 {
+				return http.ErrUseLastResponse
+			}
+			if _, ok := smashTarget(s); ok {
 				return http.ErrUseLastResponse
 			}
 			return nil
@@ -100,13 +147,13 @@ func ResolveLink(ctx context.Context, raw string) (Link, error) {
 		return Link{}, fmt.Errorf("opening link: %w", err)
 	}
 	defer resp.Body.Close()
-	if loc := resp.Header.Get("Location"); loc != "" {
-		if l, ok := linkFromURL(loc); ok {
+	for _, s := range []string{resp.Header.Get("Location"), resp.Request.URL.String()} {
+		if l, ok := linkFromURL(s); ok {
 			return l, nil
 		}
-	}
-	if l, ok := linkFromURL(resp.Request.URL.String()); ok {
-		return l, nil
+		if t, ok := smashTarget(s); ok {
+			return resolveSmash(ctx, t)
+		}
 	}
 	// Last resort: look for a share URL inside the page.
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -115,9 +162,17 @@ func ResolveLink(ctx context.Context, raw string) (Link, error) {
 			return l, nil
 		}
 	}
+	if l, ok := portalLink(ctx, resp.Request.URL); ok {
+		return l, nil
+	}
+	// A Smash transfer on the sender's own domain.
+	if final := resp.Request.URL; bytes.Contains(body, smashPageMarker) && strings.TrimSuffix(final.Path, "/") != "" {
+		return resolveSmash(ctx, strings.ToLower(final.Hostname())+strings.TrimSuffix(final.Path, "/"))
+	}
 	return Link{}, ErrNotAShareLink
 }
 
+// linkFromURL recognises a link from its URL alone (Smash links need a lookup: smashTarget).
 func linkFromURL(s string) (Link, bool) {
 	for _, k := range []struct{ marker, kind string }{{"/share/", KindShare}, {"/reviews/", KindReview}} {
 		i := strings.Index(s, k.marker)
@@ -126,10 +181,82 @@ func linkFromURL(s string) (Link, bool) {
 		}
 		rest := s[i+len(k.marker):]
 		if m := uuidRe.FindString(rest); m != "" && strings.HasPrefix(rest, m) {
-			return Link{k.kind, strings.ToLower(m)}, true
+			return Link{Kind: k.kind, ID: strings.ToLower(m)}, true
+		}
+	}
+	for _, parse := range []func(string) (Link, bool){weTransferLink, dropboxLink, driveLink} {
+		if l, ok := parse(s); ok {
+			return l, true
 		}
 	}
 	return Link{}, false
+}
+
+// parseLink parses a pasted link, which may lack its scheme, with the host lowercased.
+func parseLink(s string) (*url.URL, bool) {
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" {
+		return nil, false
+	}
+	u.Host = strings.ToLower(u.Host)
+	return u, true
+}
+
+// pathParts splits a URL path into its non-empty parts.
+func pathParts(u *url.URL) []string {
+	var parts []string
+	for _, p := range strings.Split(u.Path, "/") {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	return parts
+}
+
+// webUA is a browser user agent, for services that turn other clients away.
+const webUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+
+// send performs the request newReq builds, retrying network errors, 429 and
+// 5xx with backoff, and returns the last response's status, headers and body.
+func send(ctx context.Context, client *http.Client, service string, newReq func() (*http.Request, error)) (int, http.Header, []byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < 6; attempt++ {
+		req, err := newReq()
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			resp.Body.Close()
+			if resp.StatusCode != 429 && resp.StatusCode < 500 {
+				return resp.StatusCode, resp.Header, data, nil
+			}
+			err = fmt.Errorf("%s returned %d", service, resp.StatusCode)
+		}
+		lastErr = err
+		if err := netx.Sleep(ctx, netx.Backoff(attempt+1)); err != nil {
+			return 0, nil, nil, err
+		}
+	}
+	return 0, nil, nil, lastErr
+}
+
+// relPath turns a file name that may carry folders ("Day 1/a.mov") into a safe relative path.
+func relPath(name string) string {
+	var parts []string
+	for _, p := range strings.Split(name, "/") {
+		if p = strings.TrimSpace(p); p != "" && p != "." && p != ".." {
+			parts = append(parts, SafeName(p))
+		}
+	}
+	if len(parts) == 0 {
+		return "untitled"
+	}
+	return path.Join(parts...)
 }
 
 // Client talks to the Frame.io GraphQL endpoint with share credentials.
