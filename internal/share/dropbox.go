@@ -345,7 +345,20 @@ func (c *DropboxClient) fileHead(ctx context.Context) (*File, error) {
 	if cr := resp.Header.Get("Content-Range"); strings.Contains(cr, "/") {
 		size, _ = strconv.ParseInt(cr[strings.LastIndex(cr, "/")+1:], 10, 64)
 	}
-	return &File{AssetID: c.URL, RelPath: relPath(name), Size: size, URL: resp.Request.URL.String()}, nil
+	return &File{AssetID: c.URL, RelPath: relPath(name), Size: size, URL: contentURL(resp)}, nil
+}
+
+// contentURL is the first URL on the content server, before any redirect
+// there. MXF files go on from /cd/0/inline/ to /cd/0/inline2/, which serves
+// only the user agent that followed that redirect (404 to the engine's, so
+// 28 MXF files of a 105-file folder failed, 2026-10-23); the engine follows
+// it itself.
+func contentURL(resp *http.Response) string {
+	r := resp.Request
+	for r.Response != nil && r.Response.Request.URL.Host == r.URL.Host {
+		r = r.Response.Request
+	}
+	return r.URL.String()
 }
 
 // FreshURL resolves a file's link (its href) to the content server URL that serves it.
@@ -354,7 +367,7 @@ func (c *DropboxClient) FreshURL(ctx context.Context, href string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	return resp.Request.URL.String(), nil
+	return contentURL(resp), nil
 }
 
 // MarkDownloaded is a no-op for Dropbox links.

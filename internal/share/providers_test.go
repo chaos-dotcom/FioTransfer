@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -166,6 +167,34 @@ func TestWeTransfer(t *testing.T) {
 }
 
 func TestDropbox(t *testing.T) {
+	// The content server, like Dropbox's: MXF files go on to an inline2 URL
+	// that serves only the user agent that followed the redirect.
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name, ok := strings.CutPrefix(r.URL.Path, "/cd/0/inline/")
+		if ok && strings.HasSuffix(name, ".mxf") {
+			http.Redirect(w, r, "/cd/0/inline2/"+name+"?ua="+url.QueryEscape(r.UserAgent()), http.StatusFound)
+			return
+		}
+		if n, ok2 := strings.CutPrefix(r.URL.Path, "/cd/0/inline2/"); ok2 {
+			if r.URL.Query().Get("ua") != r.UserAgent() {
+				http.NotFound(w, r)
+				return
+			}
+			name, ok = n, true
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Range") != "bytes=0-0" {
+			t.Errorf("content request without Range: %v", r.Header)
+		}
+		w.Header().Set("Content-Range", "bytes 0-0/10")
+		w.Header().Set("Content-Disposition", `inline; filename="Grade v3.mov"`)
+		w.WriteHeader(206)
+		w.Write([]byte("x"))
+	}))
+	defer cdn.Close()
 	var srv *httptest.Server
 	var lists, refusals atomic.Int64
 	var fileUA atomic.Value
@@ -195,7 +224,7 @@ func TestDropbox(t *testing.T) {
 					{"filename": "a.mov", "bytes": 10, "href": href("/a.mov")},
 				}, "share_tokens": []e{{"secureHash": "subh4sh"}, {}}, "has_more_entries": true, "next_request_voucher": "v2"}
 			case "|v2":
-				pg = e{"entries": []e{{"filename": "b.mov", "bytes": 20, "href": href("/b.mov")}}, "share_tokens": []e{{}}}
+				pg = e{"entries": []e{{"filename": "b.mxf", "bytes": 20, "href": href("/b.mxf")}}, "share_tokens": []e{{}}}
 			case "/Stills|":
 				if r.Form.Get("secure_hash") != "subh4sh" {
 					w.WriteHeader(404)
@@ -210,15 +239,7 @@ func TestDropbox(t *testing.T) {
 				return
 			}
 			fileUA.Store(r.UserAgent())
-			http.Redirect(w, r, "/content"+strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/scl/fo/k3y/h4sh"), "/scl/fi/f1l3"), http.StatusFound)
-		case strings.HasPrefix(r.URL.Path, "/content/"):
-			if r.Header.Get("Range") != "bytes=0-0" {
-				t.Errorf("content request without Range: %v", r.Header)
-			}
-			w.Header().Set("Content-Range", "bytes 0-0/10")
-			w.Header().Set("Content-Disposition", `inline; filename="Grade v3.mov"`)
-			w.WriteHeader(206)
-			w.Write([]byte("x"))
+			http.Redirect(w, r, cdn.URL+"/cd/0/inline"+strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/scl/fo/k3y/h4sh"), "/scl/fi/f1l3"), http.StatusFound)
 		default:
 			http.NotFound(w, r)
 		}
@@ -235,15 +256,29 @@ func TestDropbox(t *testing.T) {
 		t.Fatalf("Info = %+v, %v", info, err)
 	}
 	files, err := c.List(t.Context(), nil)
-	if err != nil || relPaths(files) != "Stills/s.png, a.mov, b.mov" || files[2].Size != 20 {
+	if err != nil || relPaths(files) != "Stills/s.png, a.mov, b.mxf" || files[2].Size != 20 {
 		t.Fatalf("List = %v, %v", relPaths(files), err)
 	}
 	if n := lists.Load(); n != 3 {
 		t.Errorf("listing calls = %d; the root's first page from Info should be reused", n)
 	}
-	u, err := c.FreshURL(t.Context(), files[1].AssetID)
-	if err != nil || u != srv.URL+"/content/a.mov" {
-		t.Errorf("FreshURL = %q, %v", u, err)
+	for _, f := range files[1:] {
+		u, err := c.FreshURL(t.Context(), f.AssetID)
+		if err != nil || u != cdn.URL+"/cd/0/inline/"+f.RelPath {
+			t.Errorf("FreshURL(%s) = %q, %v", f.RelPath, u, err)
+			continue
+		}
+		// The engine fetches it with its own user agent.
+		req, _ := http.NewRequest("GET", u, nil)
+		req.Header.Set("Range", "bytes=0-0")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 206 {
+			t.Errorf("%s: engine GET = %d", f.RelPath, resp.StatusCode)
+		}
 	}
 	if ua, _ := fileUA.Load().(string); !strings.HasPrefix(ua, "Wget/") {
 		t.Errorf("file links resolved as %q; Dropbox serves parallel ranges only to curl and Wget", ua)
@@ -255,7 +290,7 @@ func TestDropbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	files, err = one.List(t.Context(), nil)
-	if err != nil || len(files) != 1 || files[0].RelPath != "Grade v3.mov" || files[0].Size != 10 || files[0].URL != srv.URL+"/content/grade.mov" {
+	if err != nil || len(files) != 1 || files[0].RelPath != "Grade v3.mov" || files[0].Size != 10 || files[0].URL != cdn.URL+"/cd/0/inline/grade.mov" {
 		t.Errorf("shared file = %+v, %v", files, err)
 	}
 
