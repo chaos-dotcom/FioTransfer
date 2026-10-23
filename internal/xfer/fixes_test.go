@@ -160,7 +160,16 @@ func TestWatchEdit(t *testing.T) {
 	w.Add(other, "acct", "dest", "P / O", history.DirUpload, false)
 
 	writeFile(t, filepath.Join(a, "new1.mov"), randBytes(1, 500))
-	waitFor(t, "new1", 10*time.Second, func() bool { return fake.assembled("dest")["new1.mov"] != nil })
+	// Wait until the watch counts it: an edit while Frame.io is still confirming
+	// it cancels the batch, and the file then rightly goes to the new destination.
+	waitFor(t, "new1", 10*time.Second, func() bool {
+		for _, v := range w.Views() {
+			if v.ID == x.ID {
+				return v.Uploaded == 1
+			}
+		}
+		return false
+	})
 
 	// New destination applies to new files.
 	if err := w.Update(x.ID, a, "acct", "dest2", "P / B", history.DirUpload, false); err != nil {
