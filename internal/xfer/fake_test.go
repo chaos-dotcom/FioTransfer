@@ -82,6 +82,7 @@ type fakeFrameio struct {
 	failAssembly string        // Frame.io reports this file name as failed after upload
 	madeShares   []madeShare   // POST projects/{id}/shares
 	deleted      []string      // DELETE files/{id}, in order
+	deletedNames []string      // the same, as "id (name)"
 	failDelete   atomic.Bool   // deletes are refused (403)
 
 	// files in the account (download watches)
@@ -631,11 +632,12 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		_, ok := f.uploads[parts[4]]
+		up, ok := f.uploads[parts[4]]
 		if ok {
 			delete(f.uploads, parts[4])
 			delete(f.assets, parts[4])
 			f.deleted = append(f.deleted, parts[4])
+			f.deletedNames = append(f.deletedNames, parts[4]+" ("+up.name+")")
 		}
 		f.mu.Unlock()
 		if !ok {
@@ -708,6 +710,19 @@ func (f *fakeFrameio) s3(w http.ResponseWriter, r *http.Request) {
 	up.lastPart = time.Now()
 	f.mu.Unlock()
 	w.WriteHeader(200)
+}
+
+// uploadReport says which uploads are complete under rootID and which files
+// the app deleted, for failure messages.
+func (f *fakeFrameio) uploadReport(rootID string) string {
+	var have []string
+	for k := range f.assembled(rootID) {
+		have = append(have, k)
+	}
+	slices.Sort(have)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return fmt.Sprintf("on Frame.io: %v; deleted by the app: %v", have, f.deletedNames)
 }
 
 // deletedFiles returns the IDs of files deleted so far.

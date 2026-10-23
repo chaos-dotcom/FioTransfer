@@ -219,7 +219,28 @@ func TestWatchDirectionChange(t *testing.T) {
 		t.Error("an upload watch downloaded")
 	}
 	if n := len(fake.assembled("dest")); n != 2 {
-		t.Errorf("%d uploads; the downloaded new.mov must not go back up", n)
+		t.Errorf("%d uploads; want a.mov and b.mov, and the downloaded new.mov not sent back up", n)
+		explainUploads(t, fake, m, "dest")
+	}
+}
+
+// explainUploads logs, after a failed check, what's on the fake Frame.io, what
+// the app deleted there, every file error in history, and the app's log.
+// (CI once found an upload deleted here, and no run since has repeated it.)
+func explainUploads(t *testing.T, fake *fakeFrameio, m *Manager, rootID string) {
+	t.Helper()
+	t.Log(fake.uploadReport(rootID))
+	rows, _ := m.Hist.List("", "", 100)
+	for _, r := range rows {
+		files, _ := m.Hist.Files(r.ID)
+		for _, f := range files {
+			if f.Error != "" || f.Note != "" {
+				t.Logf("history %s %s: %s %s (%s)", r.Kind, f.RelPath, f.Status, f.Error, f.Note)
+			}
+		}
+	}
+	if b, err := os.ReadFile(m.Hist.LogPath()); err == nil {
+		t.Logf("app log:\n%s", b)
 	}
 }
 
