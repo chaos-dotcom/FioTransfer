@@ -16,6 +16,8 @@ static NSMenuItem *fioUpdateItem;
 static NSMenuItem *fioCheckItem;
 static FioTrayTarget *fioTarget;
 
+BOOL fioQuickVisible(void); // quick_darwin.m
+
 static NSMenuItem *fioAdd(NSMenu *m, NSString *title, int tag, NSString *key) {
 	NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title action:@selector(act:) keyEquivalent:key];
 	it.target = fioTarget;
@@ -62,6 +64,7 @@ void fioTrayInit(void) {
 		[m addItem:[NSMenuItem separatorItem]];
 		fioUpdateItem = fioAdd(m, @"Update", 5, @"");
 		fioUpdateItem.hidden = YES;
+		fioAdd(m, @"Download from Link…", 7, @"");
 		fioAdd(m, @"Open FioTransfer", 1, @"");
 		fioLoginItem = fioAdd(m, @"Open at Login", 2, @"");
 		fioCheckItem = fioAdd(m, @"Check for Updates…", 6, @"");
@@ -71,6 +74,7 @@ void fioTrayInit(void) {
 		fioAppMenuAdd(5);
 		// Re-opening the app (e.g. double-click in Finder) while hidden brings the window back.
 		[[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+			if (fioQuickVisible()) return;
 			for (NSWindow *w in NSApp.windows) {
 				if (w.isVisible && w.canBecomeMainWindow) return;
 			}

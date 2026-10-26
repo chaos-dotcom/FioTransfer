@@ -33,6 +33,7 @@ const (
 	trayReopen = 4
 	trayUpdate = 5
 	trayCheck  = 6 // Check for Updates… (menu bar menu and app menu)
+	trayLink   = 7 // Download from Link… (the quick download panel)
 )
 
 func trayInit(h func(int)) {

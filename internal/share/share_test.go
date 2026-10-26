@@ -147,3 +147,31 @@ func TestLegacyListOrderAndPaging(t *testing.T) {
 		t.Errorf("last file = %q, want t129", last)
 	}
 }
+
+func TestLooksLikeLink(t *testing.T) {
+	yes := []string{
+		"https://next.frame.io/share/" + id + "/",
+		"app.frame.io/reviews/" + id,
+		"  https://f.io/AbCd12  ",
+		"https://fromsmash.com/AbCdEf-dt",
+		"https://we.tl/t-abc123",
+		"https://wetransfer.com/downloads/abc123/def456",
+		"https://www.dropbox.com/scl/fo/key/hash?rlkey=x",
+		"https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz",
+		"https://portal.example.com/d/AbCd1234efgh",
+	}
+	no := []string{
+		"", "hello", "https://f.io/", "https://fromsmash.com/", "https://example.com/reset?token=abc",
+		"https://example.com/d/x", "https://f.io/a and more", id, "https://www.dropbox.com/home",
+	}
+	for _, s := range yes {
+		if !LooksLikeLink(s) {
+			t.Errorf("LooksLikeLink(%q) = false", s)
+		}
+	}
+	for _, s := range no {
+		if LooksLikeLink(s) {
+			t.Errorf("LooksLikeLink(%q) = true", s)
+		}
+	}
+}

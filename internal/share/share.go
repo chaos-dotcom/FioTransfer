@@ -172,6 +172,33 @@ func ResolveLink(ctx context.Context, raw string) (Link, error) {
 	return Link{}, ErrNotAShareLink
 }
 
+// LooksLikeLink tells, without opening it, whether raw is a link of a known
+// kind: a service's own URL, one of their short links, or a Portal-shaped
+// /d/<token>. Used to pick up a copied link: opening any copied URL could
+// spend a one-time link.
+func LooksLikeLink(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, " \t\r\n") {
+		return false
+	}
+	if _, ok := linkFromURL(raw); ok {
+		return true
+	}
+	if t, ok := smashTarget(raw); ok {
+		return t != ""
+	}
+	u, ok := parseLink(raw)
+	if !ok {
+		return false
+	}
+	p := pathParts(u)
+	switch u.Hostname() {
+	case "f.io", "we.tl":
+		return len(p) > 0
+	}
+	return len(p) == 2 && p[0] == "d" && portalTokenRe.MatchString(p[1])
+}
+
 // linkFromURL recognises a link from its URL alone (Smash links need a lookup: smashTarget).
 func linkFromURL(s string) (Link, bool) {
 	for _, k := range []struct{ marker, kind string }{{"/share/", KindShare}, {"/reviews/", KindReview}} {

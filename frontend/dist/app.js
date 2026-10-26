@@ -128,7 +128,11 @@ async function init() {
   window.runtime.EventsOn('snapshot', (snap) => { S.snap = snap; renderSnapshot(); });
   window.runtime.EventsOn('files-dropped', onDrop);
   window.runtime.EventsOn('menu', onMenu);
-  window.runtime.EventsOn('state-changed', async () => { S.state = await call('GetState'); renderState(); });
+  window.runtime.EventsOn('state-changed', async () => {
+    S.state = await call('GetState');
+    S.dlDest = S.state.settings.download_dir; // the menu bar's download panel can change it
+    renderState();
+  });
   window.runtime.EventsOn('update', (u) => { S.update = u; renderUpdate(); });
   S.update = await call('UpdateStatus');
   renderUpdate();

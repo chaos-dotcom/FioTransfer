@@ -112,6 +112,7 @@ func (a *App) startup(ctx context.Context) {
 		runtime.EventsEmit(ctx, "files-dropped", paths)
 	})
 	a.started = time.Now()
+	quickApp = a
 	trayInit(a.onTray)
 	go a.trayLoop()
 	a.initUpdates()
@@ -127,6 +128,8 @@ func (a *App) onTray(action int) {
 	switch action {
 	case trayOpen:
 		a.showWindow()
+	case trayLink:
+		a.openQuickDownload()
 	case trayReopen:
 		if time.Since(a.started) > 3*time.Second {
 			a.showWindow()
