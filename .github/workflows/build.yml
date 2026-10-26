@@ -13,10 +13,7 @@ permissions:
 
 jobs:
   build:
-    # Intel: GitHub's arm64 macOS runners are short on capacity, and jobs there
-    # were canceled unstarted after 15 min in the queue. The app is built
-    # universal either way.
-    runs-on: macos-15-intel
+    runs-on: macos-15
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
