@@ -10,6 +10,7 @@ void fioTraySet(const char *status, const char *title, int login, const char *up
 void fioSyncDock(void);
 void fioActivate(void);
 void fioSetActive(int on);
+void fioTrayJobs(const char *json);
 */
 import "C"
 
@@ -53,6 +54,13 @@ func traySet(status, title string, login bool, update string) {
 		l = 1
 	}
 	C.fioTraySet(cs, ct, C.int(l), cu)
+}
+
+// traySetJobs shows running transfers in the menu (JSON from trayJobs).
+func traySetJobs(json string) {
+	c := C.CString(json)
+	defer C.free(unsafe.Pointer(c))
+	C.fioTrayJobs(c)
 }
 
 func syncDock()    { C.fioSyncDock() }

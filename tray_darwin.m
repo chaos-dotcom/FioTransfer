@@ -11,12 +11,81 @@
 
 static NSStatusItem *fioItem;
 static NSMenuItem *fioStatusLine;
+static NSMenuItem *fioMoreItem; // "3 more" under the transfers that fit
+static NSMutableArray<NSMenuItem *> *fioJobItems;
 static NSMenuItem *fioLoginItem;
 static NSMenuItem *fioUpdateItem;
 static NSMenuItem *fioCheckItem;
 static FioTrayTarget *fioTarget;
 
 BOOL fioQuickVisible(void); // quick_darwin.m
+
+// FioJobView is a running transfer in the menu: arrow, name and percentage,
+// a bar, then size, speed and time left. Text lines up with the item titles
+// (after the checkmark column); the arrow sits in that column.
+@interface FioJobView : NSView
+@end
+@implementation FioJobView {
+	NSImageView *_arrow;
+	NSTextField *_name, *_pct, *_detail;
+	double _progress; // 0…1, <0 while the size isn't known
+}
+static const CGFloat fioJobIndent = 22, fioJobRight = 14, fioJobPct = 44;
+
+static NSTextField *fioJobLabel(CGFloat size, NSColor *color) {
+	NSTextField *t = [NSTextField labelWithString:@""];
+	t.font = [NSFont monospacedDigitSystemFontOfSize:size weight:NSFontWeightRegular];
+	t.textColor = color;
+	t.lineBreakMode = NSLineBreakByTruncatingMiddle;
+	return t;
+}
+
+- (instancetype)init {
+	CGFloat w = 300;
+	self = [super initWithFrame:NSMakeRect(0, 0, w, 56)];
+	self.autoresizingMask = NSViewWidthSizable;
+	_arrow = [[NSImageView alloc] initWithFrame:NSMakeRect(fioJobIndent - 15, 7, 12, 16)];
+	_arrow.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:11 weight:NSFontWeightSemibold];
+	_arrow.contentTintColor = NSColor.secondaryLabelColor;
+	_name = fioJobLabel(13, NSColor.labelColor);
+	_name.frame = NSMakeRect(fioJobIndent, 6, w - fioJobIndent - fioJobRight - fioJobPct - 6, 17);
+	_name.autoresizingMask = NSViewWidthSizable;
+	_pct = fioJobLabel(13, NSColor.secondaryLabelColor);
+	_pct.frame = NSMakeRect(w - fioJobRight - fioJobPct, 6, fioJobPct, 17);
+	_pct.alignment = NSTextAlignmentRight;
+	_pct.autoresizingMask = NSViewMinXMargin;
+	_detail = fioJobLabel(11, NSColor.secondaryLabelColor);
+	_detail.frame = NSMakeRect(fioJobIndent, 36, w - fioJobIndent - fioJobRight, 14);
+	_detail.autoresizingMask = NSViewWidthSizable;
+	for (NSView *v in @[_arrow, _name, _pct, _detail]) [self addSubview:v];
+	return self;
+}
+
+- (BOOL)isFlipped { return YES; }
+
+- (void)show:(NSDictionary *)j {
+	NSString *sym = [j[@"up"] boolValue] ? @"arrow.up" : @"arrow.down";
+	_arrow.image = [NSImage imageWithSystemSymbolName:sym accessibilityDescription:[j[@"up"] boolValue] ? @"Upload" : @"Download"];
+	_name.stringValue = j[@"name"] ?: @"";
+	_name.toolTip = _name.stringValue;
+	_pct.stringValue = j[@"pct"] ?: @"";
+	_detail.stringValue = j[@"detail"] ?: @"";
+	_progress = [j[@"progress"] doubleValue];
+	self.needsDisplay = YES;
+}
+
+- (void)drawRect:(NSRect)dirty {
+	NSRect track = NSMakeRect(fioJobIndent, 28, NSWidth(self.bounds) - fioJobIndent - fioJobRight, 4);
+	[NSColor.tertiaryLabelColor setFill];
+	[[NSBezierPath bezierPathWithRoundedRect:track xRadius:2 yRadius:2] fill];
+	if (_progress > 0) {
+		NSRect done = track;
+		done.size.width = MAX(4, NSWidth(track) * MIN(_progress, 1));
+		[[NSColor colorWithSRGBRed:0x5b / 255.0 green:0x53 / 255.0 blue:1 alpha:1] setFill]; // brand
+		[[NSBezierPath bezierPathWithRoundedRect:done xRadius:2 yRadius:2] fill];
+	}
+}
+@end
 
 static NSMenuItem *fioAdd(NSMenu *m, NSString *title, int tag, NSString *key) {
 	NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:title action:@selector(act:) keyEquivalent:key];
@@ -61,6 +130,11 @@ void fioTrayInit(void) {
 		fioStatusLine = [[NSMenuItem alloc] initWithTitle:@"Idle" action:nil keyEquivalent:@""];
 		fioStatusLine.enabled = NO;
 		[m addItem:fioStatusLine];
+		fioJobItems = [NSMutableArray new];
+		fioMoreItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
+		fioMoreItem.enabled = NO;
+		fioMoreItem.hidden = YES;
+		[m addItem:fioMoreItem];
 		[m addItem:[NSMenuItem separatorItem]];
 		fioUpdateItem = fioAdd(m, @"Update", 5, @"");
 		fioUpdateItem.hidden = YES;
@@ -95,6 +169,35 @@ void fioTraySet(const char *status, const char *title, int login, const char *up
 		fioUpdateItem.hidden = u.length == 0;
 		fioCheckItem.hidden = u.length > 0; // the update item takes its place
 		if (u.length) fioUpdateItem.title = u;
+	});
+}
+
+// fioTrayJobs shows running transfers under the status line, from trayJobs'
+// JSON. Rows are reused, so an open menu updates in place.
+void fioTrayJobs(const char *json) {
+	NSData *data = [NSData dataWithBytes:json length:strlen(json)];
+	dispatch_async(dispatch_get_main_queue(), ^{
+		if (!fioItem) return;
+		NSDictionary *o = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+		NSArray<NSDictionary *> *jobs = [o isKindOfClass:[NSDictionary class]] ? o[@"jobs"] : nil;
+		if (![jobs isKindOfClass:[NSArray class]]) jobs = @[];
+		NSMenu *m = fioItem.menu;
+		while (fioJobItems.count > jobs.count) {
+			[m removeItem:fioJobItems.lastObject];
+			[fioJobItems removeLastObject];
+		}
+		for (NSUInteger i = 0; i < jobs.count; i++) {
+			if (i == fioJobItems.count) {
+				NSMenuItem *it = [NSMenuItem new];
+				it.view = [FioJobView new];
+				[m insertItem:it atIndex:[m indexOfItem:fioMoreItem]];
+				[fioJobItems addObject:it];
+			}
+			[(FioJobView *)fioJobItems[i].view show:jobs[i]];
+		}
+		int more = [o[@"more"] intValue];
+		fioMoreItem.hidden = more == 0;
+		fioMoreItem.title = [NSString stringWithFormat:@"%d more", more];
 	});
 }
 

@@ -63,23 +63,3 @@ func (a *App) quickStart(link, pass, dir string, subfolder bool) {
 	_, err := a.StartDownload(xfer.DownloadOptions{Link: link, Passphrase: pass, DestDir: dir, Subfolder: subfolder})
 	quickStarted(err)
 }
-
-// fmtBytes matches the frontend's fmtBytes.
-func fmtBytes(n int64) string {
-	if n <= 0 {
-		return "0 B"
-	}
-	units := []string{"B", "KB", "MB", "GB", "TB", "PB"}
-	v, i := float64(n), 0
-	for v >= 1000 && i < len(units)-1 {
-		v /= 1000
-		i++
-	}
-	switch {
-	case i == 0, v >= 100:
-		return fmt.Sprintf("%.0f %s", v, units[i])
-	case v >= 10:
-		return fmt.Sprintf("%.1f %s", v, units[i])
-	}
-	return fmt.Sprintf("%.2f %s", v, units[i])
-}

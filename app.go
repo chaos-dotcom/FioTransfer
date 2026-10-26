@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -153,6 +156,7 @@ func (a *App) onTray(action int) {
 func (a *App) trayLoop() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
+	shown := "" // running transfers in the menu
 	for n := 0; ; n++ {
 		if n%30 == 0 { // the login item can also be removed in System Settings
 			a.openAtLogin.Store(loginEnabled())
@@ -175,6 +179,14 @@ func (a *App) trayLoop() {
 			}
 		}
 		traySet(status, title, a.openAtLogin.Load(), a.updateMenuTitle())
+		jobs := `{"jobs":[],"more":0}`
+		if active > 0 {
+			jobs = trayJobs(a.mgr.Snapshot())
+		}
+		if jobs != shown {
+			traySetJobs(jobs)
+			shown = jobs
+		}
 		setTransfersActive(active > 0)
 		<-t.C
 	}
@@ -189,6 +201,111 @@ func speed(bps float64) string {
 	default:
 		return fmt.Sprintf("%.0f KB/s", bps/1e3)
 	}
+}
+
+// trayJob is a running transfer as the menu bar menu shows it.
+type trayJob struct {
+	Up       bool    `json:"up"`
+	Name     string  `json:"name"`
+	Progress float64 `json:"progress"` // 0…1, -1 while the size isn't known
+	Pct      string  `json:"pct"`
+	Detail   string  `json:"detail"`
+}
+
+const trayJobsMax = 5
+
+// trayJobs lists running transfers for the menu, those moving data first, as
+// JSON: {"jobs": […], "more": n} with n the ones left out.
+func trayJobs(s xfer.Snapshot) string {
+	rank := map[xfer.Status]int{xfer.Running: 0, xfer.Resolving: 1, xfer.Queued: 2}
+	var active []xfer.JobView
+	for _, j := range s.Jobs {
+		if _, ok := rank[j.Status]; ok {
+			active = append(active, j)
+		}
+	}
+	slices.SortStableFunc(active, func(a, b xfer.JobView) int { return rank[a.Status] - rank[b.Status] })
+	out := struct {
+		Jobs []trayJob `json:"jobs"`
+		More int       `json:"more"`
+	}{Jobs: []trayJob{}}
+	for i, j := range active {
+		if i == trayJobsMax {
+			out.More = len(active) - i
+			break
+		}
+		out.Jobs = append(out.Jobs, trayRow(j))
+	}
+	b, _ := json.Marshal(out)
+	return string(b)
+}
+
+// trayRow words a transfer like the main window's list does.
+func trayRow(j xfer.JobView) trayJob {
+	t := trayJob{Up: j.Kind == "upload", Name: j.Title, Progress: -1}
+	if t.Name == "" {
+		t.Name = "Download"
+		if t.Up {
+			t.Name = "Upload"
+		}
+	}
+	switch {
+	case j.Status == xfer.Queued:
+		t.Detail = "Queued"
+	case j.Status == xfer.Resolving || j.Total <= 0:
+		t.Detail = j.Phase
+		if t.Detail == "" {
+			t.Detail = "Preparing"
+		}
+	default:
+		t.Progress = min(1, float64(j.Done)/float64(j.Total))
+		t.Pct = fmt.Sprintf("%d%%", int(t.Progress*100))
+		if t.Up && j.Done >= j.Total {
+			t.Detail = "Verifying" // Frame.io is assembling the parts
+			break
+		}
+		parts := []string{fmtBytes(j.Done) + " of " + fmtBytes(j.Total)}
+		if j.Speed > 0 {
+			parts = append(parts, speed(j.Speed))
+		}
+		if j.ETA > 0 {
+			parts = append(parts, fmtDur(j.ETA)+" left")
+		}
+		t.Detail = strings.Join(parts, " · ")
+	}
+	return t
+}
+
+// fmtBytes matches the frontend's fmtBytes.
+func fmtBytes(n int64) string {
+	if n <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB"}
+	v, i := float64(n), 0
+	for v >= 1000 && i < len(units)-1 {
+		v /= 1000
+		i++
+	}
+	switch {
+	case i == 0, v >= 100:
+		return fmt.Sprintf("%.0f %s", v, units[i])
+	case v >= 10:
+		return fmt.Sprintf("%.1f %s", v, units[i])
+	}
+	return fmt.Sprintf("%.2f %s", v, units[i])
+}
+
+// fmtDur matches the frontend's fmtDur.
+func fmtDur(sec float64) string {
+	s := int(math.Round(sec))
+	switch h, m := s/3600, s%3600/60; {
+	case h > 0:
+		return fmt.Sprintf("%dh %02dm", h, m)
+	case m > 0:
+		return fmt.Sprintf("%dm %02ds", m, s%60)
+	}
+	return fmt.Sprintf("%ds", s)
 }
 
 func (a *App) shutdown(ctx context.Context) {
