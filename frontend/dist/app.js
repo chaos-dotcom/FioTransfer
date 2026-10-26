@@ -105,6 +105,7 @@ const S = {
   histKind: '',
   histExpanded: new Set(),
   pendingPaths: null,
+  watchQueue: [], // folders from Finder's "Create Watch Folder in FioTransfer", set up one by one
   update: null,
 };
 
@@ -138,6 +139,8 @@ async function init() {
   renderUpdate();
   loadWatches();
   setInterval(loadWatches, 2000);
+  window.runtime.EventsOn('service', takeServiceRequests);
+  takeServiceRequests(); // the app may have been opened from Finder for one
 }
 document.addEventListener('DOMContentLoaded', () => init().catch((e) => toast(errMsg(e), 'err', 15000)));
 
@@ -429,6 +432,31 @@ function ensureCanUpload() {
   toast(S.state.settings.client_id ? 'Not signed in' : 'Uploads not set up', 'err');
   return false;
 }
+// Finder's right-click menu: uploads go through the destination picker (the
+// window's destination bar isn't in view there); watch folders open set up.
+async function takeServiceRequests() {
+  const reqs = (await call('TakeServiceRequests')) || [];
+  const up = reqs.filter((r) => r.kind === 'upload').flatMap((r) => r.paths);
+  const watch = reqs.filter((r) => r.kind === 'watch').flatMap((r) => r.paths);
+  if (!up.length && !watch.length) return;
+  if (!ensureCanUpload()) return;
+  S.watchQueue.push(...watch);
+  if (up.length) {
+    showView('transfers');
+    S.pendingPaths = up;
+    openDestAt(null);
+  } else if ($('#dest-modal').classList.contains('hidden')) nextWatch();
+}
+
+function nextWatch() {
+  const p = S.watchQueue.shift();
+  if (!p) return;
+  showView('watch');
+  D.watchPath = p;
+  D.watchDir = 'upload';
+  openDest('watch');
+}
+
 function onDrop(paths) {
   if (!paths || !paths.length || !ensureCanUpload()) return;
   showView('transfers');
@@ -746,12 +774,14 @@ async function destPath() {
 }
 function renderDestTitle() {
   $$('#dest-dir button').forEach((b) => b.classList.toggle('active', b.dataset.dir === D.watchDir));
+  const n = S.pendingPaths ? S.pendingPaths.length : 0;
   $('#dest-modal .modal-title').textContent = D.mode === 'watch' ? `${baseName(D.watchPath)} ${DIR_ARROW[D.watchDir]} Frame.io`
-    : D.mode === 'pick' ? 'Frame.io folder' : 'Upload to';
+    : D.mode === 'pick' ? 'Frame.io folder' : n === 1 ? `Upload ${baseName(S.pendingPaths[0])} to` : n ? `Upload ${n} items to` : 'Upload to';
 }
 function closeDest() {
   $('#dest-modal').classList.add('hidden');
   if (D.mode !== 'pick') S.pendingPaths = null;
+  if (D.mode === 'watch') S.watchQueue = [];
 }
 const destTop = () => D.stack[D.stack.length - 1];
 
@@ -930,6 +960,7 @@ async function chooseDest() {
       await call('AddWatch', D.watchPath, D.stack[0].id, t.folder_id, destLabel(), D.watchDir, $('#dest-existing').checked);
       $('#dest-modal').classList.add('hidden');
       showView('watch');
+      nextWatch();
     } catch (e) { toast(errMsg(e), 'err'); }
     return;
   }

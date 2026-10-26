@@ -16,6 +16,7 @@ import (
 var assets embed.FS
 
 func main() {
+	servicesInit()
 	app := NewApp()
 
 	appMenu := menu.NewMenu()

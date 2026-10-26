@@ -119,6 +119,7 @@ func (a *App) startup(ctx context.Context) {
 	trayInit(a.onTray)
 	go a.trayLoop()
 	a.initUpdates()
+	a.startServices()
 }
 
 func (a *App) showWindow() {
