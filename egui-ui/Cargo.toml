@@ -51,3 +51,26 @@ web-sys = { version = "0.3", features = [
     "Location",
     "Window",
 ] }
+
+# Unsigned packaging of the cross-platform front end.
+#   cargo packager -p fiotransfer-egui                       (platform defaults)
+#   cargo packager -p fiotransfer-egui --formats deb appimage
+[package.metadata.packager]
+product-name = "FioTransfer"
+version = "0.1.0"
+identifier = "com.farbhaus.fiotransfer.egui"
+out-dir = "../dist-egui"
+binaries-dir = "../target/release"
+icons = ["../build/icons/icon.icns", "../build/icons/icon_1024.png", "../build/icons/icon_512.png"]
+before-packaging-command = "cargo build --release -p fiotransfer-egui --bin fiotransfer-egui"
+resources = ["../LICENSE", "../THIRD_PARTY_NOTICES.txt"]
+
+[[package.metadata.packager.binaries]]
+path = "fiotransfer-egui"
+main = true
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+
+[package.metadata.packager.linux]
+generate-desktop-entry = true
