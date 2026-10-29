@@ -3,6 +3,27 @@ name = "fiotransfer-egui"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+# `rlib` keeps the native binary and the tests linking against this crate.
+# `cdylib` is what wasm-bindgen consumes for the browser capture (`src/wasm.rs`,
+# `bench/wasm-shots.sh`) — a measurement apparatus, not a shipping target.
+name = "fiotransfer_egui"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+# The native binary is behind a feature so the browser build can leave it out:
+# Trunk runs a plain `cargo build --target wasm32-unknown-unknown`, which builds
+# every target of the package, and `main.rs` calls `eframe::run_native` (native
+# only). `default` keeps the native build exactly as it was.
+[features]
+default = ["native"]
+native = []
+
+[[bin]]
+name = "fiotransfer-egui"
+path = "src/main.rs"
+required-features = ["native"]
+
 [dependencies]
 # Deliberately no dependency on the app crate: that would drag the webview
 # stack (wry/tao) into this build, and this front end only needs the same JSON
@@ -12,5 +33,21 @@ serde_json = "1"
 
 eframe = "0.33.3"
 egui = "0.33.3"
+
+# Rendering PNGs and the kittest harness are native-only: neither belongs in the
+# wasm build (egui_kittest pulls wgpu, `image` pulls its codec stack).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 egui_kittest = { version = "0.33.3", features = ["wgpu", "snapshot"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# The browser entry point, and nothing else: eframe re-exports
+# `wasm_bindgen`/`web_sys`, but not `wasm_bindgen_futures::spawn_local`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "HtmlCanvasElement",
+    "Location",
+    "Window",
+] }

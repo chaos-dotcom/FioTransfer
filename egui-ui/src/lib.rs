@@ -5,9 +5,15 @@
 //! reads it. Nothing here talks to Frame.io; it is given a [`model::UiState`].
 
 pub mod app;
+pub mod fixture;
 pub mod model;
 pub mod theme;
 pub mod views;
+
+/// The browser entry point. Wasm only: the native build has `main.rs`, and this
+/// module is the only thing here that knows a `<canvas>` exists.
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 pub use app::FioApp;
 

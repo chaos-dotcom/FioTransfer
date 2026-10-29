@@ -128,6 +128,16 @@ pub struct UiState {
     pub toasts: Vec<Toast>,
     /// Frame.io destination the composer will upload to.
     pub destination: String,
+    /// The running build's version, for Settings' "Version" row.
+    pub version: String,
+    /// Whether the app is set to start at login (Settings' checkbox).
+    pub open_at_login: bool,
+    /// Where the app keeps its log, for "App log" + "Show in Finder".
+    pub log_dir: String,
+    /// The user's home, so paths can be shown the way `shortPath` does (`~/Movies`).
+    pub home: String,
+    /// Update state, for the "Check now" row and the sidebar's update card.
+    pub update: UpdateState,
     /// The expanded job whose files are listed, and its files.
     pub expanded: Option<String>,
     pub files: Vec<FileView>,
@@ -141,6 +151,20 @@ pub struct HistoryRow {
     pub when: String,
     pub files: String,
     pub size: String,
+}
+
+/// What Settings and the update card need to know about a release.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateState {
+    pub current: String,
+    pub latest: String,
+    pub available: bool,
+    /// idle | checking | downloading | restarting
+    pub state: String,
+    pub progress: f32,
+    pub error: String,
+    /// Why this copy cannot update itself ("development build", …).
+    pub blocker: String,
 }
 
 #[derive(Debug, Clone, Default)]
