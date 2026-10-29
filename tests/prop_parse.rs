@@ -307,7 +307,7 @@ proptest! {
 /// URL in place, so the scheme and host become part of the rate-limit key. The
 /// key is meant to be the method and the path; the host can never be in it.
 #[test]
-#[ignore = "known defect: a URL with a scheme and an empty path leaks scheme and host into the key"]
+#[allow(dead_code, unused)] // "known defect: a URL with a scheme and an empty path leaks scheme and host into the key"]
 fn a_url_without_a_path_does_not_put_its_host_in_the_key() {
     for url in ["https://api.frame.io", "https://api.frame.io?x=1", "HTTP://host.example"] {
         let k = route_key("GET", url);
@@ -327,7 +327,7 @@ fn a_url_without_a_path_does_not_put_its_host_in_the_key() {
 /// collapse into one rate-limit bucket. The query and fragment must never
 /// contribute to the key.
 #[test]
-#[ignore = "known defect: a query or fragment containing \"://\" truncates the key"]
+#[allow(dead_code, unused)] // "known defect: a query or fragment containing \"://\" truncates the key"]
 fn a_query_that_looks_like_a_url_does_not_change_the_key() {
     let plain = route_key("GET", "/v4/accounts/a/files/b");
     assert_eq!(plain, "GET /v4/accounts/a/files/b");

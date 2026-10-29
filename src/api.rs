@@ -90,9 +90,16 @@ fn is_id_segment(s: &str) -> bool {
 /// Turns "GET /v4/accounts/<uuid>/files/<uuid>?x=1" into "GET /v4/accounts/:id/files/:id".
 pub fn route_key(method: &str, raw_url: &str) -> String {
     let mut p = raw_url;
+    // Only a real scheme is stripped, and only from the front: a "://" inside a
+    // query (a `next=https://…` parameter) is data, not a scheme.
     if let Some(i) = p.find("://") {
-        if let Some(j) = p[i + 3..].find('/') {
-            p = &p[i + 3 + j..];
+        let scheme = &p[..i];
+        if !scheme.is_empty() && !scheme.contains(['/', '?', '#']) {
+            let rest = &p[i + 3..];
+            p = match rest.find(['/', '?', '#']) {
+                Some(j) if rest.as_bytes()[j] == b'/' => &rest[j..],
+                _ => "/", // no path at all: the key is the root, never the host
+            };
         }
     }
     if let Some(i) = p.find(['?', '#']) {
@@ -227,8 +234,10 @@ impl Client {
                 }
             }
             let tok = self.auth.token(cx).await.map_err(ApiErr::Auth)?;
+            let verb = reqwest::Method::from_bytes(method.as_bytes())
+                .map_err(|e| ApiErr::Other(format!("bad HTTP method {:?}: {}", method, e)))?;
             let mut rb = netx::api_client()
-                .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), &u)
+                .request(verb, &u)
                 .header("Authorization", format!("Bearer {}", tok))
                 .header("Accept", "application/json");
             if let Some(b) = &body_bytes {

@@ -43,6 +43,14 @@ impl Limiter {
 
     pub async fn acquire(&self, cx: &CancellationToken) -> Result<Permit<'_>, Cancelled> {
         loop {
+            // Register for a wake-up *before* looking at the count. Waking
+            // waiters is not a broadcast to future listeners: a release that
+            // lands between reading the count and enrolling here would
+            // otherwise be lost, and the task would sleep until the next
+            // release — or for ever if there is none.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut st = self.state.lock().unwrap();
                 if st.1 < st.0 {
@@ -50,9 +58,8 @@ impl Limiter {
                     return Ok(Permit(self));
                 }
             }
-            let waited = self.notify.notified();
             tokio::select! {
-                _ = waited => {}
+                _ = &mut notified => {}
                 _ = cx.cancelled() => return Err(Cancelled),
             }
             if cx.is_cancelled() {

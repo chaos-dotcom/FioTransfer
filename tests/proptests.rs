@@ -111,8 +111,14 @@ proptest! {
         checked?;
     }
 
-    /// Raising and lowering the limit while streams are in flight must be safe:
-    /// lowering does not kill anyone, and the count never dips below zero.
+    /// Raising and lowering the limit while streams are in flight must be safe.
+    ///
+    /// The first version of this property acquired `l` permits per step while
+    /// keeping the earlier ones, so it asked for more than the limit and then
+    /// waited for ever — a hang in the *test*, not in the limiter (an acquire
+    /// blocks while the limit is reached, which is the whole point). Found by
+    /// this suite refusing to finish. The history below never holds more than
+    /// the current limit, and releases down to it when it shrinks.
     #[test]
     fn changing_the_limit_mid_flight_keeps_the_count_sane(limits in pvec(1usize..10, 1..6)) {
         let rt = rt();
@@ -121,13 +127,16 @@ proptest! {
             let mut permits = Vec::new();
             for l in &limits {
                 limiter.set_limit(*l);
-                for _ in 0..*l {
+                while permits.len() < *l {
                     let cx = tokio_util::sync::CancellationToken::new();
-                    if let Ok(p) = limiter.acquire(&cx).await {
-                        permits.push(p);
-                    }
+                    permits.push(limiter.acquire(&cx).await.expect("a permit"));
+                }
+                while permits.len() > *l {
+                    permits.pop();
                 }
                 prop_assert_eq!(limiter.limit(), *l);
+                prop_assert_eq!(limiter.active(), permits.len(), "active tracks what is held");
+                prop_assert!(limiter.active() <= *l, "never above the limit");
             }
             drop(permits);
             prop_assert_eq!(limiter.active(), 0);
@@ -215,7 +224,7 @@ proptest! {
         let src = dir.path().join("a.bin");
         std::fs::write(&src, b"x").expect("source");
         let source = src.to_string_lossy().into_owned();
-        let ledger = Ledger::for_source(&source);
+        let ledger = Ledger::in_dir(dir.path(), &source);
         let now = fiotransfer::xfer::uploadstate::now_ms();
         let st = state_for(&source, parts, now);
         ledger.save(&st).expect("save");
@@ -240,7 +249,7 @@ proptest! {
         let src = dir.path().join("b.bin");
         std::fs::write(&src, b"y").expect("source");
         let source = src.to_string_lossy().into_owned();
-        let ledger = Ledger::for_source(&source);
+        let ledger = Ledger::in_dir(dir.path(), &source);
         let now = fiotransfer::xfer::uploadstate::now_ms();
         let st = state_for(&source, 3, now);
         ledger.save(&st).expect("save");
@@ -268,7 +277,7 @@ proptest! {
             let src = dir.path().join(format!("f{}.bin", id));
             std::fs::write(&src, b"z").expect("source");
             let source = src.to_string_lossy().into_owned();
-            let ledger = Ledger::for_source(&source);
+            let ledger = Ledger::in_dir(dir.path(), &source);
             let mut st = state_for(&source, 2, now);
             st.file_id = format!("file-{}", id);
             ledger.save(&st).expect("save");
@@ -277,7 +286,7 @@ proptest! {
         for id in 0..8u64 {
             let expected = ids.iter().any(|i| *i == id);
             prop_assert_eq!(
-                fiotransfer::xfer::uploadstate::keeps_file(&format!("file-{}", id), now),
+                fiotransfer::xfer::uploadstate::keeps_file_in(dir.path(), &format!("file-{}", id), now),
                 expected,
                 "keeps_file(file-{})",
                 id
@@ -401,8 +410,11 @@ proptest! {
         prop_assert!(skip_name(&part), "{} should be skipped", part);
         let state = format!("{}.fiostate", media);
         prop_assert!(skip_name(&state), "{} should be skipped", state);
-        let ledger = format!("{}.fioup", media);
-        prop_assert!(skip_name(&ledger), "{} should be skipped", ledger);
+        // The upload ledger is not written next to the media (it lives in the
+        // app's own directory), so a media name ending in .fioup is still a
+        // media name. Checking the opposite of what I first assumed.
+        let ledgerish = format!("{}.fioup", media);
+        prop_assert!(!skip_name(&ledgerish), "{} is not a sidecar of ours", ledgerish);
     }
 }
 

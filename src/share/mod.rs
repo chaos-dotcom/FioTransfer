@@ -521,71 +521,11 @@ impl Drop for Lister<'_> {
 /// parse_rfc3339 reads an RFC 3339 timestamp into Unix seconds, as
 /// time.Parse(time.RFC3339) does: "2026-10-23T12:00:00Z" or a "+02:00" offset.
 pub(crate) fn parse_rfc3339(s: &str) -> Option<i64> {
-    fn digits(b: &[u8], at: usize, n: usize) -> Option<i64> {
-        let mut v: i64 = 0;
-        for k in 0..n {
-            let c = *b.get(at + k)?;
-            if !c.is_ascii_digit() {
-                return None;
-            }
-            v = v * 10 + (c - b'0') as i64;
-        }
-        Some(v)
-    }
-    let b = s.as_bytes();
-    if b.len() < 19 {
-        return None;
-    }
-    let year = digits(b, 0, 4)?;
-    let month = digits(b, 5, 2)?;
-    let day = digits(b, 8, 2)?;
-    if b[4] != b'-' || b[7] != b'-' {
-        return None;
-    }
-    if b[10] != b'T' && b[10] != b't' && b[10] != b' ' {
-        return None;
-    }
-    let hour = digits(b, 11, 2)?;
-    let min = digits(b, 14, 2)?;
-    let sec = digits(b, 17, 2)?;
-    if b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-    let mut i = 19;
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    let mut offset: i64 = 0;
-    if i < b.len() {
-        match b[i] {
-            b'Z' | b'z' => i += 1,
-            sign @ (b'+' | b'-') => {
-                let oh = digits(b, i + 1, 2)?;
-                if *b.get(i + 3)? != b':' {
-                    return None;
-                }
-                let om = digits(b, i + 4, 2)?;
-                offset = if sign == b'-' { -(oh * 3600 + om * 60) } else { oh * 3600 + om * 60 };
-                i += 6;
-            }
-            _ => return None,
-        }
-    }
-    if i != b.len() {
-        return None;
-    }
-    // Howard Hinnant's days-from-civil.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + hour * 3600 + min * 60 + sec - offset)
+    // Real RFC 3339: field ranges, the exact separator and a mandatory offset.
+    // A hand-rolled reader used to accept "0000-00-00T00:00:00Z" and a missing
+    // offset, which turned a working review link into one that looks expired.
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(s, &Rfc3339).ok().map(|t| t.unix_timestamp())
 }
 
 /// now_unix is the clock, in Unix seconds.

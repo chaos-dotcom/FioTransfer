@@ -1125,6 +1125,31 @@ pub fn scan_paths(paths: &[String]) -> Result<Vec<Scanned>, String> {
 }
 
 fn walk(dir: &Path, parent: &Path, out: &mut Vec<Scanned>) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    walk_inner(dir, parent, out, &mut seen)
+}
+
+/// One directory level of the scan.
+///
+/// Symbolic links are not followed: a link that points at one of its own
+/// parents used to recurse until the stack ran out, and an upload that walks a
+/// tree twice sends the same bytes twice. `seen` holds (device, inode) pairs as
+/// a second guard, so a tree that reaches the same directory by two paths is
+/// walked once.
+fn walk_inner(
+    dir: &Path,
+    parent: &Path,
+    out: &mut Vec<Scanned>,
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(dir) {
+        Ok(m) => m,
+        Err(e) => return Err(format!("{}: {}", dir.display(), e)),
+    };
+    if !seen.insert((meta.dev(), meta.ino())) {
+        return Ok(()); // this directory was already walked by another path
+    }
     let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
     let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
@@ -1134,12 +1159,16 @@ fn walk(dir: &Path, parent: &Path, out: &mut Vec<Scanned>) -> Result<(), String>
             continue;
         }
         let fp = e.path();
-        let md = match e.metadata() {
+        // symlink_metadata: a link is reported as a link, not as what it points at.
+        let md = match std::fs::symlink_metadata(&fp) {
             Ok(m) => m,
             Err(_) => continue,
         };
+        if md.file_type().is_symlink() {
+            continue;
+        }
         if md.is_dir() {
-            walk(&fp, parent, out)?;
+            walk_inner(&fp, parent, out, seen)?;
         } else if md.is_file() {
             let rel = fp.strip_prefix(parent).unwrap_or(&fp).to_string_lossy().replace('\\', "/");
             out.push(Scanned { local: fp.to_string_lossy().into_owned(), rel, size: md.len() as i64 });
@@ -1163,6 +1192,34 @@ pub fn top_folder(paths: &[String], items: &[Scanned]) -> String {
 
 pub fn ms_from_system(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// A link that points back at its own parent used to recurse until the
+    /// stack ran out: following it means walking the tree for ever.
+    #[test]
+    fn scan_paths_does_not_follow_a_directory_symlink_cycle() {
+        let dir = std::env::temp_dir().join(format!("fio-scan-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inner")).expect("tree");
+        std::fs::write(dir.join("a.mov"), b"a").expect("file");
+        std::fs::write(dir.join("inner/b.mov"), b"bb").expect("file");
+        std::os::unix::fs::symlink(&dir, dir.join("inner/loop")).expect("symlink");
+        std::os::unix::fs::symlink(dir.join("a.mov"), dir.join("inner/link.mov")).expect("symlink");
+        let root = dir.to_string_lossy().into_owned();
+        let found = scan_paths(&[root]).expect("scan");
+        // A dropped folder keeps its own name in the relative path, so the
+        // files land in a folder of that name on the far side.
+        let top = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut names: Vec<String> = found.iter().map(|s| s.rel.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec![format!("{}/a.mov", top), format!("{}/inner/b.mov", top)],
+                   "each real file once, no link followed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 pub fn snapshot(m: &Manager) -> Snapshot {

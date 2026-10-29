@@ -75,7 +75,13 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn for_source(source: &str) -> Ledger {
-        let base = uploads_dir().join(key(source));
+        Ledger::in_dir(&uploads_dir(), source)
+    }
+
+    /// A ledger rooted somewhere else, so a test never writes into the user's
+    /// own profile (and never sees what a previous test left there).
+    pub fn in_dir(dir: &Path, source: &str) -> Ledger {
+        let base = dir.join(key(source));
         let mut header = base.clone().into_os_string();
         header.push(".json");
         let mut done = base.into_os_string();
@@ -166,7 +172,12 @@ pub fn fresh(st: &UploadState, now_ms: i64) -> bool {
 /// Whether some resumable upload still holds this Frame.io file id, so the
 /// housekeeping must not delete that file.
 pub fn keeps_file(file_id: &str, now_ms: i64) -> bool {
-    let Ok(rd) = std::fs::read_dir(uploads_dir()) else { return false };
+    keeps_file_in(&uploads_dir(), file_id, now_ms)
+}
+
+/// `keeps_file` for a ledger directory other than the app's own.
+pub fn keeps_file_in(dir: &Path, file_id: &str, now_ms: i64) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
