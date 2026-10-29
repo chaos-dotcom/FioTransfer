@@ -30,11 +30,12 @@ func TestWatchMigration(t *testing.T) {
 		t.Fatalf("Watches = %v, %v", list, err)
 	}
 	w := list[0]
-	if w.Direction != DirUpload || w.IgnoreRemote || !w.Uploads() || w.Downloads() || w.LocalPath != "/Volumes/Media/In" {
+	if w.Direction != DirUpload || w.IgnoreRemote || !w.Uploads() || w.Downloads() || w.LocalPath != "/Volumes/Media/In" || w.OnChange != OnChangeOverwrite {
 		t.Errorf("migrated watch = %+v", w)
 	}
 
-	n := Watch{ID: "w2", LocalPath: "/tmp/x", AccountID: "a", FolderID: "f", Enabled: true, CreatedAt: 1700000001000, Direction: DirMirror, IgnoreRemote: true}
+	n := Watch{ID: "w2", LocalPath: "/tmp/x", AccountID: "a", FolderID: "f", Enabled: true, CreatedAt: 1700000001000, Direction: DirMirror, IgnoreRemote: true,
+		OnChange: OnChangeKeep}
 	if err := s.AddWatch(n); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +44,7 @@ func TestWatchMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	list, _ = s.Watches()
-	if len(list) != 2 || list[1].Direction != DirMirror || list[1].IgnoreRemote {
+	if len(list) != 2 || list[1].Direction != DirMirror || list[1].IgnoreRemote || list[1].OnChange != OnChangeKeep {
 		t.Errorf("watches = %+v", list)
 	}
 

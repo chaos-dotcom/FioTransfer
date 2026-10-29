@@ -58,6 +58,7 @@ type File struct {
 	RemoteParent string
 	RemoteID     string
 	ViewURL      string
+	replaces     string // an earlier version on Frame.io, deleted once Frame.io confirms this upload (guarded by mu)
 	// downloads
 	AssetID string
 	URL     string

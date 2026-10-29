@@ -30,7 +30,7 @@ func TestRetryWatchBatchStaysInWatch(t *testing.T) {
 	fake.failChildren.Store(true) // the batch fails before uploading anything
 	w := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond)
 	defer w.Close()
-	if _, err := w.Add(root, "acct", "dest", "P", history.DirUpload, false); err != nil {
+	if _, err := w.Add(root, "acct", "dest", "P", history.DirUpload, history.OnChangeOverwrite, false); err != nil {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(root, "sub/new.mov"), randBytes(3, 1000))

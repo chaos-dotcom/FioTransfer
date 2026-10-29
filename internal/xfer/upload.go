@@ -145,7 +145,12 @@ func (j *Job) uploadFile(ctx context.Context, f *File) error {
 	secs := time.Since(started).Seconds()
 	f.mu.Lock()
 	f.detail = fmt.Sprintf("%d parts × %s, %.1fs, %s/s", len(parts), humanBytes(parts[0].size), secs, humanBytes(int64(float64(size)/max(secs, 0.001))))
+	old := f.replaces
 	f.mu.Unlock()
+	if old != "" { // CleanUp finishes the replace should the app quit before Frame.io confirms
+		j.mgr.Hist.AddReplaced(history.Replaced{FileID: old, AccountID: j.AccountID, NewID: lu.ID, TransferID: j.ID, RelPath: f.RelPath,
+			PID: os.Getpid(), Run: j.mgr.run})
+	}
 
 	// All bytes are on S3; Frame.io assembles the parts. Confirm in the background.
 	j.verifyLater(f, lu.ID)
@@ -240,6 +245,24 @@ func (j *Job) discard(f *File, id string) {
 	h.Log("%s cleanup  [%s] %s — deleted the unfinished copy from Frame.io", kindTag(j.Kind), j.ID, f.RelPath)
 }
 
+// deleteReplaced deletes the earlier version a confirmed upload replaces. If
+// Frame.io can't be reached, CleanUp tries again later.
+func (j *Job) deleteReplaced(f *File, old, newID string) {
+	h := j.mgr.Hist
+	// No owner: CleanUp's to finish if this delete fails.
+	h.AddReplaced(history.Replaced{FileID: old, AccountID: j.AccountID, NewID: newID, TransferID: j.ID, RelPath: f.RelPath})
+	// Deletes are 100/min, so a big batch of re-renders queues for them.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := j.mgr.deleteFile(ctx, j.AccountID, old); err != nil {
+		h.Log("%s replace  [%s] %s — couldn't delete the earlier version from Frame.io (will retry): %v", kindTag(j.Kind), j.ID, f.RelPath, err)
+		return
+	}
+	h.UploadDeleted(old)
+	f.setNote("replaced the earlier version")
+	h.Log("%s replaced [%s] %s — deleted the earlier version from Frame.io", kindTag(j.Kind), j.ID, f.RelPath)
+}
+
 // deleteFile deletes a file on Frame.io; one that's already gone counts as deleted.
 func (m *Manager) deleteFile(ctx context.Context, acct, id string) error {
 	err := m.API.DeleteFile(ctx, acct, id)
@@ -253,9 +276,14 @@ func (m *Manager) deleteFile(ctx context.Context, acct, id string) error {
 // cleanUpEvery is how often CleanUp looks for unfinished uploads to delete.
 const cleanUpEvery = 10 * time.Minute
 
+// replaceGiveUp is how long CleanUp waits for Frame.io to confirm a
+// replacement before keeping the earlier version for good.
+const replaceGiveUp = 24 * time.Hour
+
 // CleanUp deletes Frame.io copies of uploads that never finished, 30 s after
 // it starts and then every 10 minutes: ones whose delete failed, and ones left
-// by a run that quit or crashed mid-upload. The app runs it.
+// by a run that quit or crashed mid-upload. It also deletes earlier versions
+// whose replacement Frame.io has confirmed since. The app runs it.
 func (m *Manager) CleanUp() {
 	time.Sleep(30 * time.Second)
 	for {
@@ -273,7 +301,7 @@ func (m *Manager) cleanUp(ctx context.Context) {
 		return
 	}
 	for _, u := range list {
-		if u.PID != 0 && (u.Run == m.run || (u.PID != os.Getpid() && processAlive(u.PID))) {
+		if m.owned(u.PID, u.Run) {
 			continue // still being sent (here, or by the CLI)
 		}
 		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -285,6 +313,49 @@ func (m *Manager) cleanUp(ctx context.Context) {
 		m.Hist.UploadDeleted(u.FileID)
 		m.Hist.Log("UPLOAD   cleanup  [%s] %s — deleted the unfinished copy from Frame.io", u.TransferID, u.RelPath)
 	}
+	m.finishReplaces(ctx)
+}
+
+// finishReplaces deletes earlier versions whose replacement Frame.io confirmed
+// after its upload's own checks stopped (the app quit, or the batch was
+// canceled). If the replacement failed or is gone, the earlier version stays.
+func (m *Manager) finishReplaces(ctx context.Context) {
+	list, err := m.Hist.ReplacedFiles()
+	if err != nil {
+		return
+	}
+	for _, r := range list {
+		if m.owned(r.PID, r.Run) {
+			continue // its upload is still checking
+		}
+		sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		st, err := m.API.FileStatus(sctx, r.AccountID, r.NewID)
+		cancel()
+		var ae *api.Error
+		switch {
+		case errors.As(err, &ae) && ae.Status == 404, err == nil && st.UploadFailed,
+			err == nil && !st.UploadComplete && time.Since(time.UnixMilli(r.CreatedAt)) > replaceGiveUp:
+			m.Hist.KeepReplaced(r.FileID)
+			m.Hist.Log("UPLOAD   cleanup  [%s] %s — kept the earlier version on Frame.io: the new one didn't finish there", r.TransferID, r.RelPath)
+			continue
+		case err != nil || !st.UploadComplete:
+			continue // ask again next time
+		}
+		dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err = m.deleteFile(dctx, r.AccountID, r.FileID)
+		cancel()
+		if err != nil {
+			continue
+		}
+		m.Hist.UploadDeleted(r.FileID)
+		m.Hist.Log("UPLOAD   replaced [%s] %s — deleted the earlier version from Frame.io", r.TransferID, r.RelPath)
+	}
+}
+
+// owned reports whether a row's owner (PID and run) is still working on it:
+// this run, or another live process (the CLI).
+func (m *Manager) owned(pid int, run string) bool {
+	return pid != 0 && (run == m.run || (pid != os.Getpid() && processAlive(pid)))
 }
 
 func processAlive(pid int) bool {
@@ -303,11 +374,17 @@ func (j *Job) verifyLater(f *File, fileID string) {
 	j.verifyWG.Add(1)
 	go func() {
 		defer j.verifyWG.Done()
+		f.mu.Lock()
+		old := f.replaces
+		f.mu.Unlock()
 		var lastErr error
 		for _, d := range j.mgr.VerifyDelays {
 			if netx.Sleep(j.ctx, d) != nil {
 				f.setNote("not verified")
 				j.persistFile(f)
+				if old != "" { // CleanUp checks the new upload and deletes the old one
+					j.mgr.Hist.AddReplaced(history.Replaced{FileID: old, AccountID: j.AccountID, NewID: fileID, TransferID: j.ID, RelPath: f.RelPath})
+				}
 				return
 			}
 			s, err := j.mgr.API.FileStatus(j.ctx, j.AccountID, fileID)
@@ -319,8 +396,11 @@ func (j *Job) verifyLater(f *File, fileID string) {
 				return
 			case s.UploadComplete:
 				f.setNote("")
-				j.persistFile(f)
 				j.logFileOK(f)
+				if old != "" {
+					j.deleteReplaced(f, old, fileID)
+				}
+				j.persistFile(f)
 				j.mgr.touch()
 				return
 			}
@@ -331,10 +411,13 @@ func (j *Job) verifyLater(f *File, fileID string) {
 
 func (j *Job) verifyFailed(f *File, msg string, cause error) {
 	f.mu.Lock()
-	id := f.RemoteID
+	id, old := f.RemoteID, f.replaces
 	f.mu.Unlock()
 	if id != "" {
 		j.discard(f, id)
+	}
+	if old != "" {
+		j.mgr.Hist.KeepReplaced(old)
 	}
 	f.mu.Lock()
 	f.setStatusLocked(Failed)

@@ -33,11 +33,11 @@ func TestWatchFolder(t *testing.T) {
 	root := t.TempDir()
 	old := randBytes(51, 2000)
 	writeFile(t, filepath.Join(root, "old.mov"), old) // existed before the watch: ignored
-	x, err := w.Add(root, "acct", "dest", "P / Watch", history.DirUpload, false)
+	x, err := w.Add(root, "acct", "dest", "P / Watch", history.DirUpload, history.OnChangeOverwrite, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Add(root, "acct", "dest", "P / Watch", history.DirUpload, false); err == nil {
+	if _, err := w.Add(root, "acct", "dest", "P / Watch", history.DirUpload, history.OnChangeOverwrite, false); err == nil {
 		t.Error("expected duplicate watch to be rejected")
 	}
 

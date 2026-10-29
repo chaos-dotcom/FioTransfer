@@ -94,6 +94,7 @@ func Open(dir, logDir string) (*Store, error) {
 	addColumn(db, "transfers", "share_link", "TEXT")
 	addColumn(db, "watches", "direction", "TEXT NOT NULL DEFAULT 'upload'")
 	addColumn(db, "watches", "ignore_remote", "INTEGER NOT NULL DEFAULT 0")
+	addColumn(db, "watches", "on_change", "TEXT NOT NULL DEFAULT 'overwrite'")
 	return &Store{db: db, logDir: logDir}, nil
 }
 

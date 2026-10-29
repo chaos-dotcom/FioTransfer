@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,9 +24,12 @@ import (
 // Watch folders pair a local folder with a Frame.io folder, keeping the
 // subfolder tree. Upload watches send files that appear locally once they've
 // stopped changing; download watches fetch files that appear on Frame.io once
-// their upload there has finished; mirror watches do both. Nothing is deleted
-// on either side. Each side's records say what the watch already moved, so a
-// file it downloaded is never uploaded back, and the other way round.
+// their upload there has finished; mirror watches do both. Each side's records
+// say what the watch already moved, so a file it downloaded is never uploaded
+// back, and the other way round. A local file that changes after its record
+// (a re-render) is a new version: it uploads again, and with OnChangeOverwrite
+// its earlier copy there is deleted once Frame.io confirms the new one. Nothing
+// else is deleted on either side.
 
 var (
 	watchInterval   = 5 * time.Second  // how often folders are checked
@@ -193,7 +197,7 @@ func (w *Watcher) tick() {
 
 // Add creates a watch. Unless includeExisting, files already present (in the
 // local folder for uploads, on Frame.io for downloads) are left alone.
-func (w *Watcher) Add(local, acct, folder, label, dir string, includeExisting bool) (history.Watch, error) {
+func (w *Watcher) Add(local, acct, folder, label, dir, onChange string, includeExisting bool) (history.Watch, error) {
 	local = filepath.Clean(local)
 	if st, err := os.Stat(local); err != nil || !st.IsDir() {
 		return history.Watch{}, fmt.Errorf("not a folder: %s", local)
@@ -204,6 +208,9 @@ func (w *Watcher) Add(local, acct, folder, label, dir string, includeExisting bo
 	if !history.ValidDirection(dir) {
 		return history.Watch{}, fmt.Errorf("unknown direction %q", dir)
 	}
+	if !history.ValidOnChange(onChange) {
+		return history.Watch{}, fmt.Errorf("unknown rule for changed files %q", onChange)
+	}
 	w.mu.Lock()
 	for _, s := range w.ws {
 		if s.w.LocalPath == local {
@@ -213,7 +220,7 @@ func (w *Watcher) Add(local, acct, folder, label, dir string, includeExisting bo
 	}
 	w.mu.Unlock()
 	x := history.Watch{ID: newID(), LocalPath: local, AccountID: acct, FolderID: folder, DestLabel: label, Enabled: true,
-		CreatedAt: time.Now().UnixMilli(), Direction: dir}
+		CreatedAt: time.Now().UnixMilli(), Direction: dir, OnChange: onChange}
 	x.IgnoreRemote = x.Downloads() && !includeExisting
 	if err := w.m.Hist.AddWatch(x); err != nil {
 		return x, err
@@ -272,11 +279,12 @@ func (w *Watcher) Remove(id string) {
 	w.m.Hist.DeleteWatch(id)
 }
 
-// Update changes a watch's folders and/or direction. A side the watch takes
-// files from starts over when it's new or points somewhere else (existing
-// files there are skipped unless includeExisting); for a mirror both sides do
-// when either end changes. A new destination applies to files from now on.
-func (w *Watcher) Update(id, local, acct, folder, label, dir string, includeExisting bool) error {
+// Update changes a watch's folders, direction and rule for changed files. A
+// side the watch takes files from starts over when it's new or points
+// somewhere else (existing files there are skipped unless includeExisting);
+// for a mirror both sides do when either end changes. A new destination
+// applies to files from now on, and so does a new rule.
+func (w *Watcher) Update(id, local, acct, folder, label, dir, onChange string, includeExisting bool) error {
 	local = filepath.Clean(local)
 	if st, err := os.Stat(local); err != nil || !st.IsDir() {
 		return fmt.Errorf("not a folder: %s", local)
@@ -286,6 +294,9 @@ func (w *Watcher) Update(id, local, acct, folder, label, dir string, includeExis
 	}
 	if !history.ValidDirection(dir) {
 		return fmt.Errorf("unknown direction %q", dir)
+	}
+	if !history.ValidOnChange(onChange) {
+		return fmt.Errorf("unknown rule for changed files %q", onChange)
 	}
 	w.mu.Lock()
 	s := w.ws[id]
@@ -301,7 +312,7 @@ func (w *Watcher) Update(id, local, acct, folder, label, dir string, includeExis
 	}
 	old := s.w
 	x := old
-	x.LocalPath, x.AccountID, x.FolderID, x.DestLabel, x.Direction = local, acct, folder, label, dir
+	x.LocalPath, x.AccountID, x.FolderID, x.DestLabel, x.Direction, x.OnChange = local, acct, folder, label, dir, onChange
 	folderChanged := old.LocalPath != local
 	destChanged := old.FolderID != folder || old.AccountID != acct
 	mirror := dir == history.DirMirror
@@ -312,7 +323,7 @@ func (w *Watcher) Update(id, local, acct, folder, label, dir string, includeExis
 	if freshRemote {
 		x.IgnoreRemote = !includeExisting
 	}
-	if s.busy {
+	if s.busy && (folderChanged || destChanged || dir != old.Direction) {
 		s.job.cancel() // not a user cancel: its files stay eligible under the new settings
 	}
 	s.w = x
@@ -391,7 +402,7 @@ func (w *Watcher) retryBatch(id, localPath string, files []history.File) error {
 			rels = append(rels, f.RelPath)
 		}
 	}
-	err := errors.Join(w.m.Hist.ForgetWatchFiles(s.w.ID, rels), w.m.Hist.ForgetWatchRemotes(s.w.ID, ids))
+	err := errors.Join(w.m.Hist.RequeueWatchFiles(s.w.ID, rels), w.m.Hist.ForgetWatchRemotes(s.w.ID, ids))
 	s.invalidate(true)
 	w.mu.Unlock()
 	go w.scan(s)
@@ -445,6 +456,7 @@ type WatchView struct {
 	Name         string `json:"name"`
 	DestLabel    string `json:"dest_label"`
 	Direction    string `json:"direction"`
+	OnChange     string `json:"on_change"`
 	Enabled      bool   `json:"enabled"`
 	State        string `json:"state"` // watching | paused | uploading | downloading | settling | waiting | error
 	Detail       string `json:"detail"`
@@ -473,7 +485,7 @@ func (w *Watcher) Views() []WatchView {
 		st := w.m.Hist.WatchStats(s.w.ID)
 		w.mu.Lock()
 		v := WatchView{ID: s.w.ID, LocalPath: s.w.LocalPath, Name: filepath.Base(s.w.LocalPath), DestLabel: s.w.DestLabel,
-			Direction: s.w.Direction, Enabled: s.w.Enabled, Uploaded: st.Uploaded, Downloaded: st.Downloaded, Failed: st.Failed,
+			Direction: s.w.Direction, OnChange: s.w.OnChange, Enabled: s.w.Enabled, Uploaded: st.Uploaded, Downloaded: st.Downloaded, Failed: st.Failed,
 			Canceled: st.Canceled, LastTransfer: st.LastTransfer, Pending: s.pending, Waiting: s.waiting,
 			AccountID: s.w.AccountID, FolderID: s.w.FolderID, Link: s.link}
 		switch {
@@ -650,10 +662,14 @@ func (w *Watcher) scan(s *watchState) {
 	pending := 0
 	netVol := w.onNetwork(x.LocalPath)
 	consider := func(rel string, size, mtime int64) {
-		if k, ok := known[rel]; ok {
+		k, had := known[rel]
+		if had {
 			switch k.State {
 			case history.WatchUploaded, history.WatchDownloaded, history.WatchIgnored, history.WatchCanceled:
-				return
+				if k.Size == size && k.Mtime == mtime {
+					return
+				}
+				// Changed since: a new version (see OnChange).
 			case history.WatchFailed:
 				if k.Attempts >= watchMaxRetries && k.Size == size && k.Mtime == mtime {
 					return // gave up on this version of the file
@@ -669,7 +685,7 @@ func (w *Watcher) scan(s *watchState) {
 		switch {
 		case now.Sub(o.since) < w.settle:
 			pending++
-		case mirror && l.same[sameKey(rel, size)]:
+		case mirror && !had && l.same[sameKey(rel, size)]: // a known file's match there is its earlier version
 			onFrameio = append(onFrameio, history.WatchFile{RelPath: rel, Size: size, Mtime: mtime, State: history.WatchIgnored})
 		case !w.written(local, size, now.Sub(o.since), netVol):
 			pending++
@@ -779,6 +795,7 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 
 	var recMu sync.Mutex
 	recorded := map[string]bool{}
+	var earlier map[string]string // rel path -> its earlier copy on Frame.io; set before any file starts
 	// A batch the user cancels stays canceled: those files aren't picked up again.
 	j.onFinish = func(j *Job) {
 		if !j.userCanceled.Load() {
@@ -821,6 +838,13 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 		recMu.Lock()
 		recorded[f.RelPath] = true
 		recMu.Unlock()
+		if old := earlier[f.RelPath]; old != "" && st == Done && x.Downloads() {
+			// The earlier version stays listed (kept, or until it's deleted): it
+			// mustn't be downloaded over the new one.
+			w.recordRemote(s, x, []history.WatchRemote{{RemoteID: old, RelPath: f.RelPath, State: history.WatchIgnored,
+				Error: "earlier version"}}, []history.WatchFile{wf})
+			return
+		}
 		w.record(s, x, []history.WatchFile{wf})
 	}
 
@@ -855,9 +879,64 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 			f.RemoteParent = ids[parentDir(f.RelPath)]
 			f.mu.Unlock()
 		}
+		overwrite := x.OnChange == history.OnChangeOverwrite
+		if overwrite || x.Downloads() {
+			if earlier, err = earlierVersions(j.ctx, m.API, x.AccountID, list, known); err != nil {
+				setupFailed = j.ctx.Err() == nil
+				j.fail(err)
+				w.setErr(s, err.Error())
+				return
+			}
+		}
+		if overwrite {
+			for _, f := range list {
+				f.mu.Lock()
+				f.replaces = earlier[f.RelPath]
+				f.mu.Unlock()
+			}
+		}
 		j.setStatus(Running)
 		j.runFiles(j.uploadFile)
 	}()
+}
+
+// earlierVersions finds, by rel path, the Frame.io copy of each file the watch
+// has a record of: the file with its name in its Frame.io folder, the one the
+// watch uploaded or downloaded if there are several. A copy that was renamed,
+// moved or put in a version stack doesn't count, nor does an ambiguous name.
+func earlierVersions(ctx context.Context, c *api.Client, acct string, files []*File, known map[string]history.WatchFile) (map[string]string, error) {
+	out := map[string]string{}
+	kids := map[string][]api.Asset{} // Frame.io folder ID -> its children
+	for _, f := range files {
+		k, ok := known[f.RelPath]
+		if !ok {
+			continue // a new file
+		}
+		f.mu.Lock()
+		parent := f.RemoteParent
+		f.mu.Unlock()
+		list, ok := kids[parent]
+		if !ok {
+			var err error
+			if list, err = c.Children(ctx, acct, parent); err != nil {
+				return nil, fmt.Errorf("listing Frame.io folder: %w", err)
+			}
+			kids[parent] = list
+		}
+		var same []string
+		for _, a := range list {
+			if a.Type == "file" && a.Name == f.Name {
+				same = append(same, a.ID)
+			}
+		}
+		switch {
+		case slices.Contains(same, k.RemoteID):
+			out[f.RelPath] = k.RemoteID
+		case len(same) == 1:
+			out[f.RelPath] = same[0]
+		}
+	}
+	return out, nil
 }
 
 // claim makes j the watch's running batch, unless the watch was paused,

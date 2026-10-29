@@ -267,7 +267,13 @@
       <div class="edit-row">
         <div class="edit-label">Direction</div>
         <div class="segmented" id="we-dir">
-          <button data-dir="upload" title="New files here go to Frame.io">Upload</button><button data-dir="download" title="New files on Frame.io come here">Download</button><button data-dir="mirror" title="New files go both ways. Nothing is deleted.">Mirror</button>
+          <button data-dir="upload" title="New files here go to Frame.io">Upload</button><button data-dir="download" title="New files on Frame.io come here">Download</button><button data-dir="mirror" title="New files go both ways. Deletions aren't copied.">Mirror</button>
+        </div>
+      </div>
+      <div class="edit-row" id="we-change-row">
+        <div class="edit-label">Changed files</div>
+        <div class="segmented" id="we-change">
+          <button data-change="overwrite" title="A re-rendered file replaces its earlier upload on Frame.io">Overwrite</button><button data-change="keep" title="A re-rendered file uploads next to its earlier upload">Keep both</button>
         </div>
       </div>
       <div class="edit-row">
@@ -299,7 +305,7 @@
     <div class="modal-head">
       <div class="modal-title">Upload to</div>
       <div class="segmented hidden" id="dest-dir">
-        <button data-dir="upload" title="New files here go to Frame.io">Upload</button><button data-dir="download" title="New files on Frame.io come here">Download</button><button data-dir="mirror" title="New files go both ways. Nothing is deleted.">Mirror</button>
+        <button data-dir="upload" title="New files here go to Frame.io">Upload</button><button data-dir="download" title="New files on Frame.io come here">Download</button><button data-dir="mirror" title="New files go both ways. Deletions aren't copied.">Mirror</button>
       </div>
       <button class="icon-btn" id="dest-close" title="Close"><svg viewBox="0 0 20 20"><path d="M6 6l8 8M14 6l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
     </div>
@@ -309,13 +315,20 @@
     </div>
     <div class="crumbs" id="dest-crumbs"></div>
     <div class="dest-list" id="dest-list"></div>
+    <div class="dest-opts hidden" id="dest-opts">
+      <span class="dest-opt-label" id="dest-change-label">Changed files</span>
+      <div class="segmented" id="dest-change">
+        <button data-change="overwrite" title="A re-rendered file replaces its earlier upload on Frame.io">Overwrite</button><button data-change="keep" title="A re-rendered file uploads next to its earlier upload">Keep both</button>
+      </div>
+      <div class="grow"></div>
+      <label class="check"><input type="checkbox" id="dest-existing"><span>Include existing files</span></label>
+    </div>
     <div class="modal-foot">
       <div class="newfolder">
         <input id="newfolder-name" type="text" placeholder="Name" class="hidden">
         <button class="btn subtle" id="newfolder-btn" disabled>New folder</button>
       </div>
       <div class="grow"></div>
-      <label class="check hidden" id="dest-existing-wrap"><input type="checkbox" id="dest-existing"><span>Include existing files</span></label>
       <button class="btn subtle" id="dest-cancel">Cancel</button>
       <button class="btn primary" id="dest-choose" disabled>Upload here</button>
     </div>

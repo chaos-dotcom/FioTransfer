@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS watch_remote(
 const (
 	DirUpload   = "upload"   // local folder → Frame.io
 	DirDownload = "download" // Frame.io → local folder
-	DirMirror   = "mirror"   // both ways; nothing is deleted on either side
+	DirMirror   = "mirror"   // both ways; a deletion on one side isn't copied to the other
 )
 
 type Watch struct {
@@ -38,7 +38,8 @@ type Watch struct {
 	// IgnoreRemote: the next Frame.io listing records what it finds as existing
 	// files instead of downloading them (set when downloading starts, unless
 	// existing files are included).
-	IgnoreRemote bool `json:"ignore_remote"`
+	IgnoreRemote bool   `json:"ignore_remote"`
+	OnChange     string `json:"on_change"` // OnChangeOverwrite or OnChangeKeep
 }
 
 func (w Watch) Uploads() bool   { return w.Direction != DirDownload }
@@ -47,9 +48,22 @@ func (w Watch) Downloads() bool { return w.Direction == DirDownload || w.Directi
 // ValidDirection reports whether d names a watch direction.
 func ValidDirection(d string) bool { return d == DirUpload || d == DirDownload || d == DirMirror }
 
+// What an uploading watch does with a local file that changed after it was
+// uploaded (a re-render): it uploads again either way.
+const (
+	OnChangeOverwrite = "overwrite" // the earlier copy on Frame.io is deleted once the new one is confirmed
+	OnChangeKeep      = "keep"      // both stay on Frame.io
+)
+
+// ValidOnChange reports whether c names a rule for changed files.
+func ValidOnChange(c string) bool { return c == OnChangeOverwrite || c == OnChangeKeep }
+
 // Watch file states. Local files (watch_files) are uploaded, downloaded,
-// failed, ignored or canceled; Frame.io files (watch_remote) are downloaded,
-// waiting, failed, ignored or canceled.
+// failed, ignored, canceled or queued; Frame.io files (watch_remote) are
+// downloaded, waiting, failed, ignored or canceled. A local file whose size or
+// mtime no longer match its uploaded, downloaded, ignored or canceled record is
+// a new version: it uploads again, and the watch's OnChange rule says whether
+// its earlier copy on Frame.io goes.
 const (
 	WatchUploaded   = "uploaded"
 	WatchDownloaded = "downloaded" // written by the watch from Frame.io
@@ -57,6 +71,7 @@ const (
 	WatchIgnored    = "ignored"  // existed before the watch was created, or already on the other side
 	WatchCanceled   = "canceled" // the user canceled its transfer; not retried automatically
 	WatchWaiting    = "waiting"  // Frame.io isn't serving the original yet; tried again at the next listing
+	WatchQueued     = "queued"   // to upload again (Retry, "Transfer them"); the record stays, so it's still a new version of its earlier copy
 )
 
 type WatchFile struct {
@@ -82,13 +97,13 @@ type WatchRemote struct {
 }
 
 func (s *Store) AddWatch(w Watch) error {
-	_, err := s.db.Exec(`INSERT INTO watches(id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote)
-		VALUES(?,?,?,?,?,?,?,?,?)`, w.ID, w.LocalPath, w.AccountID, w.FolderID, w.DestLabel, w.Enabled, w.CreatedAt, w.Direction, w.IgnoreRemote)
+	_, err := s.db.Exec(`INSERT INTO watches(id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote, on_change)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, w.ID, w.LocalPath, w.AccountID, w.FolderID, w.DestLabel, w.Enabled, w.CreatedAt, w.Direction, w.IgnoreRemote, w.OnChange)
 	return err
 }
 
 func (s *Store) Watches() ([]Watch, error) {
-	rows, err := s.db.Query(`SELECT id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote
+	rows, err := s.db.Query(`SELECT id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote, on_change
 		FROM watches ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -97,7 +112,7 @@ func (s *Store) Watches() ([]Watch, error) {
 	var out []Watch
 	for rows.Next() {
 		var w Watch
-		if err := rows.Scan(&w.ID, &w.LocalPath, &w.AccountID, &w.FolderID, &w.DestLabel, &w.Enabled, &w.CreatedAt, &w.Direction, &w.IgnoreRemote); err != nil {
+		if err := rows.Scan(&w.ID, &w.LocalPath, &w.AccountID, &w.FolderID, &w.DestLabel, &w.Enabled, &w.CreatedAt, &w.Direction, &w.IgnoreRemote, &w.OnChange); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
@@ -106,8 +121,8 @@ func (s *Store) Watches() ([]Watch, error) {
 }
 
 func (s *Store) UpdateWatch(w Watch) error {
-	_, err := s.db.Exec(`UPDATE watches SET local_path=?, account_id=?, folder_id=?, dest_label=?, direction=?, ignore_remote=? WHERE id=?`,
-		w.LocalPath, w.AccountID, w.FolderID, w.DestLabel, w.Direction, w.IgnoreRemote, w.ID)
+	_, err := s.db.Exec(`UPDATE watches SET local_path=?, account_id=?, folder_id=?, dest_label=?, direction=?, ignore_remote=?, on_change=? WHERE id=?`,
+		w.LocalPath, w.AccountID, w.FolderID, w.DestLabel, w.Direction, w.IgnoreRemote, w.OnChange, w.ID)
 	return err
 }
 
@@ -128,23 +143,24 @@ func (s *Store) ResetWatchRemotes(id string) {
 
 // RequeueCanceled lets canceled files transfer again.
 func (s *Store) RequeueCanceled(id string) {
-	s.db.Exec(`DELETE FROM watch_files WHERE watch_id=? AND state='canceled'`, id)
+	s.db.Exec(`UPDATE watch_files SET state='queued', attempts=0, error='' WHERE watch_id=? AND state='canceled'`, id)
 	s.db.Exec(`DELETE FROM watch_remote WHERE watch_id=? AND state='canceled'`, id)
 }
 
-// ForgetWatchFiles drops the failed and canceled records of these local files
-// so the watch uploads them again.
-func (s *Store) ForgetWatchFiles(id string, rels []string) error {
-	return s.forget(`DELETE FROM watch_files WHERE watch_id=? AND rel_path=? AND state IN ('failed','canceled')`, id, rels)
+// RequeueWatchFiles queues these local files to upload again if their records
+// are failed or canceled.
+func (s *Store) RequeueWatchFiles(id string, rels []string) error {
+	return s.execEach(`UPDATE watch_files SET state='queued', attempts=0, error='' WHERE watch_id=? AND rel_path=? AND state IN ('failed','canceled')`, id, rels)
 }
 
 // ForgetWatchRemotes drops the failed, waiting and canceled records of these
 // Frame.io files so the watch downloads them again.
 func (s *Store) ForgetWatchRemotes(id string, remoteIDs []string) error {
-	return s.forget(`DELETE FROM watch_remote WHERE watch_id=? AND remote_id=? AND state IN ('failed','waiting','canceled')`, id, remoteIDs)
+	return s.execEach(`DELETE FROM watch_remote WHERE watch_id=? AND remote_id=? AND state IN ('failed','waiting','canceled')`, id, remoteIDs)
 }
 
-func (s *Store) forget(query, id string, keys []string) error {
+// execEach runs query once per key, in one transaction.
+func (s *Store) execEach(query, id string, keys []string) error {
 	if len(keys) == 0 {
 		return nil
 	}

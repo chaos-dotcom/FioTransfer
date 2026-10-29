@@ -48,7 +48,7 @@ func TestWatchDownload(t *testing.T) {
 	defer w.Close()
 	root := t.TempDir()
 	fake.addRemote("dest", "old.mov", randBytes(70, 1000)) // there before the watch: left alone
-	x, err := w.Add(root, "acct", "dest", "P / In", history.DirDownload, false)
+	x, err := w.Add(root, "acct", "dest", "P / In", history.DirDownload, history.OnChangeOverwrite, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestWatchMirror(t *testing.T) {
 	fake.addRemote("dest", "remote.mov", remote)
 	v2 := randBytes(85, 1600)
 	fake.addStack("dest", "grade", []string{"grade_v1.mov", "grade_v2.mov"}, [][]byte{randBytes(86, 1500), v2})
-	if _, err := w.Add(root, "acct", "dest", "P / Sync", history.DirMirror, true); err != nil {
+	if _, err := w.Add(root, "acct", "dest", "P / Sync", history.DirMirror, history.OnChangeOverwrite, true); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "existing files both ways", 10*time.Second, func() bool {
@@ -188,7 +188,7 @@ func TestWatchDirectionChange(t *testing.T) {
 	w := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond)
 	defer w.Close()
 	root := t.TempDir()
-	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, false)
+	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, history.OnChangeOverwrite, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestWatchDirectionChange(t *testing.T) {
 	waitFor(t, "upload", 10*time.Second, func() bool { return fake.assembled("dest")["a.mov"] != nil })
 	fake.addRemote("dest", "there.mov", randBytes(91, 800))
 
-	if err := w.Update(x.ID, root, "acct", "dest", "P", history.DirMirror, false); err != nil {
+	if err := w.Update(x.ID, root, "acct", "dest", "P", history.DirMirror, history.OnChangeOverwrite, false); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "listing", 5*time.Second, func() bool { return listed(w, x.ID) })
@@ -208,7 +208,7 @@ func TestWatchDirectionChange(t *testing.T) {
 		t.Errorf("local files = %v", got)
 	}
 
-	if err := w.Update(x.ID, root, "acct", "dest", "P", history.DirUpload, false); err != nil {
+	if err := w.Update(x.ID, root, "acct", "dest", "P", history.DirUpload, history.OnChangeOverwrite, false); err != nil {
 		t.Fatal(err)
 	}
 	fake.addRemote("dest", "after.mov", randBytes(93, 600))

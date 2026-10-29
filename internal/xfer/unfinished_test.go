@@ -295,7 +295,7 @@ func TestWatchWaitsForUnfinishedRender(t *testing.T) {
 	w := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond)
 	defer w.Close()
 	root := t.TempDir()
-	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, false)
+	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, history.OnChangeOverwrite, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestWatchFileChangedMidUploadSettlesAgain(t *testing.T) {
 	w := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond)
 	defer w.Close()
 	root := t.TempDir()
-	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, false)
+	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, history.OnChangeOverwrite, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -225,6 +225,8 @@ function bindUI() {
   $('#we-save').addEventListener('click', saveWatchEdit);
   $$('#dest-dir button').forEach((b) => b.addEventListener('click', () => { D.watchDir = b.dataset.dir; renderDestTitle(); }));
   $$('#we-dir button').forEach((b) => b.addEventListener('click', () => { WE.dir = b.dataset.dir; renderWatchEdit(); }));
+  $$('#dest-change button').forEach((b) => b.addEventListener('click', () => { D.watchChange = b.dataset.change; renderDestTitle(); }));
+  $$('#we-change button').forEach((b) => b.addEventListener('click', () => { WE.change = b.dataset.change; renderWatchEdit(); }));
   $('#we-local-btn').addEventListener('click', async () => {
     const p = await call('PickWatchFolder');
     if (!p) return;
@@ -454,6 +456,7 @@ function nextWatch() {
   showView('watch');
   D.watchPath = p;
   D.watchDir = 'upload';
+  D.watchChange = 'overwrite';
   openDest('watch');
 }
 
@@ -711,14 +714,14 @@ async function retry(id) {
 // ---------- destination picker ----------
 // items: the current level; q: the search text, matched against items here and
 // (hits) against the whole account; rows: what the list shows, for the keyboard.
-const D = { stack: [], mode: 'upload', watchPath: '', watchDir: 'upload', items: null, err: '', q: '', hits: null, hitsErr: '', rows: [], sel: 0, kbd: false, seq: 0, qseq: 0 };
+const D = { stack: [], mode: 'upload', watchPath: '', watchDir: 'upload', watchChange: 'overwrite', items: null, err: '', q: '', hits: null, hitsErr: '', rows: [], sel: 0, kbd: false, seq: 0, qseq: 0 };
 const DIR_ARROW = { upload: '→', download: '←', mirror: '↔' };
 
 // start: the path to open at, or a function returning a promise of one.
 function openDest(mode = 'upload', onPick = null, start = null) {
   D.mode = mode;
   D.onPick = onPick;
-  $('#dest-existing-wrap').classList.toggle('hidden', mode !== 'watch');
+  $('#dest-opts').classList.toggle('hidden', mode !== 'watch');
   $('#dest-dir').classList.toggle('hidden', mode !== 'watch');
   $('#dest-existing').checked = false;
   renderDestTitle();
@@ -774,6 +777,9 @@ async function destPath() {
 }
 function renderDestTitle() {
   $$('#dest-dir button').forEach((b) => b.classList.toggle('active', b.dataset.dir === D.watchDir));
+  $$('#dest-change button').forEach((b) => b.classList.toggle('active', b.dataset.change === D.watchChange));
+  $('#dest-change').classList.toggle('hidden', !ups(D.watchDir));
+  $('#dest-change-label').classList.toggle('hidden', !ups(D.watchDir));
   const n = S.pendingPaths ? S.pendingPaths.length : 0;
   $('#dest-modal .modal-title').textContent = D.mode === 'watch' ? `${baseName(D.watchPath)} ${DIR_ARROW[D.watchDir]} Frame.io`
     : D.mode === 'pick' ? 'Frame.io folder' : n === 1 ? `Upload ${baseName(S.pendingPaths[0])} to` : n ? `Upload ${n} items to` : 'Upload to';
@@ -957,7 +963,7 @@ async function chooseDest() {
   }
   if (D.mode === 'watch') {
     try {
-      await call('AddWatch', D.watchPath, D.stack[0].id, t.folder_id, destLabel(), D.watchDir, $('#dest-existing').checked);
+      await call('AddWatch', D.watchPath, D.stack[0].id, t.folder_id, destLabel(), D.watchDir, D.watchChange, $('#dest-existing').checked);
       $('#dest-modal').classList.add('hidden');
       showView('watch');
       nextWatch();
@@ -1070,6 +1076,7 @@ async function addWatch() {
   if (!p) return;
   D.watchPath = p;
   D.watchDir = 'upload';
+  D.watchChange = 'overwrite';
   openDest('watch');
 }
 
@@ -1136,7 +1143,7 @@ const WE = {};
 
 function openWatchEdit(w) {
   const dir = w.direction || 'upload';
-  Object.assign(WE, { id: w.id, local: w.local_path, acct: w.account_id, folder: w.folder_id, label: w.dest_label, dir, canceled: w.canceled,
+  Object.assign(WE, { id: w.id, local: w.local_path, acct: w.account_id, folder: w.folder_id, label: w.dest_label, dir, change: w.on_change || 'overwrite', canceled: w.canceled,
     orig: { local: w.local_path, acct: w.account_id, folder: w.folder_id, dir } });
   $('#we-existing').checked = false;
   renderWatchEdit();
@@ -1149,6 +1156,8 @@ function renderWatchEdit() {
   $('#we-dest').textContent = WE.label;
   $('#we-dest').title = WE.label;
   $$('#we-dir button').forEach((b) => b.classList.toggle('active', b.dataset.dir === WE.dir));
+  $$('#we-change button').forEach((b) => b.classList.toggle('active', b.dataset.change === WE.change));
+  $('#we-change-row').classList.toggle('hidden', !ups(WE.dir));
   $('#we-existing-row').classList.toggle('hidden', !freshSide());
   $('#we-canceled-row').classList.toggle('hidden', !WE.canceled);
   $('#we-requeue').textContent = { upload: 'Upload them', download: 'Download them', mirror: 'Transfer them' }[WE.orig.dir];
@@ -1167,7 +1176,7 @@ function closeWatchEdit() { $('#watch-modal').classList.add('hidden'); }
 
 async function saveWatchEdit() {
   try {
-    await call('UpdateWatch', WE.id, WE.local, WE.acct, WE.folder, WE.label, WE.dir, $('#we-existing').checked);
+    await call('UpdateWatch', WE.id, WE.local, WE.acct, WE.folder, WE.label, WE.dir, WE.change, $('#we-existing').checked);
     closeWatchEdit();
     loadWatches();
   } catch (e) { toast(errMsg(e), 'err'); }

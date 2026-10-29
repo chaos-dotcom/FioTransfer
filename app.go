@@ -872,9 +872,10 @@ func (a *App) ClipboardText() string {
 
 func (a *App) Watches() []xfer.WatchView { return a.wat.Views() }
 
-// AddWatch creates a watch folder; dir is upload, download or mirror.
-func (a *App) AddWatch(local, acct, folder, label, dir string, includeExisting bool) error {
-	_, err := a.wat.Add(local, acct, folder, label, dir, includeExisting)
+// AddWatch creates a watch folder; dir is upload, download or mirror, and
+// onChange (overwrite or keep) what happens to the earlier copy of a re-rendered file.
+func (a *App) AddWatch(local, acct, folder, label, dir, onChange string, includeExisting bool) error {
+	_, err := a.wat.Add(local, acct, folder, label, dir, onChange, includeExisting)
 	return err
 }
 
@@ -893,8 +894,8 @@ func (a *App) setOpenAtLogin(on bool) error {
 	return err
 }
 
-func (a *App) UpdateWatch(id, local, acct, folder, label, dir string, includeExisting bool) error {
-	return a.wat.Update(id, local, acct, folder, label, dir, includeExisting)
+func (a *App) UpdateWatch(id, local, acct, folder, label, dir, onChange string, includeExisting bool) error {
+	return a.wat.Update(id, local, acct, folder, label, dir, onChange, includeExisting)
 }
 
 func (a *App) RequeueCanceled(id string) { a.wat.RequeueCanceled(id) }

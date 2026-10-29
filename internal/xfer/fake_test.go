@@ -77,6 +77,7 @@ type fakeFrameio struct {
 	apiCalls     atomic.Int64
 	listCalls    atomic.Int64  // share folder listings (GraphQL)
 	failChildren atomic.Bool   // folder listings are refused (403)
+	childCalls   atomic.Int64  // folder listings (GET folders/{id}/children)
 	putDelay     atomic.Int64  // slow storage (ns)
 	assemblyTime time.Duration // Frame.io reports complete this long after the last part
 	failAssembly string        // Frame.io reports this file name as failed after upload
@@ -549,6 +550,7 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(201)
 		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": fmt.Sprintf("share-%d", n), "short_url": fmt.Sprintf("https://f.io/s%d", n)}})
 	case r.Method == "GET" && len(parts) == 6 && parts[3] == "folders" && parts[5] == "children":
+		f.childCalls.Add(1)
 		if f.failChildren.Load() {
 			http.Error(w, `{"errors":[{"detail":"forbidden"}]}`, 403)
 			return
@@ -632,12 +634,19 @@ func (f *fakeFrameio) rest(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.mu.Lock()
-		up, ok := f.uploads[parts[4]]
-		if ok {
+		name := ""
+		if up, ok := f.uploads[parts[4]]; ok {
+			name = up.name
 			delete(f.uploads, parts[4])
+		} else if r, ok := f.remote[parts[4]]; ok && r.versions == nil {
+			name = r.name
+			delete(f.remote, parts[4])
+		}
+		ok := name != ""
+		if ok {
 			delete(f.assets, parts[4])
 			f.deleted = append(f.deleted, parts[4])
-			f.deletedNames = append(f.deletedNames, parts[4]+" ("+up.name+")")
+			f.deletedNames = append(f.deletedNames, parts[4]+" ("+name+")")
 		}
 		f.mu.Unlock()
 		if !ok {
@@ -730,6 +739,20 @@ func (f *fakeFrameio) deletedFiles() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.deleted)
+}
+
+// uploadsNamed returns the IDs of complete uploads with this name, in any folder.
+func (f *fakeFrameio) uploadsNamed(name string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for id, up := range f.uploads {
+		if up.name == name && !slices.ContainsFunc(up.parts, func(p []byte) bool { return p == nil }) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 // assembled returns uploaded content by "parentFolderPath/name".
