@@ -2,3 +2,6 @@ target/
 FioTransfer.app/
 /bin/
 *.proptest-regressions
+# the wasm capture build output (egui-ui/bench/wasm-shots.sh builds it)
+egui-ui/web/dist/
+__pycache__/
