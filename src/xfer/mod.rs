@@ -351,13 +351,30 @@ impl Job {
 
     /// Publishes the job's file list (read concurrently by the UI) and seeds
     /// the per-status counts.
+    ///
+    /// The published list is the authority for the counts, so they are
+    /// recounted from it rather than added to what they were: a file that
+    /// changed status before its list went out (or a republished list) must not
+    /// be counted twice, or the view reports more done files than the job has.
     pub fn set_files(&self, fs: Vec<Arc<File>>) {
+        let mut counts = [0i32; 5];
         for f in &fs {
-            if let Some(c) = self.counter(f.status()) {
-                c.fetch_add(1, Ordering::Relaxed);
-            }
+            let slot = match f.status() {
+                Status::Done => 0,
+                Status::Failed => 1,
+                Status::Skipped => 2,
+                Status::Canceled => 3,
+                Status::Running => 4,
+                _ => continue,
+            };
+            counts[slot] += 1;
         }
         *self.files.lock().unwrap() = fs;
+        self.n_done.store(counts[0], Ordering::Relaxed);
+        self.n_failed.store(counts[1], Ordering::Relaxed);
+        self.n_skipped.store(counts[2], Ordering::Relaxed);
+        self.n_canceled.store(counts[3], Ordering::Relaxed);
+        self.n_active.store(counts[4], Ordering::Relaxed);
     }
 
     pub fn files(&self) -> Vec<Arc<File>> {
@@ -575,4 +592,79 @@ pub fn fmt_dur(sec: f64) -> String {
     } else {
         format!("{}s", s)
     }
+}
+
+// ---------- Tests ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manager whose history and log dirs are in a tempdir: the job model
+    /// needs one to make a job, and nothing here may touch the real profile.
+    fn manager() -> (tokio::runtime::Runtime, Arc<Manager>, tempfile::TempDir) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().to_path_buf();
+        std::fs::create_dir_all(base.join("hist")).expect("hist");
+        std::fs::create_dir_all(base.join("logs")).expect("logs");
+        let m = rt.block_on(async {
+            let api = Arc::new(crate::api::Client::new(crate::auth::AuthManager::new_static("t")));
+            let hist = Arc::new(history::Store::open(&base.join("hist"), &base.join("logs")).expect("store"));
+            manager::new_tuned(
+                api,
+                hist,
+                Box::new(|| {
+                    let mut s = Settings::default();
+                    s.streams = 4;
+                    s.no_folder_logs = true;
+                    s
+                }),
+                manager::Tune::default(),
+            )
+        });
+        (rt, m, dir)
+    }
+
+    /// A file that is finished before its list is published must be counted
+    /// once. `set_files` seeds the per-status counts from the list, and a
+    /// `set_status` before the publish has already moved them, so seeding has
+    /// to start from zero: otherwise the UI reports more done files than the
+    /// job has (`files_done > files_total`), which no view may ever show.
+    #[test]
+    fn publishing_the_file_list_counts_each_file_once() {
+        let (_rt, m, _dir) = manager();
+        let j = m.new_job("download");
+        let a = Arc::new(File::new(0, "a.mov", "a.mov", "/tmp/a.mov", 10));
+        let b = Arc::new(File::new(1, "b.mov", "b.mov", "/tmp/b.mov", 20));
+        let c = Arc::new(File::new(2, "c.mov", "c.mov", "/tmp/c.mov", 30));
+        for f in [&a, &b, &c] {
+            f.attach(&j);
+        }
+        // two files were settled before the list went out: one already on disk,
+        // one skipped for being empty
+        a.set_status(Status::Done, "");
+        c.set_status(Status::Skipped, "");
+        j.set_files(vec![a.clone(), b.clone(), c.clone()]);
+        let v = j.view();
+        assert_eq!(v.files_total, 3);
+        assert_eq!(j.counts(), (1, 0, 1, 0), "each file is counted once, and only once");
+        assert_eq!(v.files_done, 2, "one done plus one skipped");
+        assert_eq!(v.files_active, 0);
+        assert!(v.files_done + v.files_failed + v.files_active <= v.files_total);
+        // republishing the same list must not count them again either
+        j.set_files(vec![a.clone(), b.clone(), c.clone()]);
+        let v = j.view();
+        assert_eq!(j.counts(), (1, 0, 1, 0));
+        assert!(v.files_done + v.files_failed + v.files_active <= v.files_total);
+        // and moving a file on afterwards still lands on the right count
+        b.set_status(Status::Running, "");
+        let v = j.view();
+        assert_eq!((v.files_done, v.files_active), (2, 1));
+        b.set_status(Status::Failed, "");
+        let v = j.view();
+        assert_eq!((v.files_done, v.files_active, v.files_failed), (2, 0, 1));
+        assert_eq!(j.counts(), (1, 1, 1, 0));
+    }
+
 }
