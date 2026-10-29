@@ -1,5 +1,9 @@
 # FioTransfer in Rust
 
+This repository is the Rust application. The original Go app is kept under
+`legacy-go/` for reference and for the before/after measurements; it is not
+built and not shipped.
+
 A port of [FioTransfer](../FioTransfer) (Go + Wails) to Rust. The window, the
 frontend, the menu bar item, the download panel and the Finder services are the
 same as the Go app's — the same bytes, the same WebKit engine, the same
