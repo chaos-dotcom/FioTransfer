@@ -36,13 +36,13 @@ generator):
 | --- | --- | --- | --- |
 | `tests/proptests.rs` | seed suite: limiter, buffer pool, ledger, route keys, paths, CSV | 14 | – |
 | `tests/prop_sync.rs` | `Limiter` | 6 | 4/4 caught |
-| `tests/prop_state.rs` | upload ledger, download block resume, history store | 12 | machine-checked, see the suite |
+| `tests/prop_state.rs` | ledger resume set + staleness + `keeps_file`; `done` file as a set; history store against an insert/update/list model; `mark_interrupted`; CSV with adversarial fields; rows survive close/reopen; watch rows as a map | 12 | not returned by the worker; see tests |
 | `tests/prop_parse.rs` | `route_key`, `safe_name` | 9 | 3/3 caught |
 | `tests/prop_watch.rs` | watch folders, folder logs | 7 (+23 lib) | 14/14 caught |
 | `tests/prop_shares.rs` | six link providers | 14 (+27 lib) | 30/30 caught |
 | `tests/prop_model.rs` | job/file counters, `view()`, `snapshot()`, scanning | 12 (+33 lib) | 24/24 caught |
 | `tests/prop_engine.rs` | media-atom parser, part tiling, backoff | 16 | 5 caught, 1 equivalent, 1 survivor→strengthened |
-| `tests/prop_bridge.rs` | bridge surface, CLI flags | 12 | |
+| `tests/prop_bridge.rs` | the method list scraped from `app.js` vs the dispatch arms (a missing arm fails); dispatch totality; `null` vs missing arguments in every position; documented JSON shapes; `SaveSettings` as a fixed point; a bad settings payload changes nothing; upload-destination round trip | 12 | not returned by the worker; see tests |
 
 ## Evidence
 
