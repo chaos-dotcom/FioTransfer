@@ -470,14 +470,17 @@ fn paint(painter: &Painter, rect: Rect, glyph: Glyph, colour: Color32, size: f32
             painter.add(shape);
         }
         Glyph::Pencil => {
-            painter.line_segment(
-                [pos2(c.x - s * 0.5, c.y + s * 0.5), pos2(c.x + s * 0.55, c.y - s * 0.55)],
+            // The stylesheet's `I.pencil`: a shaft along the diagonal with a
+            // pointed tip at the lower left and the eraser line across the top.
+            // (The previous two strokes read as a golf club at 18 px.)
+            let map = |x: f32, y: f32| {
+                pos2(c.x + (x - 10.0) / 10.0 * s, c.y + (y - 10.0) / 10.0 * s)
+            };
+            painter.add(egui::Shape::closed_line(
+                vec![map(4.0, 16.0), map(4.7, 12.8), map(13.3, 4.2), map(15.3, 6.2), map(6.7, 14.8)],
                 stroke,
-            );
-            painter.line_segment(
-                [pos2(c.x - s * 0.5, c.y + s * 0.5), pos2(c.x - s * 0.1, c.y + s * 0.55)],
-                Stroke::new(2.2_f32, colour),
-            );
+            ));
+            painter.line_segment([map(12.8, 4.7), map(15.3, 7.2)], stroke);
         }
         Glyph::Reveal => {
             painter.circle_stroke(
