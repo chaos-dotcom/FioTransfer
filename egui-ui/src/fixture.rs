@@ -7,10 +7,7 @@
 //!
 //! Nothing here does I/O or touches a screen: it builds a [`UiState`] and stops.
 
-use crate::model::{
-    FileView, HistoryRow, JobView, Settings, Snapshot, Toast, ToastKind, UiState, UpdateState, User,
-    View, WatchRow,
-};
+use crate::model::{FileView, HistoryRow, JobView, Settings, Snapshot, Toast, ToastKind, UiState, UpdateState, User, View, WatchRow, Crumb};
 
 fn job(
     id: &str,
@@ -41,7 +38,7 @@ pub fn fixture_state(view: View) -> UiState {
         8_400_000_000,
         3_150_000_000,
     );
-    upload.source = "/Users/editor/Renders/A007_C012_sh010_v003.mov".into();
+    upload.source = "/Users/dana/Renders/A007_C012_sh010_v003.mov".into();
     upload.dest = "Shows / Nightfall / Ep 04 / Renders".into();
     upload.phase = "Uploading 3 of 8 files".into();
     upload.speed = 92_400_000.0;
@@ -60,7 +57,7 @@ pub fn fixture_state(view: View) -> UiState {
         21_500_000_000,
     );
     download.source = "https://f.io/9f2c1a".into();
-    download.dest = "/Users/editor/Downloads/Nightfall_Ep04_Dailies".into();
+    download.dest = "/Users/dana/Downloads/Nightfall_Ep04_Dailies".into();
     download.files_total = 42;
     download.files_done = 42;
     download.elapsed = 754.0;
@@ -117,14 +114,14 @@ pub fn fixture_state(view: View) -> UiState {
 
     let watches = vec![
         WatchRow {
-            local: "/Users/editor/Renders".into(),
+            local: "/Users/dana/Renders".into(),
             label: "Shows / Nightfall / Ep 04 / Renders".into(),
             direction: "upload".into(),
             enabled: true,
             pending: 3,
         },
         WatchRow {
-            local: "/Users/editor/Downloads/Dailies".into(),
+            local: "/Users/dana/Downloads/Dailies".into(),
             label: "Shows / Nightfall / Ep 04 / Dailies".into(),
             direction: "download".into(),
             enabled: false,
@@ -144,11 +141,24 @@ pub fn fixture_state(view: View) -> UiState {
             redirect_port: 8765,
             streams: 16,
             segment_mb: 64,
-            download_dir: "/Users/editor/Downloads/FioTransfer".into(),
+            download_dir: "/Users/dana/Downloads/FioTransfer".into(),
             no_folder_logs: false,
             no_update_check: false,
             last_folder_label: "Shows / Nightfall / Ep 04 / Renders".into(),
         },
+        // The composer starts empty, as it does in the web front end: no link
+        // typed, so no preview and Download stays dim.
+        link: String::new(),
+        passphrase: String::new(),
+        new_folder: false,
+        download_dir: "/Users/dana/Downloads/FioTransfer".into(),
+        link_info: None,
+        dest_path: vec![
+            Crumb { kind: "workspace".into(), name: "Shows".into() },
+            Crumb { kind: "project".into(), name: "Nightfall".into() },
+            Crumb { kind: "folder".into(), name: "Ep 04".into() },
+            Crumb { kind: "folder".into(), name: "Renders".into() },
+        ],
         snapshot: Snapshot {
             jobs: vec![upload, download],
             speed: 92_400_000.0,

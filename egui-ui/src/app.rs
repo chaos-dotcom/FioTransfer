@@ -188,6 +188,8 @@ pub fn page_head(ui: &mut egui::Ui, title: &str, actions: impl FnOnce(&mut egui:
 /// variable font's full axis range, so the stylesheet's file is decompressed to
 /// this TTF once and shipped in `assets/`. Sizes and weights are the theme's.
 const INTER_TTF: &[u8] = include_bytes!("../assets/InterVariable.ttf");
+const INTER_MEDIUM: &[u8] = include_bytes!("../assets/Inter-Medium.ttf");
+const INTER_SEMIBOLD: &[u8] = include_bytes!("../assets/Inter-SemiBold.ttf");
 
 /// Apply [`crate::theme`] and the Inter face to a context, once per context.
 ///
@@ -215,6 +217,24 @@ fn install_fonts(ctx: &egui::Context) {
         "inter".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(INTER_TTF)),
     );
+    // The stylesheet asks for 500 and 600 in places; epaint draws one weight per
+    // face, so the two static instances are registered as families of their own
+    // with the regular face behind them as a glyph fallback.
+    fonts.font_data.insert(
+        "inter-medium".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(INTER_MEDIUM)),
+    );
+    fonts.font_data.insert(
+        "inter-semibold".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(INTER_SEMIBOLD)),
+    );
+    for (family, face) in [("medium", "inter-medium"), ("semibold", "inter-semibold")] {
+        let list = fonts.families.entry(egui::FontFamily::Name(family.into())).or_default();
+        list.insert(0, face.to_owned());
+        list.push("inter".to_owned());
+        list.push("NotoEmoji-Regular".to_owned());
+        list.push("emoji-icon-font".to_owned());
+    }
     fonts
         .families
         .entry(egui::FontFamily::Proportional)

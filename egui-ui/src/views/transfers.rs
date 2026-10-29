@@ -566,15 +566,27 @@ fn button(ui: &mut Ui, rect: Rect, label: &str, primary: bool, enabled: bool) ->
         (fill, theme::stroke_border_2(), theme::TEXT_BODY)
     };
     let dim = if enabled { 1.0 } else { 0.4 };
-    ui.put(
-        rect,
-        Button::new(RichText::new(label).size(T_BODY).color(color.gamma_multiply(dim)))
-            .fill(fill.gamma_multiply(dim))
-            .stroke(stroke)
-            .corner_radius(theme::R_S)
-            .min_size(rect.size())
-            .wrap_mode(TextWrapMode::Truncate),
-    )
+    ui.scope(|ui| {
+        tight(ui);
+        ui.put(
+            rect,
+            Button::new(RichText::new(label).size(T_BODY).color(color.gamma_multiply(dim)))
+                .fill(fill.gamma_multiply(dim))
+                .stroke(stroke)
+                .corner_radius(theme::R_S)
+                .min_size(rect.size())
+                .wrap_mode(TextWrapMode::Truncate),
+        )
+    })
+    .inner
+}
+
+/// A widget I size myself takes exactly the rect it is given: the shell's style
+/// sets `button_padding: [12, 8]` and `interact_size: [60, 32]`, which would
+/// otherwise grow every `put` past its rect.
+fn tight(ui: &mut Ui) {
+    ui.spacing_mut().button_padding = Vec2::ZERO;
+    ui.spacing_mut().interact_size = Vec2::ZERO;
 }
 
 /// `.btn.subtle`: no fill, no border, `--text-2`, a `--hover` wash under the pointer.
@@ -582,15 +594,19 @@ fn subtle_button(ui: &mut Ui, rect: Rect, label: &str) -> egui::Response {
     let hovered = ui.rect_contains_pointer(rect);
     let fill = if hovered { theme::HOVER } else { Color32::TRANSPARENT };
     let color = if hovered { theme::TEXT } else { theme::TEXT_2 };
-    ui.put(
-        rect,
-        Button::new(RichText::new(label).size(T_BODY).color(color))
-            .fill(fill)
-            .stroke(Stroke::NONE)
-            .corner_radius(theme::R_S)
-            .min_size(rect.size())
-            .wrap_mode(TextWrapMode::Truncate),
-    )
+    ui.scope(|ui| {
+        tight(ui);
+        ui.put(
+            rect,
+            Button::new(RichText::new(label).size(T_BODY).color(color))
+                .fill(fill)
+                .stroke(Stroke::NONE)
+                .corner_radius(theme::R_S)
+                .min_size(rect.size())
+                .wrap_mode(TextWrapMode::Truncate),
+        )
+    })
+    .inner
 }
 
 // ---------- `.composer` ----------
@@ -901,14 +917,18 @@ fn link_field(ui: &mut Ui, rect: Rect, composer: &mut Composer) -> egui::Respons
     let fill = if hovered { theme::INPUT_BTN_HOVER } else { theme::RAISED };
     let color = if hovered { theme::TEXT } else { theme::TEXT_2 };
     let resp = ui
-        .put(
-            paste_rect,
-            Button::new(RichText::new(paste).size(T_DETAIL).color(color))
-                .fill(fill)
-                .stroke(Stroke::NONE)
-                .corner_radius(theme::R_MICRO)
-                .min_size(paste_rect.size()),
-        )
+        .scope(|ui| {
+            tight(ui);
+            ui.put(
+                paste_rect,
+                Button::new(RichText::new(paste).size(T_DETAIL).color(color))
+                    .fill(fill)
+                    .stroke(Stroke::NONE)
+                    .corner_radius(theme::R_MICRO)
+                    .min_size(paste_rect.size()),
+            )
+        })
+        .inner
         .on_hover_text("Paste from clipboard");
     if resp.clicked() {
         // egui has no clipboard *read* API: the button puts the caret in the field
@@ -923,15 +943,20 @@ fn link_field(ui: &mut Ui, rect: Rect, composer: &mut Composer) -> egui::Respons
 fn dir_button(ui: &mut Ui, rect: Rect, label: &str, state: &UiState) -> egui::Response {
     let hovered = ui.rect_contains_pointer(rect);
     let fill = if hovered { theme::RAISED } else { theme::CARD };
-    let resp = ui.put(
-        rect,
-        Button::new(RichText::new(label).size(T_BODY).color(theme::TEXT_BODY))
-            .fill(fill)
-            .stroke(theme::stroke_border_2())
-            .corner_radius(theme::R_S)
-            .min_size(rect.size())
-            .wrap_mode(TextWrapMode::Truncate),
-    );
+    let resp = ui
+        .scope(|ui| {
+            tight(ui);
+            ui.put(
+                rect,
+                Button::new(RichText::new(label).size(T_BODY).color(theme::TEXT_BODY))
+                    .fill(fill)
+                    .stroke(theme::stroke_border_2())
+                    .corner_radius(theme::R_S)
+                    .min_size(rect.size())
+                    .wrap_mode(TextWrapMode::Truncate),
+            )
+        })
+        .inner;
     // The glyph is painted over the button's own left padding.
     let painter = ui.painter().clone();
     let icon = Rect::from_center_size(pos2(rect.left() + 16.0, rect.center().y), vec2(16.0, 16.0));
@@ -973,12 +998,15 @@ fn comp_foot(ui: &mut Ui, composer: &mut Composer) -> Option<Action> {
                         let color = if composer.preview_warn { theme::NOTICE } else { theme::TEXT_2 };
                         line_left(ui, &painter, &composer.preview, T_NOTE, color, rect.left(), rect.center().y, rect.width());
                     }
-                    ui.spacing_mut().icon_width = size::CHECK;
-                    ui.spacing_mut().icon_spacing = space::M;
-                    ui.add(Checkbox::new(
-                        &mut composer.new_folder,
-                        RichText::new("New folder").size(T_NOTE).color(theme::TEXT_2),
-                    ));
+                    ui.scope(|ui| {
+                        ui.spacing_mut().interact_size = Vec2::ZERO;
+                        ui.spacing_mut().icon_width = size::CHECK;
+                        ui.spacing_mut().icon_spacing = space::M;
+                        ui.add(Checkbox::new(
+                            &mut composer.new_folder,
+                            RichText::new("New folder").size(T_NOTE).color(theme::TEXT_2),
+                        ));
+                    });
                     None
                 },
             )
@@ -1228,7 +1256,7 @@ fn actions_cell(ui: &mut Ui, rect: Rect, job: &JobView, is_open: bool) -> Option
     let mut icons: Vec<(Glyph, &str, Action)> = Vec::new();
     if shown.files {
         let label = if is_open { "Hide files" } else { "Show files" };
-        icons.push((Glyph::ChevronUp(if is_open { false } else { true }), label, Action::Toggle(job.id.clone())));
+        icons.push((Glyph::ChevronUp(!is_open), label, Action::Toggle(job.id.clone())));
     }
     if shown.cancel {
         icons.push((Glyph::Cancel, "Cancel", Action::Cancel(job.id.clone())));
@@ -2005,41 +2033,8 @@ mod tests {
 
 
 
-    #[test]
-    fn tmp_shell_width() {
-        let mut state = state_with(three_jobs(), Vec::new());
-        state.destination = "Acme / Delivery / Reel 1".to_string();
-        state.settings.download_dir = "/Users/chaos/Movies".to_string();
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(900.0, 700.0))
-            .build_ui_state(|ui, state: &mut UiState| show(ui, state), state);
-        harness.run();
-        for label in ["Delivery / Reel 1", "Files…", "Download", "Paste", "New folder", "clip-a.mov"] {
-            if let Some(n) = harness.query_by_label(label) {
-                let r = n.rect();
-                println!("{label:18} y {:.0}..{:.0}  x {:.0}..{:.0}", r.top(), r.bottom(), r.left(), r.right());
-            }
-        }
-    }
 
 
-    #[test]
-    fn tmp_shell_render() {
-        use crate::fixture::fixture_state;
-        use crate::model::View;
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1180.0, 780.0))
-            .build_state(|ctx, app: &mut crate::FioApp| app.draw(ctx), crate::FioApp::new(fixture_state(View::Transfers)));
-        harness.run();
-        for label in ["Files…", "Folder…", "Paste", "Download", "New folder", "clip"] {
-            if let Some(n) = harness.query_by_label_contains(label) {
-                let r = n.rect();
-                println!("{label:12} y {:.0}..{:.0}  x {:.0}..{:.0}", r.top(), r.bottom(), r.left(), r.right());
-            } else {
-                println!("{label:12} NOT FOUND");
-            }
-        }
-    }
 
     #[test]
     fn a_job_with_many_files_draws_its_own_scroll_box() {

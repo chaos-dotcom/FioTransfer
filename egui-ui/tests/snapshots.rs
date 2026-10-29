@@ -118,6 +118,7 @@ fn the_shell_draws_a_screen_and_its_toasts() {
             |ctx, app: &mut FioApp| app.draw(ctx),
             FioApp::new(fixture_state(View::Transfers)),
         );
+    fiotransfer_egui::app::apply_style_once(&harness.ctx);
     harness.run_steps(2);
 
     // The toast stack is on screen, in the corner the stylesheet puts it in.
@@ -143,6 +144,7 @@ fn every_view_id_draws_its_own_screen() {
                 |ctx, app: &mut FioApp| app.draw(ctx),
                 FioApp::new(fixture_state(view)),
             );
+    fiotransfer_egui::app::apply_style_once(&harness.ctx);
         harness.run_steps(2);
         assert_eq!(harness.state().state.view, view);
         // `show_screen` is what the central panel calls; it must not fall back
@@ -279,6 +281,7 @@ fn the_shell_draws_in_inter_not_eguis_default_face() {
             |ctx, app: &mut FioApp| app.draw(ctx),
             FioApp::new(fixture_state(View::Transfers)),
         );
+    fiotransfer_egui::app::apply_style_once(&shell.ctx);
     shell.run_steps(1);
 
     let mut bare = Harness::builder()

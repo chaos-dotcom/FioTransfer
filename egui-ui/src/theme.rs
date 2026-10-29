@@ -217,14 +217,26 @@ pub fn body() -> FontId {
     FontId::new(font::BODY, FontFamily::Proportional)
 }
 
-/// `.page-head h1`: 18 px.
+/// `.page-head h1`: 18 px, 600 — the stylesheet's semibold.
 pub fn title() -> FontId {
+    // Proportional until every harness installs the fonts (a bare egui context
+    // has no "semibold" family bound and panics when text is laid out).
     FontId::new(font::TITLE, FontFamily::Proportional)
 }
 
-/// `.set-title` / `.modal-title` / `.empty-title`: 14 px.
+/// `.set-title` / `.modal-title` / `.empty-title`: 14 px, 600.
 pub fn section() -> FontId {
     FontId::new(font::SECTION, FontFamily::Proportional)
+}
+
+/// `.name` and `.btn`: 13 px, 500.
+pub fn medium() -> FontId {
+    FontId::new(font::BODY, FontFamily::Name("medium".into()))
+}
+
+/// The 600 face, for anything the stylesheet sets at `font-weight: 600`.
+pub fn semibold() -> FontFamily {
+    FontFamily::Name("semibold".into())
 }
 
 /// `.list-head` / `.dest-sec` / `.who .e`: 11.5 px.

@@ -138,6 +138,19 @@ pub struct UiState {
     pub home: String,
     /// Update state, for the "Check now" row and the sidebar's update card.
     pub update: UpdateState,
+    /// What the user has typed in the composer's link field.
+    pub link: String,
+    /// The composer's passphrase field, shown only when a link needs one.
+    pub passphrase: String,
+    /// "New folder" under the link field (`#subfolder`).
+    pub new_folder: bool,
+    /// The destination chosen for this download, overriding `settings.download_dir`.
+    pub download_dir: String,
+    /// What `InspectLink` said about the typed link: the preview line, the
+    /// passphrase prompt and whether Download is live all come from it.
+    pub link_info: Option<LinkInfo>,
+    /// The crumbs of the remembered upload destination, outermost first.
+    pub dest_path: Vec<Crumb>,
     /// The expanded job whose files are listed, and its files.
     pub expanded: Option<String>,
     pub files: Vec<FileView>,
@@ -151,6 +164,24 @@ pub struct HistoryRow {
     pub when: String,
     pub files: String,
     pub size: String,
+}
+
+/// One level of a Frame.io path: account, workspace, project or folder.
+#[derive(Debug, Clone, Default)]
+pub struct Crumb {
+    pub kind: String,
+    pub name: String,
+}
+
+/// The `InspectLink` payload the composer's preview is built from.
+#[derive(Debug, Clone, Default)]
+pub struct LinkInfo {
+    pub name: String,
+    pub files: i64,
+    pub total_bytes: i64,
+    pub unavailable: i64,
+    pub error: String,
+    pub needs_passphrase: bool,
 }
 
 /// What Settings and the update card need to know about a release.
