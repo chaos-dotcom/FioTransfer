@@ -21,6 +21,10 @@ Each has a regression test that fails before the fix.
 | 7 | `xfer::scan_paths` | followed directory symlinks with no cycle guard | a self-referential link recursed until the stack overflowed | `scan_paths_does_not_follow_a_directory_symlink_cycle` |
 | 8 | `api::Client::send` | `Method::from_bytes(..).unwrap()` | a non-token method panicked instead of erroring | covered by the client's error path |
 | 9 | `App::path_to` | a failed step up the folder chain ended the walk instead of failing | the picker showed a folder under the wrong parent | `prop_bridge` |
+| 10 | `xfer::complete::quick_time_state` | a partial atom header at the end was forgiven | a file whose tail was still being written could be uploaded as complete | `trailing_bytes_under_a_header_are_unfinished` |
+| 11 | same | a 64-bit atom whose extended length was still zero was forgiven | same window, on the >4 GiB path | `an_unfilled_extended_length_after_a_moov_is_unfinished`, `a_length_below_a_header_is_unfinished` |
+| 12 | `xfer::download::unique_path` | a lone leading dot was treated as an extension | deduping `.hidden` produced ` (2).hidden` — it lost its dot and stopped being hidden | `prop_model` naming properties |
+| 13 | `xfer::folderlog::is_folder_log` | any `FioTransfer *.txt` counted as one of our logs | a user's `FioTransfer notes.txt` was silently left out of every upload | `prop_model` skip-name properties |
 
 ## Property machinery
 
@@ -47,17 +51,13 @@ generator):
 * Performance (same rig as the port's benchmarks): upload 2 GiB / 8 streams 11,018 MB/s,
   8 GiB / 16 streams 10,477 MB/s — at parity with the pre-change numbers.
 
-## Open decisions
+## Behaviour deliberately changed
 
-* dotfile dedupe (`.hidden` → `.hidden (2)`, staying hidden)
-* `skip_name` scope (only the generated `FioTransfer …` log stamp)
-* media-atom tolerances (partial trailing header, zero extended size)
+These four were inherited tolerances, kept for parity until now. Each is now the safer
+rule, with a test that pins it, and each is a deliberate divergence from the old app:
 
-## Notes for the reviewer
-
-* `secret.rs` gained `FIO_NO_KEYCHAIN=1`, honoured by `get`/`set`: tests must not touch
-  the real Keychain (reading it can raise an access dialog and would sign a test in with
-  the user's account). Off unless the variable is set; the fallback 0600 token file lives
-  under `HOME`, which a test redirects.
-* Generated `*.proptest-regressions` files are git-ignored: they are machine-specific
-  replays of failing cases, not sources.
+* a partial atom header at the end of a QuickTime file reads `Unfinished` (an early
+  upload sends a truncated copy; the cost of waiting is bounded by the stall limit);
+* an unfilled 64-bit atom length likewise;
+* `.hidden` dedupes to `.hidden (2)` and stays hidden;
+* only the stamped `FioTransfer Watch|Upload|Download …txt` names count as folder logs.

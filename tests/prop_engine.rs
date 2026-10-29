@@ -602,11 +602,13 @@ fn a_quicktime_file_that_is_not_one_is_unknown() {
     assert_eq!(state_of(&m), MediaFormat::Unknown);
 }
 
-/// Characterization, not a claim: fewer than eight bytes left over after the
-/// last atom are called stray bytes, and a file with a moov is still finished.
-/// See the report — this is the tolerance the model marks `Ambiguous`.
+/// A partial atom header at the end means the next atom is still arriving, so
+/// the file is not finished however complete the atoms before it are. (This
+/// replaces a tolerance the port inherited: starting an upload on a file whose
+/// tail is still being written sends a truncated copy, and the cost of waiting
+/// is bounded by the stall limit.)
 #[test]
-fn trailing_bytes_under_a_header_are_tolerated() {
+fn trailing_bytes_under_a_header_are_unfinished() {
     let mut b = Vec::new();
     b.extend_from_slice(&8u32.to_be_bytes());
     b.extend_from_slice(b"ftyp");
@@ -617,7 +619,7 @@ fn trailing_bytes_under_a_header_are_tolerated() {
     for n in 1..8usize {
         let mut t = b.clone();
         t.extend(std::iter::repeat(0xab).take(n));
-        assert_eq!(state_of(&t), MediaFormat::Finished, "{} stray bytes", n);
+        assert_eq!(state_of(&t), MediaFormat::Unfinished, "{} stray bytes", n);
     }
     // Without a moov the same tail is unfinished, so the tolerance is not
     // "assume finished".
@@ -632,7 +634,7 @@ fn trailing_bytes_under_a_header_are_tolerated() {
 /// Characterization: a length below a header (2..=7) ends the walk, and with a
 /// moov already behind it the file reads as finished.
 #[test]
-fn a_length_below_a_header_ends_the_walk() {
+fn a_length_below_a_header_is_unfinished() {
     let mut b = Vec::new();
     b.extend_from_slice(&8u32.to_be_bytes());
     b.extend_from_slice(b"ftyp");
@@ -643,15 +645,15 @@ fn a_length_below_a_header_ends_the_walk() {
         let mut t = b.clone();
         t.extend_from_slice(&n.to_be_bytes());
         t.extend_from_slice(b"mdat");
-        assert_eq!(state_of(&t), MediaFormat::Finished, "length {}", n);
+        assert_eq!(state_of(&t), MediaFormat::Unfinished, "length {}", n);
     }
 }
 
 /// A 64-bit mdat whose extended length is still zero: the writer reserved the
-/// header and has not filled its size in. Reads as finished when a moov is
-/// already behind it.
+/// header and has not filled its size in. That shape only exists mid-write, so
+/// it is unfinished — the old leniency let such a file be uploaded as complete.
 #[test]
-fn an_unfilled_extended_length_after_a_moov_reads_as_finished() {
+fn an_unfilled_extended_length_after_a_moov_is_unfinished() {
     let mut b = Vec::new();
     b.extend_from_slice(&8u32.to_be_bytes());
     b.extend_from_slice(b"ftyp");
@@ -663,7 +665,7 @@ fn an_unfilled_extended_length_after_a_moov_reads_as_finished() {
     b.extend_from_slice(b"mdat");
     b.extend_from_slice(&0u64.to_be_bytes());
     b.extend_from_slice(&[0xcd; 12]);
-    assert_eq!(state_of(&b), MediaFormat::Finished);
+    assert_eq!(state_of(&b), MediaFormat::Unfinished);
 }
 
 #[test]

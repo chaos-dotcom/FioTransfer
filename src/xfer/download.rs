@@ -797,9 +797,11 @@ pub fn sidecar(p: &str) -> String {
 /// the suffix would push it past the file-name limit.
 pub fn unique_path(p: &str) -> Result<String, String> {
     let (dir, name) = split(p);
+    // A leading dot that is the only dot is part of the name, not an extension:
+    // ".hidden" must dedupe to ".hidden (2)" and stay hidden, not to " (2).hidden".
     let ext = match name.rfind('.') {
+        Some(0) | None => "",
         Some(i) => &name[i..],
-        None => "",
     };
     let base = &name[..name.len() - ext.len()];
     for i in 2..10000 {

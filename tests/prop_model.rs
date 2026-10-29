@@ -559,6 +559,18 @@ fn model_outcome(statuses: &[Status], cancel: bool) -> Status {
 
 /// The names a walk must skip, written out from `skip_name`'s doc comment and
 /// the folder-log prefix — an independent list, so a change to one side shows.
+/// The narrow rule: only the stamp this app writes is a log, so a user file
+/// called "FioTransfer notes.txt" is uploaded like any other.
+fn is_stamped_log(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("FioTransfer ") else { return false };
+    let Some(stem) = rest.strip_suffix(".txt") else { return false };
+    ["Watch ", "Upload ", "Download "].iter().any(|kind| {
+        stem.strip_prefix(kind)
+            .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == ' '))
+            .unwrap_or(false)
+    })
+}
+
 fn reference_skip(name: &str) -> bool {
     const META: [&str; 8] = [
         ".DS_Store",
@@ -575,7 +587,7 @@ fn reference_skip(name: &str) -> bool {
         || name.ends_with(".fiopart")
         || name.ends_with(".fiostate")
         || name.ends_with(".fiostate.tmp")
-        || (name.starts_with("FioTransfer ") && name.ends_with(".txt"))
+        || is_stamped_log(name)
 }
 
 fn reference_walk(root: &Path, base: &Path, out: &mut Vec<(String, i64)>) {
@@ -599,10 +611,12 @@ fn reference_walk(root: &Path, base: &Path, out: &mut Vec<(String, i64)>) {
     }
 }
 
-const SKIP_POOL: [&str; 13] = [
+const SKIP_POOL: [&str; 15] = [
     ".DS_Store", "._resource", "Thumbs.db", "desktop.ini", ".localized", "a.fiopart", "a.fiostate",
     "a.fiostate.tmp", ".Spotlight-V100", ".Trashes", ".fseventsd", ".TemporaryItems",
-    "FioTransfer 2026-01-01 10-00-00.txt",
+    "FioTransfer Watch 2026-01-01.txt",
+    "FioTransfer Upload 2026-01-01 100000.txt",
+    "FioTransfer Download 2026-01-01 100000.txt",
 ];
 const SAFE_POOL: [&str; 13] = [
     "a.mov", "b.txt", "clip 1.mov", "é.mov", "日本語.mov", "x.🙂", ".hidden", "..x", "x.fiopartX",

@@ -11,8 +11,20 @@ use crate::limiter::{human_bytes, human_duration};
 
 pub const FOLDER_LOG_PREFIX: &str = "FioTransfer ";
 
+/// Whether a name is one of the logs this app writes next to media.
+///
+/// It has to be the stamp we produce — `FioTransfer Watch 2026-10-29.txt`,
+/// `FioTransfer Upload 2026-10-29 143012.txt` — and not anything that merely
+/// starts with the product name, or a user's `FioTransfer notes.txt` would be
+/// silently left out of an upload.
 pub fn is_folder_log(name: &str) -> bool {
-    name.starts_with(FOLDER_LOG_PREFIX) && name.ends_with(".txt")
+    let Some(rest) = name.strip_prefix(FOLDER_LOG_PREFIX) else { return false };
+    let Some(stem) = rest.strip_suffix(".txt") else { return false };
+    ["Watch ", "Upload ", "Download "].iter().any(|kind| {
+        stem.strip_prefix(kind)
+            .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == ' '))
+            .unwrap_or(false)
+    })
 }
 
 /// log_dirs decides where this job's log goes.
