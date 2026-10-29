@@ -338,7 +338,9 @@ func (c *DropboxClient) fileHead(ctx context.Context) (*File, error) {
 	}
 	p, _, _ := c.parts()
 	name, _ := url.PathUnescape(p[len(p)-1])
-	if _, params, err := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); err == nil && params["filename"] != "" {
+	// The /cd/0/inline/ server names every file "unspecified" (only /cd/0/get/
+	// sends the real name), so the link's name stands (2026-10-29).
+	if _, params, err := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); err == nil && params["filename"] != "" && params["filename"] != "unspecified" {
 		name = params["filename"]
 	}
 	var size int64

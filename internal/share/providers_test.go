@@ -190,7 +190,7 @@ func TestDropbox(t *testing.T) {
 			t.Errorf("content request without Range: %v", r.Header)
 		}
 		w.Header().Set("Content-Range", "bytes 0-0/10")
-		w.Header().Set("Content-Disposition", `inline; filename="Grade v3.mov"`)
+		w.Header().Set("Content-Disposition", "attachment; filename=unspecified") // what Dropbox sends here
 		w.WriteHeader(206)
 		w.Write([]byte("x"))
 	}))
@@ -285,12 +285,12 @@ func TestDropbox(t *testing.T) {
 	}
 
 	// A shared file is resolved once: its name, size and download URL.
-	one := Open(Link{Kind: KindDropbox, ID: "f1l3", URL: srv.URL + "/scl/fi/f1l3/grade.mov?rlkey=rl"}, "")
+	one := Open(Link{Kind: KindDropbox, ID: "f1l3", URL: srv.URL + "/scl/fi/f1l3/Grade%20v3.mov?rlkey=rl"}, "")
 	if _, err := one.Info(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	files, err = one.List(t.Context(), nil)
-	if err != nil || len(files) != 1 || files[0].RelPath != "Grade v3.mov" || files[0].Size != 10 || files[0].URL != cdn.URL+"/cd/0/inline/grade.mov" {
+	if err != nil || len(files) != 1 || files[0].RelPath != "Grade v3.mov" || files[0].Size != 10 || files[0].URL != cdn.URL+"/cd/0/inline/Grade%20v3.mov" {
 		t.Errorf("shared file = %+v, %v", files, err)
 	}
 
