@@ -198,15 +198,12 @@ pub fn folder_log_text(j: &Job, dirs: &[String]) -> String {
     b
 }
 
-/// The directory a path is in (Go's filepath.Dir).
+/// The directory a path is in (Go's filepath.Dir): the path up to and
+/// including its last separator, cleaned; a path with no separator is in ".".
+/// Trailing separators are part of the path, so Dir("a/b/") is "a/b".
 pub fn dir_of(p: &str) -> String {
-    let t = p.trim_end_matches('/');
-    if t.is_empty() {
-        return "/".to_string();
-    }
-    match t.rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(i) => t[..i].to_string(),
+    match p.rfind('/') {
+        Some(i) => super::watch::clean(&p[..=i]),
         None => ".".to_string(),
     }
 }
