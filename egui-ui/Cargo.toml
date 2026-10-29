@@ -1,0 +1,16 @@
+[package]
+name = "fiotransfer-egui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Deliberately no dependency on the app crate: that would drag the webview
+# stack (wry/tao) into this build, and this front end only needs the same JSON
+# the webview front end receives.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+eframe = "0.33.3"
+egui = "0.33.3"
+egui_kittest = { version = "0.33.3", features = ["wgpu", "snapshot"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
