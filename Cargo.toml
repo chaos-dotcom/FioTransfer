@@ -1,3 +1,7 @@
+[workspace]
+members = ["egui-ui"]
+resolver = "2"
+
 [package]
 name = "fiotransfer"
 version = "0.1.0"
