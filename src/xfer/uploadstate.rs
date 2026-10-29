@@ -75,7 +75,13 @@ pub struct Ledger {
 
 impl Ledger {
     pub fn for_source(source: &str) -> Ledger {
-        let base = uploads_dir().join(key(source));
+        Ledger::in_dir(&uploads_dir(), source)
+    }
+
+    /// A ledger rooted somewhere else, so a test never writes into the user's
+    /// own profile (and never sees what a previous test left there).
+    pub fn in_dir(dir: &Path, source: &str) -> Ledger {
+        let base = dir.join(key(source));
         let mut header = base.clone().into_os_string();
         header.push(".json");
         let mut done = base.into_os_string();
@@ -159,14 +165,22 @@ impl Ledger {
 }
 
 pub fn fresh(st: &UploadState, now_ms: i64) -> bool {
+    // `created_at` and `now_ms` are milliseconds (see now_ms()), so the window
+    // has to be compared in milliseconds too: as_secs() here made an hour-long
+    // window expire after 3.6 seconds.
     let age = now_ms - st.created_at;
-    age >= 0 && (age as u64) <= resume_window().as_secs()
+    age >= 0 && (age as u64) <= resume_window().as_millis() as u64
 }
 
 /// Whether some resumable upload still holds this Frame.io file id, so the
 /// housekeeping must not delete that file.
 pub fn keeps_file(file_id: &str, now_ms: i64) -> bool {
-    let Ok(rd) = std::fs::read_dir(uploads_dir()) else { return false };
+    keeps_file_in(&uploads_dir(), file_id, now_ms)
+}
+
+/// `keeps_file` for a ledger directory other than the app's own.
+pub fn keeps_file_in(dir: &Path, file_id: &str, now_ms: i64) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
@@ -272,6 +286,28 @@ mod tests {
         assert_eq!(done, vec![false, false], "a fresh attempt starts with nothing done");
         l.remove();
         let _ = std::fs::remove_file(&src);
+    }
+
+    // Regression: `fresh` compared a millisecond age against a window expressed
+    // in seconds, so a ledger stopped being resumable 3.6 seconds after it was
+    // written instead of an hour later. An interrupted upload was therefore
+    // always restarted from zero, and clean_up deleted its copy on Frame.io.
+    #[test]
+    fn a_ledger_saved_a_minute_ago_still_resumes() {
+        let dir = std::env::temp_dir().join(format!("fio-resume-window-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = "/media/window.mov".to_string();
+        let l = Ledger::in_dir(&dir, &src);
+        let now = now_ms();
+        l.save(&state(&src, 8, 1234, now)).unwrap();
+        let window_ms = resume_window().as_millis() as i64;
+        assert!(resume_window().as_secs() >= 60, "the default window is an hour, not seconds");
+        assert!(l.load(8, 1234, now + 60_000).is_some(), "one minute is inside the window");
+        assert!(l.load(8, 1234, now + window_ms).is_some(), "the window is inclusive");
+        assert!(l.load(8, 1234, now + window_ms + 1_000).is_none(), "past the window");
+        assert!(l.load(8, 1234, now - 1_000).is_none(), "a stamp in the future is not fresh");
+        l.remove();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

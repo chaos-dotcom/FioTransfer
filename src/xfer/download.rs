@@ -175,6 +175,40 @@ struct DlState {
     filled: Vec<i64>,
 }
 
+/// The state a resumed download starts from: the segment size the download was
+/// split with back then (even if the setting has changed since), the number of
+/// segments, and the recorded progress, with `filled` brought up to date for
+/// the segments that are already done. `None` when the sidecar describes another
+/// file or another layout, or when the part file it belongs to is gone — the
+/// download then starts from nothing.
+fn resume_state(previous: Option<&[u8]>, part_exists: bool, size: i64) -> Option<(i64, usize, DlState)> {
+    let old: DlState = serde_json::from_slice(previous?).ok()?;
+    if old.seg_size <= 0 || old.size != size || !part_exists {
+        return None;
+    }
+    if old.done.len() as i64 != (size + old.seg_size - 1) / old.seg_size {
+        return None; // another segment count: not this download's layout
+    }
+    let seg = old.seg_size;
+    let nseg = old.done.len();
+    let mut st = old;
+    st.filled.resize(nseg, 0);
+    for i in 0..nseg {
+        let len = std::cmp::min(seg, size - i as i64 * seg);
+        // `filled` counts bytes already in the part file, so it cannot be
+        // negative or longer than the segment. A sidecar that says otherwise
+        // (edited, truncated, written by another version) must not move the
+        // resume point outside its segment: a start past the segment's end would
+        // ask for a negative range and then mark the segment done with none of
+        // its bytes fetched.
+        st.filled[i] = st.filled[i].clamp(0, len);
+        if st.done[i] {
+            st.filled[i] = len;
+        }
+    }
+    Some((seg, nseg, st))
+}
+
 struct SaverInner {
     st: DlState,
     last_save: Instant,
@@ -356,26 +390,16 @@ impl Job {
         let mut seg = seg_size;
         let mut nseg = (size + seg - 1) as usize / seg as usize;
         let mut st = DlState { size, seg_size: seg, done: vec![false; nseg], filled: vec![0; nseg] };
+        // Resume with the segment size the download started with, even if the
+        // setting has changed since.
+        let previous = std::fs::read(state_path).ok();
+        let part_exists = std::fs::metadata(part_path).is_ok();
         let mut resumed = false;
-        if let Ok(b) = std::fs::read(state_path) {
-            // Resume with the segment size the download started with, even if
-            // the setting has changed since.
-            if let Ok(old) = serde_json::from_slice::<DlState>(&b) {
-                if old.size == size && old.seg_size > 0 && old.done.len() as i64 == (size + old.seg_size - 1) / old.seg_size {
-                    if std::fs::metadata(part_path).is_ok() {
-                        seg = old.seg_size;
-                        nseg = old.done.len();
-                        st = old;
-                        st.filled.resize(nseg, 0);
-                        for i in 0..nseg {
-                            if st.done[i] {
-                                st.filled[i] = std::cmp::min(seg, size - i as i64 * seg);
-                            }
-                        }
-                        resumed = true;
-                    }
-                }
-            }
+        if let Some((oseg, onseg, ost)) = resume_state(previous.as_deref(), part_exists, size) {
+            seg = oseg;
+            nseg = onseg;
+            st = ost;
+            resumed = true;
         }
         // Create (and, for a fresh download, size) the part file before any
         // segment opens it.
@@ -1044,6 +1068,39 @@ mod tests {
         assert!(st.done[0] && !st.done[1]);
     }
 
+    // Regression: a sidecar that claimed more bytes than a segment holds (a
+    // truncated write, a hand-edited file, a sidecar from a version with another
+    // block size) made the resume point land past the segment's end, which is a
+    // negative length: the segment was then marked done having fetched nothing,
+    // leaving a hole of zeros in the finished file. What the sidecar claims is
+    // clamped to what the segment can hold.
+    #[test]
+    fn a_sidecar_cannot_claim_more_than_a_segment_holds() {
+        let dir = std::env::temp_dir().join(format!("fio-sidecar-clamp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let part = dir.join("a.fiopart");
+        std::fs::File::create(&part).unwrap().set_len(8).unwrap();
+        let (seg, size) = (4i64, 8i64);
+
+        let over = DlState { size, seg_size: seg, done: vec![false, false], filled: vec![1_000, -5] };
+        let body = serde_json::to_vec(&over).unwrap();
+        let (got_seg, nseg, st) = resume_state(Some(&body), true, size).expect("it resumes");
+        assert_eq!((got_seg, nseg), (seg, 2));
+        assert_eq!(st.filled, vec![4, 0], "a claim is clamped to the segment it belongs to");
+        assert!(!st.done[0], "a full segment that was never marked done is still fetched");
+
+        let done = DlState { size, seg_size: seg, done: vec![true, false], filled: vec![-1, 3] };
+        let body = serde_json::to_vec(&done).unwrap();
+        let (_, _, st) = resume_state(Some(&body), true, size).expect("it resumes");
+        assert_eq!(st.filled, vec![4, 3], "a done segment is filled to its length");
+
+        // A zero segment size is not a layout, and must not divide by zero.
+        let zero = DlState { size, seg_size: 0, done: vec![false], filled: vec![] };
+        let body = serde_json::to_vec(&zero).unwrap();
+        assert!(resume_state(Some(&body), true, size).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn block_progress_survives_a_sidecar_round_trip() {
         let st = DlState {
@@ -1102,4 +1159,380 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// ---------- Property tests: block-granular resume ----------
+//
+// A download is a plan (segments of `seg_size` bytes, the last one short) and a
+// vector of 1 MiB blocks per segment. The models here are the obvious ones: the
+// number of bytes recorded per segment, the segment length, and the offset the
+// next attempt starts at. `resume_state` is the whole of the resume decision, so
+// these properties cover exactly what a second attempt does.
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use proptest::collection::vec as pvec;
+    use proptest::prelude::*;
+
+    const BLOCK_I: i64 = BLOCK as i64;
+
+    #[derive(Debug, Clone, Copy)]
+    struct Plan {
+        size: i64,
+        seg: i64,
+        nseg: usize,
+    }
+
+    impl Plan {
+        fn seg_start(&self, i: usize) -> i64 {
+            i as i64 * self.seg
+        }
+        fn seg_len(&self, i: usize) -> i64 {
+            std::cmp::min(self.seg, self.size - self.seg_start(i))
+        }
+    }
+
+    /// `nseg` segments of `seg_blocks` blocks each, the last one `last` bytes.
+    fn plan(seg_blocks: usize, nseg: usize, last: i64) -> Plan {
+        let seg = BLOCK_I * seg_blocks as i64;
+        // The last segment is between one byte and a whole segment long, so the
+        // plan always needs exactly `nseg` segments.
+        let last = last.clamp(1, seg);
+        Plan { size: seg * (nseg as i64 - 1) + last, seg, nseg }
+    }
+
+    /// A part file of the right size and the sidecar path beside it, as
+    /// `download_file` names them.
+    fn files(dir: &Path, size: i64) -> (String, String) {
+        let part = dir.join("a.fiopart");
+        let fh = std::fs::File::create(&part).expect("part file");
+        fh.set_len(size as u64).expect("size the part file");
+        (part.to_string_lossy().into_owned(), dir.join("a.fiostate").to_string_lossy().into_owned())
+    }
+
+    fn fresh_saver(p: Plan, path: &str) -> Saver {
+        Saver {
+            inner: Mutex::new(SaverInner {
+                st: DlState { size: p.size, seg_size: p.seg, done: vec![false; p.nseg], filled: vec![0; p.nseg] },
+                last_save: Instant::now(),
+            }),
+            path: path.to_string(),
+        }
+    }
+
+    fn resumed_saver(st: DlState, path: &str) -> Saver {
+        Saver { inner: Mutex::new(SaverInner { st, last_save: Instant::now() }), path: path.to_string() }
+    }
+
+    /// What the next attempt does with what the last one left behind.
+    fn next_attempt(state: &str, part_exists: bool, size: i64) -> Option<(i64, usize, DlState)> {
+        let previous = std::fs::read(state).ok();
+        resume_state(previous.as_deref(), part_exists, size)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 96, ..ProptestConfig::default() })]
+
+        /// After an arbitrary schedule of finished blocks and finished segments,
+        /// and a cancel, the next attempt starts each segment at the last finished
+        /// block boundary: no byte it recorded is fetched again, and it never
+        /// starts inside a block it did not record.
+        #[test]
+        fn a_resume_starts_each_segment_at_its_last_finished_block(
+            blocks in pvec(0usize..6, 1..5),
+            done in pvec(any::<bool>(), 1..5),
+            last in 1i64..(BLOCK_I * 4 + 1),
+        ) {
+            let p = plan(4, blocks.len(), last);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (part, state) = files(dir.path(), p.size);
+            let s = fresh_saver(p, &state);
+            s.save(true);
+            for i in 0..p.nseg {
+                if done[i % done.len()] {
+                    s.mark_done(i);
+                } else {
+                    s.fill(i, blocks[i % blocks.len()] as i64 * BLOCK_I);
+                }
+            }
+            s.save(true); // the attempt ends: cancel, failure, or the app quitting
+            drop(s);
+            prop_assert!(std::fs::metadata(&part).is_ok(), "the part file is still there");
+            let (seg, nseg, st) = next_attempt(&state, true, p.size).expect("the next attempt resumes");
+            prop_assert_eq!(seg, p.seg, "the segment size the download started with");
+            prop_assert_eq!(nseg, p.nseg);
+            for i in 0..p.nseg {
+                let len = p.seg_len(i);
+                let d = done[i % done.len()];
+                let recorded = if d { len } else { (blocks[i % blocks.len()] as i64 * BLOCK_I).min(len) };
+                prop_assert!(st.filled[i] >= 0, "segment {} says {} bytes are on disk", i, st.filled[i]);
+                prop_assert!(st.filled[i] <= len, "segment {} says {} of {} bytes", i, st.filled[i], len);
+                prop_assert!(st.filled[i] >= recorded, "segment {} lost {} bytes of recorded progress", i, recorded - st.filled[i]);
+                let start = p.seg_start(i) + st.filled[i];
+                prop_assert!(start <= p.seg_start(i) + len, "segment {} would start past its end", i);
+                if st.filled[i] < len {
+                    // Everything already in the part file is on a block boundary.
+                    prop_assert_eq!(start % BLOCK_I, 0, "segment {} resumes at {} (not a block boundary)", i, start);
+                }
+                if d {
+                    prop_assert_eq!(st.filled[i], len, "a done segment has nothing left to fetch");
+                }
+            }
+        }
+
+        /// Three attempts in a row, each finishing more blocks: a segment's start
+        /// only ever moves forward, and what a later attempt writes is exactly the
+        /// bytes that are not on disk yet.
+        #[test]
+        fn progress_moves_forward_across_attempts(
+            seg_blocks in 1usize..5,
+            nseg in 1usize..5,
+            per_attempt in pvec(pvec(0usize..5, 1..5), 2..4),
+            last in 1i64..(BLOCK_I * 4 + 1),
+        ) {
+            let p = plan(seg_blocks, nseg, last);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (_, state) = files(dir.path(), p.size);
+            let mut previous: Vec<i64> = vec![0; nseg];
+            let mut carried: Option<DlState> = None;
+            for (a, blocks) in per_attempt.iter().enumerate() {
+                let st = match carried.take() {
+                    Some(st) => st,
+                    None => DlState { size: p.size, seg_size: p.seg, done: vec![false; nseg], filled: vec![0; nseg] },
+                };
+                let s = resumed_saver(st, &state);
+                s.save(a == 0); // the first attempt writes its plan; later ones resume
+                for i in 0..nseg {
+                    // Only ever add to what is already there, as the engine does.
+                    let have = s.filled(i);
+                    let more = std::cmp::min((blocks[i % blocks.len()] as i64) * BLOCK_I, p.seg_len(i) - have).max(0);
+                    s.fill(i, have + more);
+                }
+                s.save(true); // the attempt ends
+                drop(s);
+                let (_, onseg, st) = next_attempt(&state, true, p.size).expect("it resumes");
+                prop_assert_eq!(onseg, nseg);
+                for i in 0..nseg {
+                    prop_assert!(st.filled[i] >= previous[i], "attempt {} moved segment {} back", a, i);
+                    prop_assert!(st.filled[i] <= p.seg_len(i));
+                    if st.filled[i] < p.seg_len(i) {
+                        prop_assert_eq!(st.filled[i] % BLOCK_I, 0, "attempt {} segment {}", a, i);
+                    }
+                }
+                previous = st.filled.clone();
+                carried = Some(st);
+            }
+        }
+
+        /// `filled` counts bytes on disk, so it is capped at the segment length —
+        /// including the short last segment, and including a segment that is done.
+        #[test]
+        fn filled_is_capped_at_the_segment_length(
+            seg_blocks in 1usize..4,
+            nseg in 1usize..5,
+            last in 1i64..(BLOCK_I * 3 + 1),
+            claim in 0i64..(BLOCK_I * 20),
+        ) {
+            let p = plan(seg_blocks, nseg, last);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (_, state) = files(dir.path(), p.size);
+            let s = fresh_saver(p, &state);
+            let i = nseg - 1;
+            s.fill(i, claim);
+            prop_assert_eq!(s.filled(i), std::cmp::min(claim, p.seg_len(i)), "fill caps at the segment length");
+            s.fill(i, p.seg_len(i) - 1);
+            prop_assert_eq!(s.filled(i), p.seg_len(i) - 1, "fill can also lower it");
+            s.fill(i, p.seg_len(i) + 1);
+            prop_assert_eq!(s.filled(i), p.seg_len(i));
+            // Done from a segment that is only partly on disk: a done segment is
+            // full, and the next attempt must not fetch the rest of it again.
+            s.fill(i, 0);
+            s.mark_done(i);
+            prop_assert!(s.is_done(i));
+            prop_assert_eq!(s.filled(i), p.seg_len(i), "a done segment is filled to its length");
+            s.save(true);
+            drop(s);
+            let (_, _, st) = next_attempt(&state, true, p.size).expect("it resumes");
+            for k in 0..nseg {
+                prop_assert!(st.filled[k] <= p.seg_len(k), "segment {}", k);
+            }
+        }
+
+        /// A done segment is never fetched again: the next attempt gives it no
+        /// bytes at all, even when the segment is shorter than a block.
+        #[test]
+        fn a_done_segment_is_never_refetched(
+            seg_blocks in 1usize..4,
+            nseg in 1usize..5,
+            last in 1i64..(BLOCK_I * 3 + 1),
+            which in pvec(any::<bool>(), 1..5),
+        ) {
+            let p = plan(seg_blocks, nseg, last);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (_, state) = files(dir.path(), p.size);
+            let s = fresh_saver(p, &state);
+            s.save(true);
+            for i in 0..nseg {
+                if which[i % which.len()] {
+                    s.mark_done(i);
+                }
+            }
+            s.save(true);
+            drop(s);
+            let (_, _, st) = next_attempt(&state, true, p.size).expect("it resumes");
+            for i in 0..nseg {
+                if which[i % which.len()] {
+                    prop_assert!(st.done[i], "segment {} is still done", i);
+                    prop_assert_eq!(p.seg_start(i) + st.filled[i], p.seg_start(i) + p.seg_len(i), "segment {} fetches {} bytes", i, p.seg_len(i) - st.filled[i]);
+                } else {
+                    prop_assert!(!st.done[i], "segment {} was not done", i);
+                }
+            }
+        }
+
+        /// A sidecar written before block-level progress existed has no `filled`
+        /// field: it must still load, with the done segments done and the rest
+        /// starting at their segment boundary.
+        #[test]
+        fn an_old_sidecar_without_filled_still_loads(
+            seg_blocks in 1usize..4,
+            nseg in 1usize..5,
+            last in 1i64..(BLOCK_I * 3 + 1),
+            which in pvec(any::<bool>(), 1..5),
+        ) {
+            let p = plan(seg_blocks, nseg, last);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (_, state) = files(dir.path(), p.size);
+            let done: Vec<bool> = (0..nseg).map(|i| which[i % which.len()]).collect();
+            let old = serde_json::json!({ "size": p.size, "seg_size": p.seg, "done": done });
+            std::fs::write(&state, serde_json::to_vec(&old).unwrap()).expect("sidecar");
+            let (seg, onseg, st) = next_attempt(&state, true, p.size).expect("an old sidecar still resumes");
+            prop_assert_eq!(seg, p.seg);
+            prop_assert_eq!(onseg, nseg);
+            for i in 0..nseg {
+                prop_assert_eq!(st.done[i], done[i], "segment {}", i);
+                if done[i] {
+                    prop_assert_eq!(st.filled[i], p.seg_len(i), "segment {}", i);
+                } else {
+                    prop_assert_eq!(st.filled[i], 0, "segment {} starts at its segment boundary", i);
+                    prop_assert_eq!(p.seg_start(i) % BLOCK_I, 0);
+                }
+            }
+            // And a sidecar whose `filled` is shorter than its `done` list is
+            // padded, not indexed out of range.
+            let short = serde_json::json!({ "size": p.size, "seg_size": p.seg, "done": done, "filled": [0] });
+            std::fs::write(&state, serde_json::to_vec(&short).unwrap()).expect("sidecar");
+            let (_, onseg, st) = next_attempt(&state, true, p.size).expect("it still resumes");
+            prop_assert_eq!(onseg, nseg);
+            prop_assert_eq!(st.filled.len(), nseg);
+        }
+
+        /// A sidecar describes one file with one layout. Anything else — another
+        /// size, another segment count, a zero segment size, a missing part file,
+        /// bytes that are not JSON — is ignored and the download starts fresh.
+        #[test]
+        fn a_sidecar_for_another_file_or_layout_is_ignored(
+            seg_blocks in 1usize..4,
+            nseg in 1usize..5,
+            last in 1i64..(BLOCK_I * 3 + 1),
+            dsize in -2i64..3,
+            dlen in -1i64..2,
+            part_exists in any::<bool>(),
+            garbage in any::<bool>(),
+        ) {
+            let p = plan(seg_blocks, nseg, last);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (_, state) = files(dir.path(), p.size);
+            let s = fresh_saver(p, &state);
+            s.save(true);
+            drop(s);
+            let body = if garbage {
+                b"not a sidecar".to_vec()
+            } else {
+                let mut st = DlState { size: p.size, seg_size: p.seg, done: vec![false; nseg], filled: vec![0; nseg] };
+                st.size += dsize;
+                let mut done = st.done.clone();
+                for _ in 0..dlen.max(0) {
+                    done.push(false);
+                }
+                for _ in 0..(-dlen).max(0) {
+                    done.pop();
+                }
+                st.done = done;
+                st.filled = vec![0; st.done.len()];
+                serde_json::to_vec(&st).unwrap()
+            };
+            std::fs::write(&state, &body).expect("sidecar");
+            let usable = !garbage && part_exists && dsize == 0 && dlen == 0;
+            let got = next_attempt(&state, part_exists, p.size);
+            prop_assert_eq!(got.is_some(), usable, "usable={} garbage={} part={} dsize={} dlen={}", usable, garbage, part_exists, dsize, dlen);
+            if let Some((seg, onseg, st)) = got {
+                prop_assert_eq!(seg, p.seg);
+                prop_assert_eq!(onseg, nseg);
+                prop_assert_eq!(st.done.len(), nseg);
+            }
+        }
+
+        /// Whatever a sidecar claims about bytes already on disk, a resumed
+        /// segment never starts outside itself: a claim of more than the segment
+        /// holds must not turn into "this segment is finished" with its bytes
+        /// never fetched, and a negative claim must not pull the start back into
+        /// the previous segment.
+        #[test]
+        fn a_sidecar_cannot_claim_more_than_the_segment_holds(
+            seg_blocks in 1usize..4,
+            nseg in 1usize..5,
+            last in 1i64..(BLOCK_I * 3 + 1),
+            claims in pvec((any::<bool>(), -3i64 * BLOCK_I..6i64 * BLOCK_I), 1..5),
+        ) {
+            let p = plan(seg_blocks, nseg, last);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (_, state) = files(dir.path(), p.size);
+            let mut st = DlState { size: p.size, seg_size: p.seg, done: vec![false; nseg], filled: vec![0; nseg] };
+            for (i, (done, claim)) in claims.iter().enumerate() {
+                if i < nseg {
+                    st.done[i] = *done;
+                    st.filled[i] = *claim;
+                }
+            }
+            std::fs::write(&state, serde_json::to_vec(&st).unwrap()).expect("sidecar");
+            let (_, onseg, got) = next_attempt(&state, true, p.size).expect("it resumes");
+            prop_assert_eq!(onseg, nseg);
+            for i in 0..nseg {
+                let len = p.seg_len(i);
+                prop_assert!(got.filled[i] >= 0, "segment {} starts {} bytes before itself", i, -got.filled[i]);
+                prop_assert!(got.filled[i] <= len, "segment {} starts {} bytes past its end", i, got.filled[i] - len);
+                prop_assert!(p.seg_start(i) + got.filled[i] <= p.seg_start(i) + len);
+            }
+        }
+
+        /// The save that runs at most once a second may lose the last few blocks
+        /// after a crash, but it can never record progress that was not made.
+        #[test]
+        fn a_throttled_save_never_invents_progress(
+            nseg in 1usize..4,
+            seg_blocks in 1usize..4,
+            blocks in pvec(0usize..4, 1..4),
+        ) {
+            let p = plan(seg_blocks, nseg, BLOCK_I * 2);
+            let dir = tempfile::tempdir().expect("temp dir");
+            let (_, state) = files(dir.path(), p.size);
+            let s = fresh_saver(p, &state);
+            s.save(true);
+            for i in 0..nseg {
+                s.fill(i, blocks[i % blocks.len()] as i64 * BLOCK_I);
+                s.save(false); // throttled: usually a no-op
+            }
+            let on_disk = std::fs::read(&state).ok().and_then(|b| serde_json::from_slice::<DlState>(&b).ok());
+            prop_assert!(on_disk.is_some(), "the plan is on disk");
+            for i in 0..nseg {
+                let got = on_disk.as_ref().map(|st| st.filled[i]).unwrap_or(0);
+                prop_assert!(got >= 0);
+                prop_assert!(got <= s.filled(i), "the file claims more progress than was made");
+                prop_assert!(got <= p.seg_len(i));
+            }
+        }
+    }
+
 }
