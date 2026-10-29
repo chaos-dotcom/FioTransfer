@@ -742,15 +742,9 @@ impl App {
                     Node { id: f.id.clone(), name: f.name.clone(), kind: "folder".into(), folder_id: f.id.clone(), where_: String::new() },
                 );
                 let next = f.parent_id.clone();
-                match self.api.folder(&cx, acct, &next).await {
-                    Ok(nf) => f = nf,
-                    Err(e) => {
-                        if e.to_string().is_empty() {
-                            break;
-                        }
-                        break;
-                    }
-                }
+                // As in the Go app: a failed step up the chain is an error, not a
+                // shorter path (the UI would show a folder under the wrong parent).
+                f = self.api.folder(&cx, acct, &next).await.map_err(|e| gone(&e))?;
             }
             project = f.project_id.clone();
         }

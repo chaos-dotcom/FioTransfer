@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3a248f8747c1558f05bb108a1cc6844218c6e27c4e8118f1edbe8305014e05bd # shrinks to prefix = []
+cc 1ad2b4cacc467b6dbe3981b6f4eb4a254293d8934571f65ee27f95010563e700 # shrinks to args = ["-n"]
+cc eedc595c415d8a2b55dc0b43dfcbf95576e3e97a568d92b2e310dcd45d87dcaf # shrinks to args = ["-o"]
+cc 2bf6029795eadc43785b78af3596282721747f1aada9f2d43561c57a02ca109a # shrinks to args = ["--subfolder", "--account"]
+cc 20c61b8268476cf3b6ca251285b5a466a757eeb434d4e847c1bffa95e83bbecd # shrinks to args = ["-n", "-o", "-n"], which = 1
