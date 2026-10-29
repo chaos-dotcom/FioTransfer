@@ -6,7 +6,6 @@
 //! view, in a window with the same size, chrome and background. What changes is
 //! only what answers `window.go.main.App[method]`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -257,7 +256,7 @@ pub fn run(host: Arc<dyn BridgeHost>, opts: WindowOptions) -> i32 {
     // The menu is built before the run loop starts, as Wails did.
     unsafe { fioMenuInit(menu_callback) };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<(u64, String, Vec<Value>)>();
+    let (tx, _rx) = mpsc::unbounded_channel::<(u64, String, Vec<Value>)>();
     let host_for_ipc = host.clone();
     let proxy_for_ipc = proxy.clone();
     let proxy_for_drop = proxy.clone();

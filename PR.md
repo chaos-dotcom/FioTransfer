@@ -20,6 +20,7 @@ Each has a regression test that fails before the fix.
 | 6 | `xfer::Limiter::acquire` | enrolled for a wake-up only after re-reading the count | a release landing in that window was lost; a waiter could sleep until the next release | `prop_sync` (6 properties, 4/4 mutations caught) |
 | 7 | `xfer::scan_paths` | followed directory symlinks with no cycle guard | a self-referential link recursed until the stack overflowed | `scan_paths_does_not_follow_a_directory_symlink_cycle` |
 | 8 | `api::Client::send` | `Method::from_bytes(..).unwrap()` | a non-token method panicked instead of erroring | covered by the client's error path |
+| 9 | `App::path_to` | a failed step up the folder chain ended the walk instead of failing | the picker showed a folder under the wrong parent | `prop_bridge` |
 
 ## Property machinery
 
@@ -31,13 +32,13 @@ generator):
 | --- | --- | --- | --- |
 | `tests/proptests.rs` | seed suite: limiter, buffer pool, ledger, route keys, paths, CSV | 14 | – |
 | `tests/prop_sync.rs` | `Limiter` | 6 | 4/4 caught |
-| `tests/prop_state.rs` | upload ledger, download block resume, history store | *(pending)* | |
+| `tests/prop_state.rs` | upload ledger, download block resume, history store | 12 | machine-checked, see the suite |
 | `tests/prop_parse.rs` | `route_key`, `safe_name` | 9 | 3/3 caught |
 | `tests/prop_watch.rs` | watch folders, folder logs | 7 (+23 lib) | 14/14 caught |
 | `tests/prop_shares.rs` | six link providers | 14 (+27 lib) | 30/30 caught |
 | `tests/prop_model.rs` | job/file counters, `view()`, `snapshot()`, scanning | 12 (+33 lib) | 24/24 caught |
 | `tests/prop_engine.rs` | media-atom parser, part tiling, backoff | 16 | 5 caught, 1 equivalent, 1 survivor→strengthened |
-| `tests/prop_bridge.rs` | bridge surface, CLI flags | *(pending)* | |
+| `tests/prop_bridge.rs` | bridge surface, CLI flags | 12 | |
 
 ## Evidence
 
@@ -51,3 +52,12 @@ generator):
 * dotfile dedupe (`.hidden` → `.hidden (2)`, staying hidden)
 * `skip_name` scope (only the generated `FioTransfer …` log stamp)
 * media-atom tolerances (partial trailing header, zero extended size)
+
+## Notes for the reviewer
+
+* `secret.rs` gained `FIO_NO_KEYCHAIN=1`, honoured by `get`/`set`: tests must not touch
+  the real Keychain (reading it can raise an access dialog and would sign a test in with
+  the user's account). Off unless the variable is set; the fallback 0600 token file lives
+  under `HOME`, which a test redirects.
+* Generated `*.proptest-regressions` files are git-ignored: they are machine-specific
+  replays of failing cases, not sources.
