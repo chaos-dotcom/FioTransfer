@@ -1,0 +1,97 @@
+name: package
+
+# Unsigned binaries for macOS, Linux and Windows, through cargo-packager.
+#
+# What is packaged where, and why it differs:
+#   * macOS   - the application as it ships: the Wails-compatible webview shell
+#               (`fiotransfer`), which is AppKit code and builds only there.
+#               The egui front end is packaged beside it, so the same UI can be
+#               opened on every platform.
+#   * Linux   - the egui front end only (`fiotransfer-egui`): eframe runs on
+#               Linux, the AppKit shell does not exist there.
+#   * Windows - the egui front end, same reason.
+#
+# Nothing is signed: no certificate, no notarisation, no Authenticode. These
+# artifacts are for testing and for CI proof that the code builds.
+#
+# cargo-packager 0.11 reads its configuration from `[package.metadata.packager]`
+# in each crate's Cargo.toml. `cargo packager --config <file>` is broken in that
+# release ("Not a directory"), so the configuration lives in the manifests.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager@0.11.8
+      - uses: Swatinem/rust-cache@v2
+      # Both workspace members carry packager metadata, so this makes the AppKit
+      # app (dist/) and the egui app (dist-egui/).
+      - name: Package (unsigned)
+        run: cargo packager --formats app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FioTransfer-macos-unsigned
+          path: |
+            dist/*.app
+            dist-egui/*.app
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager@0.11.8
+      - uses: Swatinem/rust-cache@v2
+      # eframe/winit build against these; AppImage needs fuse to be introspected.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libwayland-dev libudev-dev libssl-dev \
+            fuse libfuse2 file
+      - name: Package the egui front end (unsigned)
+        run: cargo packager -p fiotransfer-egui --formats deb appimage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FioTransfer-linux-unsigned
+          path: |
+            dist-egui/*.deb
+            dist-egui/*.AppImage
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager@0.11.8
+      - uses: Swatinem/rust-cache@v2
+      # NSIS is fetched by cargo-packager itself; nothing is signed.
+      - name: Package the egui front end (unsigned)
+        run: cargo packager -p fiotransfer-egui --formats nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FioTransfer-windows-unsigned
+          path: dist-egui/*.exe
+          if-no-files-found: error
