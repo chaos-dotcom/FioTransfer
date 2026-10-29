@@ -1102,4 +1102,200 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    // ---------- property tests: the naming helpers against a model ----------
+    //
+    // These live next to the private helpers they exercise (`split`,
+    // `path_free`, `truncate_len`), so the model can be written without
+    // reaching through a public wrapper.
+
+    use proptest::prelude::*;
+
+    /// The longest prefix of `s` that ends on a character boundary and is at
+    /// most `n` bytes long — the model, by walking characters rather than bytes.
+    fn longest_bounded_prefix(s: &str, n: usize) -> &str {
+        let mut end = 0;
+        for (i, c) in s.char_indices() {
+            if i + c.len_utf8() > n {
+                break;
+            }
+            end = i + c.len_utf8();
+        }
+        &s[..end]
+    }
+
+    fn multi_byte_text() -> impl Strategy<Value = String> {
+        // plain ASCII, 2-byte Latin-1, 3-byte CJK, 4-byte emoji, and combining
+        // marks, at any length including empty
+        proptest::collection::vec(
+            prop_oneof![
+                Just("a"), Just("Z"), Just("-"), Just(" "), Just("/"),
+                Just("é"), Just("ñ"), Just("ß"),
+                Just("日"), Just("本"), Just("語"),
+                Just("🙂"), Just("🎬"),
+                Just("e\u{0301}"),
+            ],
+            0..12,
+        )
+        .prop_map(|v| v.concat())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// `truncate_utf8` must cut at the largest character boundary that fits
+        /// in `n` bytes: never mid-character, never longer than asked, and
+        /// never shorter than it has to be.
+        #[test]
+        fn truncate_utf8_is_the_longest_prefix_that_fits(s in multi_byte_text(), n in 0usize..40) {
+            let got = truncate_utf8(&s, n);
+            prop_assert_eq!(&got, longest_bounded_prefix(&s, n), "s={:?} n={}", s, n);
+            prop_assert!(got.len() <= n, "{} > {} for {:?}", got.len(), n, s);
+            prop_assert!(s.starts_with(&got), "{:?} is not a prefix of {:?}", got, s);
+            prop_assert!(got.is_char_boundary(got.len()));
+            // idempotent: cutting an already-cut string changes nothing
+            prop_assert_eq!(truncate_utf8(&got, n), got);
+        }
+
+        /// The sidecar prefix must always leave room for the longest suffix
+        /// any caller appends (`.fiostate.tmp`), must be stable for the same
+        /// name, and must depend on the name alone, not on the directory.
+        #[test]
+        fn sidecar_leaves_room_for_its_suffixes(name in sidecar_name(), dir in dir_choice()) {
+            let p = format!("{}{}", dir, name);
+            let s = sidecar(&p);
+            let (sdir, sname) = split(&s);
+            prop_assert_eq!(sdir, dir.clone(), "the directory is kept");
+            prop_assert!(sname.len() + ".fiostate.tmp".len() <= MAX_NAME,
+                         "{:?} leaves no room for .fiostate.tmp", sname);
+            prop_assert!(sname.len() + ".fiopart".len() <= MAX_NAME);
+            // stable: a resume finds the same sidecar again
+            prop_assert_eq!(sidecar(&p), s.clone());
+            prop_assert_eq!(sidecar(&format!("{}{}", dir, name)), s.clone());
+            // the same name in another directory hashes the same way
+            let other = split(&sidecar(&format!("/elsewhere/{}", name))).1.to_string();
+            prop_assert_eq!(&other, sname, "the hash may depend on the name only");
+            // a short name is its own sidecar prefix
+            if name.len() + ".fiostate.tmp".len() <= MAX_NAME {
+                prop_assert_eq!(&s, &p);
+            } else {
+                prop_assert!(sname.starts_with(".fio-"), "a long name is hashed: {:?}", sname);
+            }
+            // and the hashed name is itself short enough to take the suffix
+            prop_assert!(sidecar(&s).ends_with(&sname));
+        }
+
+        /// `unique_path` never hands back a name that is taken (nor one whose
+        /// part file is), always stays inside the file-name limit, and counts
+        /// up without gaps when a series of files of the same name arrives.
+        #[test]
+        fn unique_path_never_clobbers_and_counts_up(name in file_name(), taken in 0usize..4, mask in 0u8..16) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let d = dir.path().to_string_lossy().into_owned();
+            let p = format!("{}/{}", d, name);
+            // `taken` names of this series are already on disk; some of them are
+            // only their `.fiopart` (an interrupted download that left no file)
+            std::fs::write(&p, b"x").expect("write the original");
+            let mut made = vec![p.clone()];
+            let mut series: Vec<String> = vec![p.clone()];
+            for i in 0..taken {
+                let next = unique_path(&p).expect("a free name");
+                prop_assert!(!made.contains(&next), "{:?} was already made", next);
+                prop_assert!(!std::fs::symlink_metadata(&next).is_ok(), "{:?} already exists", next);
+                prop_assert!(!std::fs::symlink_metadata(format!("{}.fiopart", sidecar(&next))).is_ok(),
+                             "the part file of {:?} exists", next);
+                if mask & (1 << i) != 0 {
+                    std::fs::write(format!("{}.fiopart", sidecar(&next)), b"part").expect("write a part");
+                } else {
+                    std::fs::write(&next, b"y").expect("write a collision");
+                }
+                made.push(next.clone());
+                series.push(next);
+            }
+            // the next free name is one past the last one made
+            let last = series.last().unwrap().clone();
+            let next = unique_path(&p).expect("a free name");
+            prop_assert!(!std::fs::symlink_metadata(&next).is_ok(), "{:?} already exists", next);
+            prop_assert!(!made.contains(&next));
+            // the series is "name", "name (2)" … "name (taken+1)", so the
+            // next free one is exactly the one after that
+            prop_assert_eq!(suffix_number(&next), Some(taken as u32 + 2),
+                            "{:?} should follow {:?} in the series", next, last);
+            if taken == 0 {
+                prop_assert_eq!(suffix_number(&p), None, "the original carries no suffix");
+            }
+            // every name stays inside the limit, whatever the base name
+            for m in made.iter().chain(std::iter::once(&next)) {
+                let (mdir, mname) = split(m);
+                prop_assert_eq!(mdir, format!("{}/", d));
+                prop_assert!(mname.len() <= MAX_NAME, "{:?} is {} bytes", mname, mname.len());
+                // the part and state files hang off the sidecar prefix, which
+                // is what keeps a 255-byte name resumable
+                prop_assert!(split(&sidecar(m)).1.len() + ".fiostate.tmp".len() <= MAX_NAME,
+                             "the sidecar of {:?} leaves no room for its suffix", mname);
+            }
+        }
+
+        /// `path_free` must mirror the filesystem and refuse to swallow an
+        /// error: a name that cannot be stat'ed is not "free".
+        #[test]
+        fn path_free_mirrors_the_filesystem(name in file_name()) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let p = format!("{}/{}", dir.path().to_string_lossy(), name);
+            prop_assert!(path_free(&p).unwrap(), "{:?} does not exist yet", p);
+            std::fs::write(&p, b"z").expect("write");
+            prop_assert!(!path_free(&p).unwrap(), "{:?} exists", p);
+            // a path whose directory does not exist is free (the caller creates it)
+            let deeper = format!("{}/nope/{}", dir.path().to_string_lossy(), name);
+            prop_assert!(path_free(&deeper).unwrap_or(true));
+        }
+    }
+
+    /// A name that may appear on disk: multi-byte, dotfiles, several dots, no
+    /// extension, and names at the file-name limit.
+    fn file_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("a.mov".to_string()),
+            Just("a.tar.gz".to_string()),
+            Just("noext".to_string()),
+            Just(".hidden".to_string()),
+            Just("..double".to_string()),
+            Just("clip é.mov".to_string()),
+            Just("🎬 take 1.mov".to_string()),
+            Just(format!("{}.mov", "x".repeat(251))),
+            Just(format!("{}.mov", "x".repeat(247))),
+            Just("é".repeat(100)),
+            Just(format!("{}", "y".repeat(255))),
+            Just(format!("{}.tar.gz", "z".repeat(240))),
+        ]
+    }
+
+    fn sidecar_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("a.mov".to_string()),
+            Just(format!("{}.mov", "x".repeat(251))),
+            Just(format!("{}.mov", "x".repeat(242))),
+            Just(format!("{}.mov", "x".repeat(243))),
+            Just("é".repeat(130)),
+            Just("y".repeat(255)),
+            Just(".fio-deadbeefdeadbeef".to_string()),
+        ]
+    }
+
+    fn dir_choice() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("/tmp/".to_string()),
+            Just("/tmp/Downloads/".to_string()),
+            Just("".to_string()),
+            Just("rel/path/".to_string()),
+        ]
+    }
+
+    /// The ` (n)` counter in a name, for the count-up check.
+    fn suffix_number(p: &str) -> Option<u32> {
+        let name = split(p).1;
+        let open = name.rfind(" (")?;
+        let close = name[open..].find(')')? + open;
+        name[open + 2..close].parse().ok()
+    }
+
 }
