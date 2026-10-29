@@ -25,6 +25,7 @@ Each has a regression test that fails before the fix.
 | 11 | same | a 64-bit atom whose extended length was still zero was forgiven | same window, on the >4 GiB path | `an_unfilled_extended_length_after_a_moov_is_unfinished`, `a_length_below_a_header_is_unfinished` |
 | 12 | `xfer::download::unique_path` | a lone leading dot was treated as an extension | deduping `.hidden` produced ` (2).hidden` — it lost its dot and stopped being hidden | `prop_model` naming properties |
 | 13 | `xfer::folderlog::is_folder_log` | any `FioTransfer *.txt` counted as one of our logs | a user's `FioTransfer notes.txt` was silently left out of every upload | `prop_model` skip-name properties |
+| 14 | `xfer::uploadstate::fresh` | compared an age in **milliseconds** against a window in **seconds** | the one-hour resume window was really 3.6 seconds: an interrupted upload almost never resumed | `a_ledger_saved_a_minute_ago_still_resumes` |
 
 ## Property machinery
 
@@ -50,6 +51,22 @@ generator):
 * UI: the app's own webview snapshot, four views at 1180×780 — **0 differing pixels**.
 * Performance (same rig as the port's benchmarks): upload 2 GiB / 8 streams 11,018 MB/s,
   8 GiB / 16 streams 10,477 MB/s — at parity with the pre-change numbers.
+
+## Found, reported, not fixed here
+
+Each of these is a real contract or documentation gap that a reviewer may want decided
+rather than silently changed:
+
+* `xfer::watch::join_path` documents itself as `filepath.Join` but only concatenates:
+  `join_path("/a/b", "../c")` is `/a/b/../c`, and `join_path("/", "/")` is `//`. Every
+  caller passes a clean relative path today, so nothing misbehaves — but the doc overclaims.
+* `share::resolve_link("0")` parses as `https://0.0.0.0/` and issues a request; junk input
+  that looks like a host escapes the "not a link" path.
+* `share::dedupe_paths` folds case with ASCII rules only; on APFS a composed and a
+  decomposed `é.mov` collide on disk but not here.
+* `Limiter` is not FIFO, and that is undocumented (no fairness guarantee is claimed).
+* a job with zero files finishes `Done`, and a cancelled job whose files all completed
+  reports `Done` rather than `Canceled` — policy, not bookkeeping.
 
 ## Behaviour deliberately changed
 
