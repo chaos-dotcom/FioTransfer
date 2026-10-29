@@ -1670,8 +1670,10 @@ fn dedupe_remote(files: &mut Vec<RemoteFile>) {
         if used.insert(k) {
             continue;
         }
-        let ext = path_ext(&files[i].rel);
-        let base = files[i].rel.trim_end_matches(ext);
+        // Go's strings.TrimSuffix(rel, ext) drops one suffix, not every
+        // repetition of it: "a.mov.mov" is numbered as "a.mov (2).mov".
+        let ext = path_ext(&files[i].rel).to_string();
+        let base = files[i].rel.strip_suffix(&ext).unwrap_or(&files[i].rel).to_string();
         let mut n = 2;
         loop {
             let c = format!("{} ({}){}", base, n, ext);
@@ -2061,7 +2063,7 @@ fn api_status(e: &str) -> Option<u16> {
 // ---------- Small path helpers ----------
 
 /// clean is Go's filepath.Clean for the slash paths this app uses.
-fn clean(p: &str) -> String {
+pub(crate) fn clean(p: &str) -> String {
     if p.is_empty() {
         return ".".to_string();
     }
@@ -2108,6 +2110,9 @@ fn join_path(dir: &str, rel: &str) -> String {
 
 /// base_name_path is Go's filepath.Base.
 fn base_name_path(p: &str) -> String {
+    if p.is_empty() {
+        return ".".to_string();
+    }
     let t = p.trim_end_matches('/');
     if t.is_empty() {
         return "/".to_string();
@@ -2142,6 +2147,20 @@ mod tests {
         assert_eq!(got["a"], "a/X.mov");
         assert_eq!(got["b"], "A/x (3).mov");
         assert_eq!(got["c"], "A/x (2).mov");
+    }
+
+    // Regression: a name that ends in the same extension twice is numbered
+    // before its last extension (Go's strings.TrimSuffix), not before its first,
+    // so a listing of two "a.mov.mov" files gives "a.mov (2).mov".
+    #[test]
+    fn dedupe_remote_keeps_a_repeated_extension_in_the_stem() {
+        let mut files = vec![
+            RemoteFile { id: "a".into(), rel: "a.mov.mov".into(), size: 0, ready: true },
+            RemoteFile { id: "b".into(), rel: "a.mov.mov".into(), size: 0, ready: true },
+        ];
+        dedupe_remote(&mut files);
+        assert_eq!(files[0].rel, "a.mov.mov");
+        assert_eq!(files[1].rel, "a.mov (2).mov");
     }
 
     // Go: TestLocalRootOK — a share that isn't mounted is refused.
@@ -2198,5 +2217,851 @@ mod tests {
         assert_eq!(path_ext("a/b/x.mov"), ".mov");
         assert_eq!(path_ext("a/b/x"), "");
         assert_eq!(path_ext("a.b/x"), "");
+    }
+}
+
+
+// ---------- Property tests (proptest-praxis discovery suite) ----------
+//
+// Everything below tests the private decision machinery in this module: the
+// walk, the temp-name filter, the batch key, the backoff curve, the remote
+// dedupe, and the Go-parity path helpers. The remote listing and the folder log
+// are covered in `tests/prop_watch.rs`.
+//
+// Run with: cargo test --lib --offline xfer::watch::props
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::collection::vec as pvec;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // ---------- temp_name ----------
+
+    /// The six suffixes temp_name's doc names, lowercased as the code does.
+    const DOC_SUFFIXES: [&str; 6] = [".part", ".partial", ".crdownload", ".download", ".tmp", ".temp"];
+
+    /// temp_model is the rule the doc states, written from the doc text rather
+    /// than from the code: lowercased, starts with "~$" or ".", or ends with one
+    /// of the six partial-write suffixes.
+    fn temp_model(name: &str) -> bool {
+        let n = name.to_lowercase();
+        n.starts_with("~$") || n.starts_with('.') || DOC_SUFFIXES.iter().any(|s| n.ends_with(*s))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// For every string, the filter agrees with the rule it documents.
+        #[test]
+        fn temp_name_matches_the_documented_rule(name in ".{0,12}") {
+            prop_assert_eq!(temp_name(&name), temp_model(&name), "name {:?}", name);
+        }
+
+        /// Every documented partial-write suffix is filtered, in any case, and
+        /// the stem in front of it doesn't matter; so is a "~$" or "." prefix.
+        #[test]
+        fn every_documented_temp_form_is_filtered(
+            stem in "[A-Za-z0-9 _-]{0,10}",
+            which in 0usize..DOC_SUFFIXES.len(),
+            upper in any::<bool>(),
+        ) {
+            let suffix = DOC_SUFFIXES[which];
+            let suffix = if upper { suffix.to_uppercase() } else { suffix.to_string() };
+            prop_assert!(temp_name(&format!("{}{}", stem, suffix)), "stem {:?} suffix {:?}", stem, suffix);
+            prop_assert!(temp_name(&format!("~${}", stem)), "~$ + {:?}", stem);
+            prop_assert!(temp_name(&format!(".{}", stem)), "dot + {:?}", stem);
+        }
+
+        /// A name that is none of the documented forms is not filtered: this is
+        /// what stops a real media file from being ignored.
+        #[test]
+        fn ordinary_media_names_are_not_filtered(stem in "[A-Za-z0-9_-]{1,10}", ext in "mov|mp4|mxf|wav|r3d") {
+            let name = format!("{}.{}", stem, ext);
+            prop_assert!(!temp_name(&name), "name {:?}", name);
+        }
+    }
+
+    // ---------- same_key ----------
+
+    /// The batch logic groups by (case-insensitive relative path, size): a local
+    /// file whose key is already in the listing is not uploaded again.
+    fn key_model(rel: &str, size: i64) -> (String, i64) {
+        (rel.to_lowercase(), size)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// Two (rel, size) pairs share a key exactly when they are the same path
+        /// ignoring case and the same size.
+        #[test]
+        fn same_key_groups_exactly_by_lowercased_path_and_size(
+            a in "[A-Za-z0-9 ./_-]{0,12}",
+            b in "[A-Za-z0-9 ./_-]{0,12}",
+            sa in 0i64..1_000_000,
+            sb in 0i64..1_000_000,
+        ) {
+            prop_assert_eq!(
+                same_key(&a, sa) == same_key(&b, sb),
+                key_model(&a, sa) == key_model(&b, sb),
+                "a {:?}/{} b {:?}/{}", a, sa, b, sb
+            );
+        }
+
+        /// A different size never shares a key, and case never splits one.
+        #[test]
+        fn different_size_never_matches_and_case_never_splits(
+            rel in "[A-Za-z0-9 ./_-]{1,12}",
+            size in 1i64..1_000_000,
+            delta in 1i64..1000,
+        ) {
+            prop_assert_ne!(same_key(&rel, size), same_key(&rel, size + delta));
+            prop_assert_eq!(same_key(&rel, size), same_key(&rel.to_uppercase(), size));
+        }
+    }
+
+    // ---------- watch_backoff ----------
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 40, ..ProptestConfig::default() })]
+
+        /// The backoff never decreases as failures pile up and never exceeds the
+        /// documented 15 minutes; it starts at 30s and doubles.
+        #[test]
+        fn watch_backoff_is_monotone_and_capped(n in 0u32..64) {
+            let b = watch_backoff(n);
+            prop_assert!(b <= Duration::from_secs(15 * 60), "n {} gave {:?}", n, b);
+            prop_assert!(b >= Duration::from_secs(30), "n {} gave {:?}", n, b);
+            prop_assert!(watch_backoff(n + 1) >= b, "{} then {}: {:?} then {:?}", n, n + 1, b, watch_backoff(n + 1));
+            match n {
+                1..=5 => prop_assert_eq!(b, Duration::from_secs(30 * (1 << (n - 1)))),
+                6..=63 => prop_assert_eq!(b, Duration::from_secs(15 * 60)),
+                _ => prop_assert_eq!(b, Duration::from_secs(30)), // 0: the first failure's wait
+            }
+        }
+    }
+
+    // ---------- path helpers ----------
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// clean is idempotent, keeps the root "/" and the leading ".."s, and
+        /// every other form has no empty or "." segment and no trailing slash.
+        #[test]
+        fn clean_is_a_normal_form(p in "[A-Za-z0-9 ./]{0,14}") {
+            let c = clean(&p);
+            prop_assert_eq!(c.clone(), clean(&c), "p {:?}", p);
+            prop_assert!(!c.is_empty(), "p {:?}", p);
+            prop_assert_eq!(c.starts_with('/'), p.starts_with('/'), "p {:?} -> {:?}", p, c);
+            if c != "." && c != ".." && !c.starts_with("../") && c != "/" {
+                prop_assert!(!c.ends_with('/'), "p {:?} -> {:?}", p, c);
+                for seg in c.trim_start_matches('/').split('/') {
+                    prop_assert!(seg != "." && !seg.is_empty(), "p {:?} -> {:?}", p, c);
+                }
+            }
+        }
+
+        /// Every caller passes a clean relative path (from the walk or a
+        /// listing), so this is the domain that matters: one separator, no
+        /// trailing slash on the folder, and the joined path is the folder's
+        /// normal form plus the file.
+        #[test]
+        fn join_path_has_one_separator(
+            dir in "/[A-Za-z0-9]{1,6}(/[A-Za-z0-9]{1,6}){0,2}",
+            rel in "[A-Za-z0-9]{1,6}(/[A-Za-z0-9]{1,6}){0,2}",
+        ) {
+            let j = join_path(&dir, &rel);
+            prop_assert!(!j.contains("//"), "dir {:?} rel {:?} -> {:?}", dir, rel, j);
+            prop_assert_eq!(j.clone(), format!("{}/{}", clean(&dir), rel));
+            prop_assert_eq!(join_path(&(dir.clone() + "/"), &rel), j);
+        }
+    }
+
+    /// What Go 1.27.3's filepath.Dir, path.Ext and filepath.Base return, from
+    /// `go run` — the model the three helpers document.
+    const GO_DB: [(&str, &str, &str, &str); 11] = [
+        //  path,   Dir,      Ext,   Base
+        ("", ".", "", "."),
+        (".", ".", ".", "."),
+        ("/", "/", "", "/"),
+        ("//", "/", "", "/"),
+        ("a/b/", "a/b", "", "b"),
+        ("/a/b/", "/a/b", "", "b"),
+        ("a", ".", "", "a"),
+        ("/a", "/", "", "a"),
+        ("a.b/x", "a.b", "", "x"),
+        ("a/..", "a", ".", ".."),
+        ("../a", "..", "", "a"),
+    ];
+
+    #[test]
+    fn go_parity_helpers_match_go() {
+        let mut bad: Vec<String> = Vec::new();
+        for (p, dir, ext, base) in GO_DB {
+            let got = crate::xfer::folderlog::dir_of(p);
+            if got != dir {
+                bad.push(format!("dir_of({:?}) = {:?}, Go says {:?}", p, got, dir));
+            }
+            if path_ext(p) != ext {
+                bad.push(format!("path_ext({:?}) = {:?}, Go says {:?}", p, path_ext(p), ext));
+            }
+            if base_name_path(p) != base {
+                bad.push(format!("base_name_path({:?}) = {:?}, Go says {:?}", p, base_name_path(p), base));
+            }
+        }
+        assert!(bad.is_empty(), "{} differences from Go:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    // ---------- the walk ----------
+
+    /// A folder tree held in the test, built from the same entries the disk tree
+    /// is made from.
+    #[derive(Default, Debug)]
+    struct Model {
+        dirs: BTreeMap<String, Model>,
+        files: BTreeMap<String, i64>, // name -> size
+    }
+
+    impl Model {
+        fn node(&mut self, segs: &[String]) -> &mut Model {
+            let mut n = self;
+            for s in segs {
+                n = n.dirs.entry(s.clone()).or_default();
+            }
+            n
+        }
+
+        /// eligible is what a watch must consider, from the doc: every regular
+        /// file below the root, except empty ones, except names that are skipped
+        /// or are a temp name, and except anything under a folder whose name is
+        /// skipped.
+        fn eligible(&self) -> BTreeSet<(String, i64)> {
+            let mut out = BTreeSet::new();
+            self.collect("", &mut out);
+            out
+        }
+
+        fn collect(&self, prefix: &str, out: &mut BTreeSet<(String, i64)>) {
+            let join = |p: &str, n: &str| if p.is_empty() { n.to_string() } else { format!("{}/{}", p, n) };
+            for (name, sub) in &self.dirs {
+                if skip_name(name) || temp_name(name) {
+                    continue;
+                }
+                sub.collect(&join(prefix, name), out);
+            }
+            for (name, size) in &self.files {
+                if skip_name(name) || temp_name(name) || *size == 0 {
+                    continue;
+                }
+                out.insert((join(prefix, name), *size));
+            }
+        }
+
+        /// descended lists the folders a walk goes into, relative to the root.
+        fn descended(&self) -> BTreeSet<String> {
+            let mut out = BTreeSet::new();
+            self.descend("", &mut out);
+            out
+        }
+
+        fn descend(&self, prefix: &str, out: &mut BTreeSet<String>) {
+            for (name, sub) in &self.dirs {
+                if skip_name(name) || temp_name(name) {
+                    continue;
+                }
+                let p = if prefix.is_empty() { name.clone() } else { format!("{}/{}", prefix, name) };
+                out.insert(p.clone());
+                sub.descend(&p, out);
+            }
+        }
+    }
+
+    /// A name a user could plausibly have, plus the metadata and partial-write
+    /// names a watch must leave alone.
+    fn any_name() -> impl Strategy<Value = String> {
+        let plain = "[A-Za-z0-9][A-Za-z0-9 ._-]{0,6}".prop_map(|s| s.trim_end().to_string());
+        let hidden = "[A-Za-z]{0,4}".prop_map(String::from);
+        prop_oneof![
+            5 => plain,
+            1 => hidden.prop_map(|s| format!(".{}", s)),
+            2 => prop::sample::select(vec![
+                "~$notes.docx".to_string(),
+                "a.mov.part".to_string(),
+                "b.partial".to_string(),
+                "c.crdownload".to_string(),
+                "d.download".to_string(),
+                "e.tmp".to_string(),
+                "f.TEMP".to_string(),
+                ".DS_Store".to_string(),
+                ".Spotlight-V100".to_string(),
+                "Thumbs.db".to_string(),
+                "x.fiopart".to_string(),
+                "y.fiostate.tmp".to_string(),
+                "FioTransfer Upload 2026-01-02 030405.txt".to_string(),
+            ]),
+        ]
+    }
+
+    /// Puts one generated entry into the model and on disk, skipping anything
+    /// that would make one path both a folder and a file.
+    fn place(model: &mut Model, root: &std::path::Path, segs: &[String], name: &str, size: u8) -> bool {
+        {
+            let mut n: &Model = model;
+            for s in segs {
+                if n.files.contains_key(s) {
+                    return false;
+                }
+                n = match n.dirs.get(s) {
+                    Some(sub) => sub,
+                    None => return false, // make_parents makes them first
+                };
+            }
+            if n.files.contains_key(name) {
+                return false;
+            }
+        }
+        let dir = segs.iter().fold(root.to_path_buf(), |p, s| p.join(s));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        if std::fs::write(dir.join(name), vec![b'x'; size as usize]).is_err() {
+            return false;
+        }
+        model.node(segs).files.insert(name.to_string(), size as i64);
+        true
+    }
+
+    /// Makes the entry's parent folders in the model, failing if one of them is
+    /// already a file.
+    fn make_parents(model: &mut Model, segs: &[String]) -> bool {
+        {
+            let mut n: &Model = model;
+            for s in segs {
+                if n.files.contains_key(s) {
+                    return false;
+                }
+                n = match n.dirs.get(s) {
+                    Some(sub) => sub,
+                    None => break,
+                };
+            }
+        }
+        model.node(segs);
+        true
+    }
+
+    fn walk_with_dirs(root: &str) -> Result<(Vec<(String, i64, i64)>, HashMap<String, i64>), String> {
+        let mut files = Vec::new();
+        let mut dirs = Some(HashMap::new());
+        walk_watch(root, &mut files, &mut dirs)?;
+        Ok((files, dirs.unwrap_or_default()))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// walk_watch returns every eligible file exactly once, and nothing under
+        /// a skipped or temp-named folder.
+        #[test]
+        fn walk_lists_each_eligible_file_once(entries in pvec((0u8..3, 0u8..3, any_name(), 0u8..3), 0..10)) {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let root = tmp.path().to_path_buf();
+            let root_s = root.to_string_lossy().into_owned();
+            let mut model = Model::default();
+            for (depth, tag, name, size) in &entries {
+                if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                    continue; // not a filename
+                }
+                let segs: Vec<String> = (0..*depth).map(|l| format!("d{}_{}", l, tag % 3)).collect();
+                if !make_parents(&mut model, &segs) {
+                    continue;
+                }
+                place(&mut model, &root, &segs, name, *size);
+            }
+
+            let mut files: Vec<(String, i64, i64)> = Vec::new();
+            let mut dirs: Option<HashMap<String, i64>> = Some(HashMap::new());
+            walk_watch(&root_s, &mut files, &mut dirs).expect("root exists");
+            let got: BTreeSet<(String, i64)> = files.iter().map(|(r, s, _)| (r.clone(), *s)).collect();
+            prop_assert_eq!(got.len(), files.len(), "a file was listed twice: {:?}", files);
+            prop_assert_eq!(got, model.eligible());
+            for (rel, _, _) in &files {
+                prop_assert!(!rel.starts_with('/'), "rel {:?} is not relative", rel);
+                for seg in rel.split('/') {
+                    prop_assert!(!seg.is_empty() && seg != ".." && seg != ".", "rel {:?}", rel);
+                }
+            }
+        }
+
+        /// The walk reports exactly the folders it descended into, keyed by full
+        /// path and with an mtime, and the root is one of them.
+        #[test]
+        fn walk_reports_the_folders_it_descends(entries in pvec((0u8..3, 0u8..3, any_name(), 1u8..3), 0..8)) {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let root = tmp.path().to_path_buf();
+            let root_s = root.to_string_lossy().into_owned();
+            let mut model = Model::default();
+            for (depth, tag, name, size) in &entries {
+                if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                    continue;
+                }
+                let segs: Vec<String> = (0..*depth).map(|l| format!("d{}_{}", l, tag % 3)).collect();
+                if !make_parents(&mut model, &segs) {
+                    continue;
+                }
+                place(&mut model, &root, &segs, name, *size);
+            }
+            let (files, dirs) = walk_with_dirs(&root_s).expect("root exists");
+            let mut want: BTreeSet<String> = BTreeSet::new();
+            want.insert(root_s.clone());
+            for d in model.descended() {
+                want.insert(root.join(&d).to_string_lossy().into_owned());
+            }
+            let got: BTreeSet<String> = dirs.keys().cloned().collect();
+            prop_assert_eq!(got, want);
+            for (d, mtime) in &dirs {
+                prop_assert!(*mtime > 0, "folder {:?} has no mtime", d);
+            }
+            prop_assert!(files.iter().all(|(rel, _, _)| !rel.starts_with('/')));
+        }
+    }
+
+    #[test]
+    fn walk_refuses_a_missing_root() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let missing = tmp.path().join("not-there");
+        let mut files: Vec<(String, i64, i64)> = Vec::new();
+        let mut dirs: Option<HashMap<String, i64>> = None;
+        assert_eq!(
+            walk_watch(&missing.to_string_lossy(), &mut files, &mut dirs),
+            Err(ERR_FOLDER_UNAVAILABLE.to_string())
+        );
+        assert!(files.is_empty());
+    }
+
+    // ---------- dedupe_remote ----------
+
+    fn dedupe_name_cases() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                "a.mov", "A.MOV", "a.mov.mov", "x.txt.txt", "b.tar.gz", ".hidden", "no_ext",
+                "Sub/a.mov", "sub/A.mov", "a (2).mov", "c.", "d..e",
+            ]).prop_map(String::from),
+            "[a-z]{1,3}\\.[a-z]{1,3}".prop_map(String::from),
+        ]
+    }
+
+    /// Go's strings.TrimSuffix(rel, path.Ext(rel)): the name without its last
+    /// extension, which is what a de-duplicated path is numbered from.
+    fn go_stem(rel: &str) -> &str {
+        let e = path_ext(rel);
+        &rel[..rel.len() - e.len()]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// Colliding paths get " (2)", " (3)" … before their extension, the first
+        /// one in (lowercased path, ID) order keeps its name, no path is taken
+        /// from another file, and the numbering doesn't depend on the order the
+        /// listing arrived in.
+        #[test]
+        fn dedupe_remote_renames_the_later_copies(
+            clusters in pvec((dedupe_name_cases(), 1usize..4), 0..4),
+            rotate in 0usize..7,
+        ) {
+            // Clusters, not a flat list: the interesting case is the same name
+            // in 2..3 files, which a flat generator reaches almost never.
+            let mut names: Vec<String> = Vec::new();
+            for (name, copies) in &clusters {
+                for _ in 0..*copies {
+                    names.push(name.clone());
+                }
+            }
+            let mut files: Vec<RemoteFile> = names
+                .iter()
+                .enumerate()
+                .map(|(i, rel)| RemoteFile { id: format!("{:04x}", i), rel: rel.clone(), size: 1, ready: true })
+                .collect();
+            let originals: HashMap<String, String> = files.iter().map(|f| (f.id.clone(), f.rel.clone())).collect();
+            let before: Vec<String> = files.iter().map(|f| f.id.clone()).collect();
+            let mut sorted = before.clone();
+            sorted.sort_by_key(|id| (originals[id].to_lowercase(), id.clone()));
+
+            dedupe_remote(&mut files);
+
+            prop_assert_eq!(files.len(), before.len());
+            let mut ids: Vec<String> = files.iter().map(|f| f.id.clone()).collect();
+            let mut want_ids = before.clone();
+            ids.sort();
+            want_ids.sort();
+            prop_assert_eq!(&ids, &want_ids, "the IDs changed");
+            prop_assert_eq!(files.iter().map(|f| f.id.clone()).collect::<Vec<_>>(), sorted, "order");
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            for f in &files {
+                prop_assert!(seen.insert(f.rel.to_lowercase()), "two files at {:?}", f.rel);
+            }
+            let mut kept: BTreeSet<String> = BTreeSet::new();
+            for f in &files {
+                let orig = &originals[&f.id];
+                let lc = orig.to_lowercase();
+                if f.rel == *orig && kept.insert(lc.clone()) {
+                    continue; // the first copy keeps its name
+                }
+                let stem = go_stem(orig);
+                let ext = path_ext(orig);
+                let mut matched = false;
+                for n in 2..64 {
+                    if f.rel == format!("{} ({}){}", stem, n, ext) {
+                        matched = true;
+                        break;
+                    }
+                }
+                prop_assert!(
+                    matched,
+                    "{:?} was renamed to {:?}; the numbered form is stem {:?} + \" (n)\" + ext {:?}",
+                    orig, f.rel, stem, ext
+                );
+                prop_assert!(
+                    !originals.values().any(|o| o.to_lowercase() == f.rel.to_lowercase()),
+                    "{:?} took another file's name",
+                    f.rel
+                );
+                kept.insert(f.rel.to_lowercase());
+            }
+
+            // The same listing in another order numbers the same way.
+            if !files.is_empty() {
+                let mut again: Vec<RemoteFile> = before
+                    .iter()
+                    .map(|id| RemoteFile { id: id.clone(), rel: originals[id].clone(), size: 1, ready: true })
+                    .collect();
+                let k = rotate % again.len();
+                again.rotate_left(k);
+                dedupe_remote(&mut again);
+                let a: BTreeMap<String, String> = files.iter().map(|f| (f.id.clone(), f.rel.clone())).collect();
+                let b: BTreeMap<String, String> = again.iter().map(|f| (f.id.clone(), f.rel.clone())).collect();
+                prop_assert_eq!(a, b, "the numbering depends on listing order");
+            }
+        }
+    }
+
+    // ---------- the upload side's decision ----------
+
+    /// What the scan decided about one file.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Kind {
+        Pending,
+        OnFrameio,
+        Settled,
+    }
+
+    const ROW_STATES: [&str; 7] = [
+        WATCH_UPLOADED, WATCH_DOWNLOADED, WATCH_IGNORED, WATCH_CANCELED, WATCH_FAILED, "queued", "",
+    ];
+
+    /// expected is the rule set the module doc and the state comments state,
+    /// applied to one file in the order that matters: a record that still
+    /// matches the file means the watch already moved it (or gave up on it);
+    /// anything else is seen, must hold still for the settle time, is left alone
+    /// when a mirror sees the same name-and-size on Frame.io, and finally must be
+    /// finished being written.
+    fn expected(
+        rel: &str,
+        size: i64,
+        mtime: i64,
+        row: Option<&WatchFile>,
+        prev: Option<&Obs>,
+        settle: Duration,
+        net_vol: bool,
+        mirror: bool,
+        same: &HashSet<String>,
+    ) -> (bool, Option<Kind>) {
+        let now = Instant::now();
+        if let Some(k) = row {
+            let unchanged = k.size == size && k.mtime == mtime;
+            let moved = matches!(
+                k.state.as_str(),
+                WATCH_UPLOADED | WATCH_DOWNLOADED | WATCH_IGNORED | WATCH_CANCELED
+            );
+            if moved && unchanged {
+                return (false, None);
+            }
+            if k.state == WATCH_FAILED && k.attempts >= WATCH_MAX_RETRIES && unchanged {
+                return (false, None); // gave up on this version of the file
+            }
+        }
+        let since = match prev {
+            Some(p) if p.size == size && p.mtime == mtime => p.since,
+            _ => now,
+        };
+        let steady = now.saturating_duration_since(since);
+        if steady < settle {
+            return (true, Some(Kind::Pending));
+        }
+        if mirror && row.is_none() && same.contains(&same_key(rel, size)) {
+            return (true, Some(Kind::OnFrameio));
+        }
+        let finished = !net_vol || steady >= settle * NET_SETTLE_FACTOR;
+        if !finished {
+            return (true, Some(Kind::Pending));
+        }
+        (true, Some(Kind::Settled))
+    }
+
+    fn bucket_age(bucket: usize, settle: Duration) -> Duration {
+        match bucket % 4 {
+            0 => Duration::ZERO,          // just appeared
+            1 => settle / 4,              // still inside the settle window
+            2 => settle * 2,              // settled, but short of a share's 6x
+            _ => settle * 8,              // settled, and long past a share's 6x
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// The upload side's decision matches the documented rules for every
+        /// combination of records, earlier observations, settle age, mirror and
+        /// network share; every seen file lands in exactly one of settled, on
+        /// Frame.io or pending; and re-checking only the files already seen (no
+        /// walk) decides the same as the full walk.
+        #[test]
+        fn scan_upload_side_follows_the_documented_rules(
+            n in 1usize..4,
+            sizes in pvec(1u8..4, 3),
+            rows in pvec((0usize..4, 0usize..7, 0i64..5, 0usize..3), 0..4),
+            prevs in pvec((0usize..4, 0usize..4), 0..4),
+            mirror in any::<bool>(),
+            sames in pvec((0usize..4, 0usize..2), 0..4),
+            settle_ms in prop::sample::select(vec![1_000u64, 10_000]),
+            net_vol in any::<bool>(),
+        ) {
+            let settle = Duration::from_millis(settle_ms);
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let root = tmp.path().to_path_buf();
+            let root_s = root.to_string_lossy().into_owned();
+
+            let mut disk: Vec<(String, i64, i64)> = Vec::new(); // rel, size, mtime
+            for i in 0..n {
+                let rel = format!("take{}.mov", i);
+                let size = *sizes.get(i % sizes.len()).unwrap_or(&1) as i64;
+                std::fs::write(root.join(&rel), vec![b'x'; size as usize]).expect("file");
+                let md = std::fs::metadata(root.join(&rel)).expect("meta");
+                disk.push((rel, md.len() as i64, mtime_nanos(&md)));
+            }
+
+            let mut known: HashMap<String, WatchFile> = HashMap::new();
+            for (idx, st, attempts, mismatch) in &rows {
+                let (rel, size, mtime) = &disk[idx % disk.len()];
+                let mut k = wf(rel, *size, *mtime, ROW_STATES[st % ROW_STATES.len()]);
+                k.attempts = *attempts;
+                match mismatch {
+                    1 => k.size = size + 1,     // the file grew: a new version
+                    2 => k.mtime += 1,          // the file was rewritten: a new version
+                    _ => {}
+                }
+                known.insert(rel.clone(), k);
+            }
+
+            let now = Instant::now();
+            let mut prev: HashMap<String, Obs> = HashMap::new();
+            for (idx, bucket) in &prevs {
+                let (rel, size, mtime) = &disk[idx % disk.len()];
+                let age = bucket_age(*bucket, settle);
+                prev.insert(rel.clone(), Obs { size: *size, mtime: *mtime, since: now - age });
+            }
+
+            let mut same: HashSet<String> = HashSet::new();
+            for (idx, mode) in &sames {
+                let (rel, size, _) = &disk[idx % disk.len()];
+                if *mode == 0 {
+                    same.insert(same_key(rel, *size));
+                } else {
+                    same.insert(same_key(rel, size + 7)); // a different size: not a match
+                }
+            }
+
+            let out = scan_upload_side(&root_s, &prev, &known, true, settle, net_vol, mirror, if mirror { Some(&same) } else { None });
+            prop_assert!(out.err.is_none(), "walk failed: {:?}", out.err);
+
+            let mut want_seen: BTreeSet<String> = BTreeSet::new();
+            let mut want_settled: BTreeSet<String> = BTreeSet::new();
+            let mut want_frameio: BTreeSet<String> = BTreeSet::new();
+            let mut want_pending = 0usize;
+            for (rel, size, mtime) in &disk {
+                let (seen, kind) = expected(rel, *size, *mtime, known.get(rel), prev.get(rel), settle, net_vol, mirror, &same);
+                if !seen {
+                    prop_assert!(!out.seen.contains_key(rel), "{:?} was seen although its record still matches", rel);
+                    continue;
+                }
+                want_seen.insert(rel.clone());
+                match kind {
+                    Some(Kind::Pending) => want_pending += 1,
+                    Some(Kind::OnFrameio) => { want_frameio.insert(rel.clone()); }
+                    Some(Kind::Settled) => { want_settled.insert(rel.clone()); }
+                    None => {}
+                }
+            }
+            let got_seen: BTreeSet<String> = out.seen.keys().cloned().collect();
+            prop_assert_eq!(&got_seen, &want_seen);
+            prop_assert_eq!(
+                out.settled.iter().map(|i| i.rel.clone()).collect::<BTreeSet<_>>(),
+                want_settled
+            );
+            prop_assert_eq!(
+                out.on_frameio.iter().map(|r| r.rel_path.clone()).collect::<BTreeSet<_>>(),
+                want_frameio
+            );
+            prop_assert_eq!(out.pending, want_pending);
+            prop_assert_eq!(
+                out.seen.len(),
+                out.settled.len() + out.on_frameio.len() + out.pending,
+                "every seen file lands in exactly one bucket"
+            );
+            for (rel, size, mtime) in &disk {
+                if let Some(o) = out.seen.get(rel) {
+                    prop_assert_eq!((o.size, o.mtime), (*size, *mtime));
+                }
+            }
+            for it in &out.settled {
+                let (_, size, mtime) = disk.iter().find(|(r, _, _)| *r == it.rel).expect("a known file");
+                prop_assert_eq!((it.size, it.mtime), (*size, *mtime));
+                prop_assert_eq!(&it.local, &join_path(&root_s, &it.rel));
+                prop_assert!(std::fs::metadata(&it.local).map(|m| m.len() as i64 == it.size).unwrap_or(false));
+            }
+            for r in &out.on_frameio {
+                prop_assert_eq!(r.state.as_str(), WATCH_IGNORED);
+            }
+            prop_assert_eq!(out.dirs.is_some(), true, "a walk reports the folders it saw");
+
+            // The incremental path (no walk, only the files already seen) must
+            // decide exactly the same as the full walk.
+            let prev2 = out.seen.clone();
+            let inc = scan_upload_side(&root_s, &prev2, &known, false, settle, net_vol, mirror, if mirror { Some(&same) } else { None });
+            prop_assert!(inc.err.is_none());
+            prop_assert_eq!(
+                inc.settled.iter().map(|i| i.rel.clone()).collect::<BTreeSet<_>>(),
+                out.settled.iter().map(|i| i.rel.clone()).collect::<BTreeSet<_>>(),
+                "the incremental re-check disagrees with the walk"
+            );
+            prop_assert_eq!(inc.pending, out.pending, "pending count");
+            prop_assert_eq!(
+                inc.on_frameio.iter().map(|r| r.rel_path.clone()).collect::<BTreeSet<_>>(),
+                out.on_frameio.iter().map(|r| r.rel_path.clone()).collect::<BTreeSet<_>>()
+            );
+        }
+    }
+
+    // ---------- the remote listing ----------
+
+    /// A one-thread HTTP server for the Frame.io replies a listing needs. Bounded
+    /// by `stop`: set it, then `join`.
+    fn serve(routes: HashMap<String, String>) -> (String, Arc<AtomicBool>, std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let join = std::thread::spawn(move || {
+            for conn in l.incoming() {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(mut c) = conn else { continue };
+                let Ok(peek) = c.try_clone() else { continue };
+                let mut r = BufReader::new(peek);
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" || h == "\n" {
+                        break;
+                    }
+                }
+                let path = line.split(' ').nth(1).unwrap_or("").split('?').next().unwrap_or("").to_string();
+                let body = routes.get(&path).cloned().unwrap_or_else(|| r#"{"data":[],"links":{"next":null}}"#.to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = c.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{}", addr), stop, addr, join)
+    }
+
+    #[test]
+    fn list_remote_walks_the_tree_skips_names_and_takes_the_newest_version() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let mut routes: HashMap<String, String> = HashMap::new();
+        routes.insert(
+            "/v4/accounts/acct/folders/ROOT/children".into(),
+            format!(
+                r#"{{"data":[
+  {{"id":"f1","name":"A.MOV","type":"file","file_size":5,"status":"uploaded"}},
+  {{"id":"f2","name":"a.mov","type":"file","file_size":5,"status":"uploaded"}},
+  {{"id":"f3","name":"b.fiopart","type":"file","file_size":5,"status":"uploaded"}},
+  {{"id":"f6","name":"{}","type":"file","file_size":5,"status":"uploaded"}},
+  {{"id":"f7","name":"pending.mov","type":"file","file_size":6,"status":"created"}},
+  {{"id":"d1","name":"Sub","type":"folder"}},
+  {{"id":"s1","name":"stack1","type":"version_stack","head_version":{{"id":"h1","name":"v2.mov","type":"file","file_size":7,"status":"uploaded"}}}},
+  {{"id":"s2","name":"stack2","type":"version_stack"}}
+],"links":{{"next":null}}}}"#,
+                "FioTransfer Upload 2026-01-02 030405.txt"
+            ),
+        );
+        routes.insert(
+            "/v4/accounts/acct/folders/d1/children".into(),
+            r#"{"data":[{"id":"f5","name":"deep.mov","type":"file","file_size":9,"status":"uploaded"}],"links":{}}"#.into(),
+        );
+        // The stack that names its head must not be asked for its children; if it
+        // is, the reply says so.
+        routes.insert(
+            "/v4/accounts/acct/version_stacks/s1/children".into(),
+            r#"{"data":[{"id":"WRONG","name":"wrong.mov","type":"file","file_size":1,"created_at":"2030-01-01T00:00:00Z"}],"links":{}}"#.into(),
+        );
+        routes.insert(
+            "/v4/accounts/acct/version_stacks/s2/children".into(),
+            r#"{"data":[
+  {"id":"x1","name":"old.mov","type":"file","file_size":3,"created_at":"2020-01-01T00:00:00Z"},
+  {"id":"x2","name":"new.mov","type":"file","file_size":4,"created_at":"2021-01-01T00:00:00Z"}
+],"links":{}}"#.into(),
+        );
+
+        let (url, stop, addr, join) = serve(routes);
+        let client = {
+            let mut c = Client::new(crate::auth::AuthManager::new_static("test-token"));
+            c.base_url = url;
+            std::sync::Arc::new(c)
+        };
+        let cx = CancellationToken::new();
+        let got = rt.block_on(list_remote(&cx, &client, "acct", "ROOT"));
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::net::TcpStream::connect(addr); // wake the accept loop
+        join.join().ok();
+
+        let mut files = got.expect("listing");
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        let rows: Vec<(&str, &str, i64, bool)> =
+            files.iter().map(|f| (f.id.as_str(), f.rel.as_str(), f.size, f.ready)).collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("f1", "A.MOV", 5, true),
+                ("f5", "Sub/deep.mov", 9, true),
+                ("f2", "a (2).mov", 5, true),
+                ("x2", "new.mov", 4, true),
+                ("f7", "pending.mov", 6, false),
+                ("h1", "v2.mov", 7, true),
+            ],
+            "listing: {:?}",
+            rows
+        );
     }
 }
