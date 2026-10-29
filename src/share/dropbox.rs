@@ -593,3 +593,193 @@ impl Source for DropboxClient {
         Ok(())
     }
 }
+
+/// Property tests for the link parser, the client's reading of a link, the
+/// listing page's shape and the Content-Disposition / redirect helpers. All of
+/// these are pure; the client's requests live behind `Source` and cannot run
+/// here.
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    const TOKEN: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+
+    fn tokens(min: usize, max: usize) -> impl Strategy<Value = String> {
+        (min..=max)
+            .prop_flat_map(|n| prop::collection::vec(select(TOKEN), n))
+            .prop_map(|v| String::from_utf8(v).unwrap())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+        cases: 64,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED),
+        ..ProptestConfig::default()
+    })]
+
+        /// A folder link asks for the folder the user pasted: the key the parser
+        /// reports is the key the listing uses, and only /fo and /sh links are
+        /// folders.
+        #[test]
+        fn client_agrees_with_the_parser(
+            seg in select(vec!["scl/fo", "scl/fi", "sh", "s"]),
+            key in tokens(3, 20),
+            last in tokens(1, 12),
+            host in select(vec!["www.dropbox.com", "dropbox.com"]),
+        ) {
+            let raw = format!("https://{}/{}/{}/{}", host, seg, key, last);
+            let l = dropbox_link(&raw).expect("a share link");
+            let c = DropboxClient::new(l.url.clone());
+            let (p, _q, folder) = c.parts();
+            prop_assert_eq!(DropboxClient::link_key(&p), l.id.clone(), "{:?}", l);
+            // /sh is a shared folder, /s a shared file; /scl/fo a folder,
+            // /scl/fi a file.
+            prop_assert_eq!(folder, seg == "sh" || seg.ends_with("fo"));
+            prop_assert!(!p.iter().any(|s| s.contains('?')), "{:?}", p);
+        }
+
+        /// `dropbox_download` serves the file itself: one dl=1 and nothing else
+        /// changed, stable when applied twice.
+        #[test]
+        fn download_urls_carry_one_dl(
+            host in select(vec!["https://www.dropbox.com", "https://dl.dropboxusercontent.com"]),
+            seg in tokens(1, 12),
+            key in tokens(1, 12),
+            rlkey in proptest::option::of(tokens(1, 10)),
+            dl in proptest::option::of(select(vec!["0", "1", "yes"])),
+        ) {
+            let mut raw = format!("{}/{}/{}", host, seg, key);
+            let mut q: Vec<String> = Vec::new();
+            if let Some(r) = &rlkey {
+                q.push(format!("rlkey={}", r));
+            }
+            if let Some(d) = &dl {
+                q.push(format!("dl={}", d));
+            }
+            if !q.is_empty() {
+                raw.push('?');
+                raw.push_str(&q.join("&"));
+            }
+            let once = dropbox_download(&raw).expect("a URL");
+            let u = url::Url::parse(&once).expect("parses");
+            let pairs: Vec<(String, String)> =
+                u.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            prop_assert_eq!(pairs.iter().filter(|(k, _)| k == "dl").count(), 1, "{:?}", once);
+            prop_assert!(pairs.iter().any(|(k, v)| k == "dl" && v == "1"), "{:?}", once);
+            prop_assert_eq!(
+                pairs.iter().filter(|(k, _)| k == "rlkey").count(),
+                usize::from(rlkey.is_some()),
+                "{:?}",
+                once
+            );
+            let twice = dropbox_download(&once).expect("parses");
+            prop_assert_eq!(twice.as_str(), once.as_str());
+            prop_assert_eq!(dropbox_download("not a url").is_err(), true);
+        }
+
+        /// The content server URL is the first hop on the content host: the
+        /// redirect into it is crossed, no redirect after it is.
+        #[test]
+        fn content_url_is_the_first_hop_on_the_content_host(
+            hops in 1usize..6,
+            tail in 1usize..4,
+        ) {
+            let mut chain: Vec<String> =
+                (0..hops).map(|i| format!("https://www.dropbox.com/scl/fi/k/n?x={}", i)).collect();
+            let first_content = format!("https://content.dropboxapi.com/cd/0/inline/{}/x", 0);
+            for i in 0..tail {
+                chain.push(format!("https://content.dropboxapi.com/cd/0/inline/{}/x", i));
+            }
+            let got = content_url(&chain);
+            prop_assert_eq!(got.as_str(), first_content.as_str(), "{:?}", chain);
+            prop_assert!(chain.contains(&got));
+            let all_content: Vec<String> =
+                (0..tail).map(|i| format!("https://content.dropboxapi.com/cd/0/inline/{}", i)).collect();
+            let all = content_url(&all_content);
+            prop_assert_eq!(all.as_str(), all_content[0].as_str());
+            let mut one = vec!["https://content.dropboxapi.com/cd/0/inline/x".to_string()];
+            let first = content_url(&one);
+            prop_assert_eq!(first.as_str(), one[0].as_str());
+            // Both hops are on the content host, so the first of them is the
+            // one the engine follows itself.
+            one.push("https://content.dropboxapi.com/cd/0/inline2/x".to_string());
+            let second = content_url(&one);
+            prop_assert_eq!(second.as_str(), one[0].as_str());
+            prop_assert_eq!(content_url(&[]), String::new());
+        }
+
+        /// The Content-Disposition reader takes the quoted filename, unescapes it,
+        /// prefers an RFC 2231 filename* and gives nothing when there is no name.
+        #[test]
+        fn content_disposition_names_are_read(
+            name in "[a-zA-Z0-9 ._-]{0,24}",
+            quoted in any::<bool>(),
+            extended in any::<bool>(),
+            size in 0u64..100000,
+        ) {
+            // Two names, always different: the plain parameter and the RFC 2231
+            // one. When both are there the extended form must win.
+            let plain = format!("plain-{}", name);
+            let shown = if quoted { format!("\"{}\"", plain) } else { plain.clone() };
+            let header = if extended {
+                let enc: String = name.bytes().map(|b| format!("%{:02X}", b)).collect();
+                format!("attachment; size={}; filename={}", size, shown)
+                    + &format!("; filename*=UTF-8''{}", enc)
+            } else {
+                format!("attachment; size={}; filename={}", size, shown)
+            };
+            let got = media_filename(&header);
+            // An unquoted value is trimmed the way an HTTP parameter is; a
+            // quoted one keeps its spaces.
+            let want = if extended {
+                name.clone()
+            } else if quoted {
+                plain.clone()
+            } else {
+                plain.trim().to_string()
+            };
+            prop_assert_eq!(got, Some(want), "{:?}", header);
+            prop_assert_eq!(media_filename("attachment"), None);
+            prop_assert_eq!(media_filename(""), None);
+            // A backslash inside a quoted name is an escape, not part of the name.
+            if quoted && !name.contains('"') {
+                let header = format!("attachment; filename=\"a\\{}b\"", name);
+                let got = media_filename(&header).unwrap_or_default();
+                prop_assert_eq!(got, format!("a{}b", name), "{:?}", header);
+            }
+        }
+
+        /// Every shape of the listing page tolerates junk: an empty object is a
+        /// default page, a scalar in the first field is an error, and a page that
+        /// says it has more entries keeps its voucher for the next request.
+        #[test]
+        fn listing_pages_take_junk(body in prop::collection::vec(any::<u8>(), 0..48), shape in 0usize..4) {
+            let payload: Vec<u8> = match shape {
+                0 => body.clone(),
+                1 => b"{}".to_vec(),
+                2 => b"[1,2,3]".to_vec(),
+                _ => br#"{"entries":[{"filename":"a.mov","is_dir":false,"href":"h","bytes":7}],"share_tokens":[{"secureHash":"s"}],"has_more_entries":true,"next_request_voucher":"v","folder":{"filename":"f"}}"#.to_vec(),
+            };
+            let r = serde_json::from_slice::<DropboxPage>(&payload);
+            match shape {
+                1 => prop_assert!(r.is_ok(), "an empty object is a default page"),
+                2 => prop_assert!(r.is_err(), "a sequence is not a page"),
+                3 => {
+                    let pg = r.expect("a page");
+                    prop_assert_eq!(pg.entries.len(), 1);
+                    prop_assert_eq!(pg.entries[0].filename.as_str(), "a.mov");
+                    prop_assert_eq!(pg.entries[0].bytes, 7);
+                    prop_assert_eq!(pg.entries[0].href.as_str(), "h");
+                    prop_assert!(pg.has_more);
+                    prop_assert_eq!(pg.voucher.as_str(), "v");
+                    prop_assert_eq!(pg.share_tokens.len(), 1);
+                    let folder = pg.folder.map(|f| f.filename).unwrap_or_default();
+                    prop_assert_eq!(folder.as_str(), "f");
+                }
+                _ => prop_assert!(r.is_ok() || r.is_err(), "junk must not panic"),
+            }
+        }
+    }
+}
