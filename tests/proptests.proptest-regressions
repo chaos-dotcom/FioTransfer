@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 66562be8e91095e6f93ed6bab569a9d16df4eaa74d17a64c8c628d3e01e85ac6 # shrinks to stem = "a", ext = "0"
+cc 55cba891d0f5f12e253b222a4a01ee0f3d837eddcc99b87b633c35cfb6df21f3 # shrinks to ids = {}
+cc 9a0e114589015ea82c5e2397c491e88c34464bd1dd28f0d5063c5849522417e1 # shrinks to ids = {}
