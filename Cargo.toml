@@ -69,3 +69,24 @@ strip = "symbols"
 [dev-dependencies]
 proptest = "1.12.0"
 tempfile = "3.27.0"
+
+# Unsigned packaging through cargo-packager (0.11 reads this table; `--config`
+# with a file path is broken in that release, so the config lives here).
+#   cargo packager --formats app        (macOS app bundle; also: dmg)
+[package.metadata.packager]
+product-name = "FioTransfer"
+version = "1.0.0"
+identifier = "com.farbhaus.fiotransfer"
+out-dir = "dist"
+binaries-dir = "target/release"
+formats = ["app"]
+icons = ["build/icons/icon.icns", "build/icons/icon_1024.png", "build/icons/icon_512.png"]
+before-packaging-command = "cargo build --release -p fiotransfer --bin FioTransfer"
+resources = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
+
+[[package.metadata.packager.binaries]]
+path = "FioTransfer"
+main = true
+
+[package.metadata.packager.macos]
+minimum-system-version = "13.0"
