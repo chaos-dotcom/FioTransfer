@@ -28,8 +28,8 @@ import (
 // say what the watch already moved, so a file it downloaded is never uploaded
 // back, and the other way round. A local file that changes after its record
 // (a re-render) is a new version: it uploads again, and with OnChangeOverwrite
-// its earlier copy there is deleted once Frame.io confirms the new one. Nothing
-// else is deleted on either side.
+// its earlier copy there, if FioTransfer uploaded it, is deleted once Frame.io
+// confirms the new one. Nothing else is deleted on either side.
 
 var (
 	watchInterval   = 5 * time.Second  // how often folders are checked
@@ -889,9 +889,18 @@ func (w *Watcher) startBatch(s *watchState, x history.Watch, items []scanned, kn
 			}
 		}
 		if overwrite {
+			// Only a copy FioTransfer uploaded is replaced: a same-named file
+			// put there some other way stays next to the new one.
+			ids := make([]string, 0, len(earlier))
+			for _, id := range earlier {
+				ids = append(ids, id)
+			}
+			ours := m.Hist.Uploaded(ids)
 			for _, f := range list {
 				f.mu.Lock()
-				f.replaces = earlier[f.RelPath]
+				if old := earlier[f.RelPath]; ours[old] {
+					f.replaces = old
+				}
 				f.mu.Unlock()
 			}
 		}

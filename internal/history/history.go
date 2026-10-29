@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS transfer_files(
   asset_id TEXT, finished_at INTEGER, PRIMARY KEY(transfer_id, idx));
 CREATE INDEX IF NOT EXISTS transfer_files_asset ON transfer_files(asset_id);
 CREATE INDEX IF NOT EXISTS transfer_files_local ON transfer_files(local_path);
+CREATE INDEX IF NOT EXISTS transfer_files_remote ON transfer_files(remote_id);
 `
 
 func Open(dir, logDir string) (*Store, error) {

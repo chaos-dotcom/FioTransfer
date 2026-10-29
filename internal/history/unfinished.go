@@ -114,3 +114,16 @@ func (s *Store) ReplacedFiles() ([]Replaced, error) {
 func (s *Store) KeepReplaced(fileID string) {
 	s.db.Exec(`DELETE FROM replaced_files WHERE file_id=?`, fileID)
 }
+
+// Uploaded returns which of these Frame.io files FioTransfer uploaded and
+// Frame.io confirmed (none if history can't be read).
+func (s *Store) Uploaded(fileIDs []string) map[string]bool {
+	out := map[string]bool{}
+	for _, id := range fileIDs {
+		var n int
+		if id != "" && s.db.QueryRow(`SELECT COUNT(*) FROM transfer_files WHERE remote_id=? AND status='done'`, id).Scan(&n) == nil && n > 0 {
+			out[id] = true
+		}
+	}
+	return out
+}

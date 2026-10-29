@@ -50,18 +50,21 @@ func replacedRows(t *testing.T, m *Manager) []history.Replaced {
 
 // A re-rendered file uploads again and its earlier copy on Frame.io goes once
 // Frame.io confirms the new one. Files that were there before the watch
-// replace the one same-named copy; an ambiguous name or a version stack is
-// left alone.
+// replace the one same-named copy if FioTransfer uploaded it; one put there
+// another way, an ambiguous name or a version stack is left alone.
 func TestWatchReplacesNewVersion(t *testing.T) {
 	fake := newFake(t)
 	m := newTestManager(t, fake, 4, 1)
 	w := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond)
 	defer w.Close()
 	root := t.TempDir()
-	for i, n := range []string{"b.mov", "dup.mov", "stack.mov"} {
+	for i, n := range []string{"b.mov", "dup.mov", "stack.mov", "c.mov"} {
 		writeFile(t, filepath.Join(root, n), randBytes(int64(i+1), 4000))
 	}
 	byHand := fake.addRemote("dest", "b.mov", randBytes(1, 4000))
+	j, _ := m.StartUpload(UploadOptions{Paths: []string{filepath.Join(root, "c.mov")}, AccountID: "acct", FolderID: "dest", DestLabel: "P"})
+	waitJob(t, m, j.ID, 10*time.Second)
+	byApp := fake.uploadsNamed("c.mov")
 	dup1, dup2 := fake.addRemote("dest", "dup.mov", randBytes(2, 4000)), fake.addRemote("dest", "dup.mov", randBytes(2, 4000))
 	stack := fake.addStack("dest", "stack.mov", []string{"stack.mov"}, [][]byte{randBytes(3, 4000)})
 	x, err := w.Add(root, "acct", "dest", "P", history.DirUpload, history.OnChangeOverwrite, false)
@@ -84,23 +87,22 @@ func TestWatchReplacesNewVersion(t *testing.T) {
 		t.Errorf("a.mov on Frame.io: %v; %s", ids, fake.uploadReport("dest"))
 	}
 
-	for i, n := range []string{"b.mov", "dup.mov", "stack.mov"} {
+	for i, n := range []string{"b.mov", "dup.mov", "stack.mov", "c.mov"} {
 		rerender(t, filepath.Join(root, n), randBytes(int64(20+i), 5000))
 	}
 	waitFor(t, "changed files", 10*time.Second, func() bool {
-		return len(fake.uploadsNamed("b.mov")) == 1 && len(fake.uploadsNamed("dup.mov")) == 1 && len(fake.uploadsNamed("stack.mov")) == 1
+		return len(fake.uploadsNamed("b.mov")) == 1 && len(fake.uploadsNamed("dup.mov")) == 1 && len(fake.uploadsNamed("stack.mov")) == 1 &&
+			slices.ContainsFunc(fake.uploadsNamed("c.mov"), func(id string) bool { return id != byApp[0] })
 	})
 	waitFor(t, "idle watch", 10*time.Second, func() bool { return watchView(w, x.ID).State == "watching" })
+	waitFor(t, "FioTransfer's copy replaced", 10*time.Second, func() bool { return slices.Contains(fake.deletedFiles(), byApp[0]) })
 	deleted := fake.deletedFiles()
-	if !slices.Contains(deleted, byHand) {
-		t.Errorf("the copy uploaded by hand wasn't replaced; deleted %v", deleted)
-	}
-	for _, id := range []string{dup1, dup2, stack} {
+	for _, id := range []string{byHand, dup1, dup2, stack} {
 		if slices.Contains(deleted, id) {
-			t.Errorf("deleted %s, which isn't clearly the earlier version; deleted %v", id, deleted)
+			t.Errorf("deleted %s, which FioTransfer didn't upload or isn't clearly the earlier version; deleted %v", id, deleted)
 		}
 	}
-	if v := watchView(w, x.ID); v.Uploaded != 4 || v.Failed != 0 {
+	if v := watchView(w, x.ID); v.Uploaded != 5 || v.Failed != 0 {
 		t.Errorf("view = %+v", v)
 	}
 	if rows := replacedRows(t, m); len(rows) != 0 {
@@ -245,6 +247,36 @@ func TestWatchMirrorReplace(t *testing.T) {
 	}
 	if v := watchView(w, x.ID); v.Uploaded != 1 || v.Downloaded != 0 {
 		t.Errorf("view = %+v", v)
+	}
+}
+
+// A file the mirror downloaded came from someone else: re-rendering it locally
+// uploads the new version next to theirs, which stays and isn't downloaded
+// back over the new render.
+func TestWatchMirrorKeepsDownloaded(t *testing.T) {
+	fake := newFake(t)
+	m := newTestManager(t, fake, 4, 1)
+	w := newWatcher(m, 50*time.Millisecond, 100*time.Millisecond)
+	defer w.Close()
+	root := t.TempDir()
+	theirs := fake.addRemote("dest", "a.mov", randBytes(1, 4000))
+	x, _ := w.Add(root, "acct", "dest", "P", history.DirMirror, history.OnChangeOverwrite, true)
+	waitFor(t, "download", 10*time.Second, func() bool { v := watchView(w, x.ID); return v.Downloaded == 1 && v.State == "watching" })
+
+	a := filepath.Join(root, "a.mov")
+	v2 := randBytes(2, 5000)
+	rerender(t, a, v2)
+	waitFor(t, "new version", 10*time.Second, func() bool { return len(fake.uploadsNamed("a.mov")) == 1 })
+	waitFor(t, "idle watch", 10*time.Second, func() bool { return watchView(w, x.ID).State == "watching" })
+	time.Sleep(time.Second) // several listings with both copies on Frame.io
+	if d := fake.deletedFiles(); slices.Contains(d, theirs) {
+		t.Errorf("deleted a file FioTransfer didn't upload: %v", d)
+	}
+	if got, _ := os.ReadFile(a); !bytes.Equal(got, v2) {
+		t.Fatal("the earlier version was downloaded over the new render")
+	}
+	if rows := replacedRows(t, m); len(rows) != 0 {
+		t.Errorf("replace rows: %+v", rows)
 	}
 }
 

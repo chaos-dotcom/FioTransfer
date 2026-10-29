@@ -255,12 +255,12 @@ func (j *Job) deleteReplaced(f *File, old, newID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := j.mgr.deleteFile(ctx, j.AccountID, old); err != nil {
-		h.Log("%s replace  [%s] %s — couldn't delete the earlier version from Frame.io (will retry): %v", kindTag(j.Kind), j.ID, f.RelPath, err)
+		h.Log("%s replace  [%s] %s — couldn't delete the earlier version %s from Frame.io (will retry): %v", kindTag(j.Kind), j.ID, f.RelPath, old, err)
 		return
 	}
 	h.UploadDeleted(old)
 	f.setNote("replaced the earlier version")
-	h.Log("%s replaced [%s] %s — deleted the earlier version from Frame.io", kindTag(j.Kind), j.ID, f.RelPath)
+	h.Log("%s replaced [%s] %s — deleted the earlier version %s from Frame.io", kindTag(j.Kind), j.ID, f.RelPath, old)
 }
 
 // deleteFile deletes a file on Frame.io; one that's already gone counts as deleted.
@@ -348,7 +348,7 @@ func (m *Manager) finishReplaces(ctx context.Context) {
 			continue
 		}
 		m.Hist.UploadDeleted(r.FileID)
-		m.Hist.Log("UPLOAD   replaced [%s] %s — deleted the earlier version from Frame.io", r.TransferID, r.RelPath)
+		m.Hist.Log("UPLOAD   replaced [%s] %s — deleted the earlier version %s from Frame.io", r.TransferID, r.RelPath, r.FileID)
 	}
 }
 
