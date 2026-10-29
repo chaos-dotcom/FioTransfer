@@ -237,9 +237,19 @@ async fn new_manager(client: Arc<Client>, settings: config::Settings) -> Arc<xfe
 }
 
 fn check_range(flag: &str, v: i64, lo: i64, hi: i64) {
-    if v < lo || v > hi {
-        fatal(&format!("{} must be between {} and {}", flag, lo, hi));
+    if let Err(e) = range_check(flag, v, lo, hi) {
+        fatal(&e);
     }
+}
+
+/// The message `fio` prints for an out-of-range number, or `Ok` when the value
+/// is inside `lo..=hi`. (Separate from `check_range` so tests can see it:
+/// `check_range` ends the process.)
+fn range_check(flag: &str, v: i64, lo: i64, hi: i64) -> Result<(), String> {
+    if v < lo || v > hi {
+        return Err(format!("{} must be between {} and {}", flag, lo, hi));
+    }
+    Ok(())
 }
 
 /// Keeps the flags the command understands, and the single positional argument.
@@ -436,4 +446,348 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ---------- the reference models ----------
+    //
+    // The three parsers walk `args` with an index. Each model below is written
+    // from the usage text, not from the code: a flag takes the token after it as
+    // its value, a switch takes nothing, the first token that is not a value or a
+    // switch is the positional (the link, or an upload path), and anything the
+    // command does not know is a positional too.
+
+    /// Models `flags_and_positional`: `(first flag value, first positional)`.
+    fn model_flags_and_positional(args: &[String], flags: &[&str]) -> (String, String) {
+        let mut flag: Option<String> = None;
+        let mut pos: Option<String> = None;
+        let mut i = 0;
+        while i < args.len() {
+            if flags.iter().any(|f| *f == args[i]) {
+                if flag.is_none() {
+                    flag = Some(args.get(i + 1).cloned().unwrap_or_default());
+                }
+                i += 2;
+            } else {
+                if pos.is_none() {
+                    pos = Some(args[i].clone());
+                }
+                i += 1;
+            }
+        }
+        (flag.unwrap_or_default(), pos.unwrap_or_default())
+    }
+
+    struct GetModel {
+        dir: String,
+        pass: String,
+        streams: i64,
+        segment_mb: i64,
+        subfolder: bool,
+    }
+
+    fn model_get(args: &[String], d: &config::Settings) -> (GetModel, String) {
+        let mut m = GetModel {
+            dir: d.download_dir.clone(),
+            pass: String::new(),
+            streams: d.streams as i64,
+            segment_mb: d.segment_mb as i64,
+            subfolder: false,
+        };
+        let mut link = String::new();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-o" => {
+                    m.dir = args.get(i + 1).cloned().unwrap_or_default();
+                    i += 2;
+                }
+                "-p" => {
+                    m.pass = args.get(i + 1).cloned().unwrap_or_default();
+                    i += 2;
+                }
+                "-n" => {
+                    if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<i64>().ok()) {
+                        m.streams = v;
+                    }
+                    i += 2;
+                }
+                "--seg" => {
+                    if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<i64>().ok()) {
+                        m.segment_mb = v;
+                    }
+                    i += 2;
+                }
+                "--subfolder" => {
+                    m.subfolder = true;
+                    i += 1;
+                }
+                other => {
+                    if link.is_empty() {
+                        link = other.to_string();
+                    }
+                    i += 1;
+                }
+            }
+        }
+        (m, link)
+    }
+
+    fn model_up(args: &[String], d: &config::Settings) -> (Vec<String>, String, String, i64) {
+        let mut paths: Vec<String> = Vec::new();
+        let mut account = d.last_account_id.clone();
+        let mut folder = d.last_folder_id.clone();
+        let mut streams = d.streams as i64;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--account" => {
+                    account = args.get(i + 1).cloned().unwrap_or_default();
+                    i += 2;
+                }
+                "--folder" => {
+                    folder = args.get(i + 1).cloned().unwrap_or_default();
+                    i += 2;
+                }
+                "-n" => {
+                    if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<i64>().ok()) {
+                        streams = v;
+                    }
+                    i += 2;
+                }
+                other => {
+                    paths.push(other.to_string());
+                    i += 1;
+                }
+            }
+        }
+        (paths, account, folder, streams)
+    }
+
+    // ---------- generators ----------
+    //
+    // A token pool with every meaningful class: the flags of both commands, a
+    // switch, values that parse, values that do not, an empty token, a token
+    // that looks like a flag but is not, a path with a space, and a huge number.
+
+    const TOKENS: &[&str] = &[
+        "-o", "-p", "-n", "--seg", "--subfolder", "--account", "--folder", "-x", "--", "link",
+        "frame.io/abc", "0", "1", "7", "8", "64", "128", "129", "512", "513", "512.5", "-1",
+        "+12", "00012", "999999999999999999999", "", " ", "/tmp/a b", "-o=x", "dir",
+    ];
+
+    fn tokens() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(prop::sample::select(TOKENS).prop_map(|s: &str| s.to_string()), 0..=9)
+    }
+
+    fn settings() -> config::Settings {
+        config::Settings::default()
+    }
+
+    // ---------- properties ----------
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// `flags_and_positional` finds the first value of the flag and the first
+        /// token that is not a flag or a value, in any order, for any tokens.
+        #[test]
+        fn flags_and_positional_matches_the_usage_text(args in tokens(), which in 0usize..3) {
+            let flags: &[&str] = [&["-p"][..], &["-n"][..], &["-p", "-n"][..]][which];
+            let got = flags_and_positional(&args, flags);
+            let want = model_flags_and_positional(&args, flags);
+            prop_assert_eq!(got, want, "args {:?}", args);
+        }
+
+        /// `parse_get_flags` matches the usage text: `-o dir  -p pass  -n N
+        /// --seg MB  --subfolder  <link>`, in any order.
+        #[test]
+        fn parse_get_flags_matches_the_usage_text(args in tokens()) {
+            let d = settings();
+            let (o, link) = parse_get_flags(&args, &d);
+            let (m, wlink) = model_get(&args, &d);
+            prop_assert_eq!(link.clone(), wlink.clone(), "link for args {:?}", args);
+            prop_assert_eq!(o.dir.clone(), m.dir.clone(), "dir for args {:?}", args);
+            prop_assert_eq!(o.pass.clone(), m.pass.clone(), "pass for args {:?}", args);
+            prop_assert_eq!(o.streams, m.streams, "streams for args {:?}", args);
+            prop_assert_eq!(o.segment_mb, m.segment_mb, "seg for args {:?}", args);
+            prop_assert_eq!(o.subfolder, m.subfolder, "subfolder for args {:?}", args);
+        }
+
+        /// `parse_up_flags` matches the usage text: `up <path>... --account ID
+        /// --folder ID -n N`, in any order; every unknown token is a path.
+        #[test]
+        fn parse_up_flags_matches_the_usage_text(args in tokens()) {
+            let d = settings();
+            let (paths, account, folder, streams) = parse_up_flags(&args, &d);
+            let (wp, wa, wf, ws) = model_up(&args, &d);
+            prop_assert_eq!(paths.clone(), wp.clone(), "paths for args {:?}", args);
+            prop_assert_eq!(account.clone(), wa, "account for args {:?}", args);
+            prop_assert_eq!(folder.clone(), wf, "folder for args {:?}", args);
+            prop_assert_eq!(streams, ws, "streams for args {:?}", args);
+        }
+
+        /// Order does not matter: the same flag/value pairs, given in any order,
+        /// with the link placed between whole pairs, parse the same way.
+        #[test]
+        fn get_flags_do_not_depend_on_order(
+            keys in prop::collection::vec(any::<u8>(), 0..=4),
+            vals in prop::collection::vec("[ -~]{0,8}", 0..=4),
+            link_at in 0usize..5,
+        ) {
+            const FLAGS: [&str; 5] = ["-o", "-p", "-n", "--seg", "--subfolder"];
+            let n = keys.len().min(vals.len()).min(5);
+            let mut order: Vec<usize> = (0..n).collect();
+            // distinct flags only, so "the first one wins" never decides.
+            let mut used = std::collections::BTreeSet::new();
+            order.retain(|i| used.insert(*i));
+            order.sort_by_key(|i| keys[*i]);
+            let mut args: Vec<String> = Vec::new();
+            for (k, i) in order.iter().enumerate() {
+                if k == link_at.min(n) {
+                    args.push("https://f.io/abc".to_string());
+                }
+                args.push(FLAGS[*i].to_string());
+                if FLAGS[*i] != "--subfolder" {
+                    args.push(vals[*i].clone());
+                }
+            }
+            if link_at >= n {
+                args.push("https://f.io/abc".to_string());
+            }
+            let d = settings();
+            let (o, link) = parse_get_flags(&args, &d);
+            // the same pairs in the order they were generated
+            let mut canonical: Vec<String> = Vec::new();
+            for i in 0..n {
+                canonical.push(FLAGS[i].to_string());
+                if FLAGS[i] != "--subfolder" {
+                    canonical.push(vals[i].clone());
+                }
+            }
+            canonical.push("https://f.io/abc".to_string());
+            let (c, clink) = parse_get_flags(&canonical, &d);
+            prop_assert_eq!(link.clone(), clink.clone(), "link for {:?} vs {:?}", args, canonical);
+            prop_assert_eq!(o.dir.clone(), c.dir.clone(), "dir for {:?} vs {:?}", args, canonical);
+            prop_assert_eq!(o.pass.clone(), c.pass.clone(), "pass for {:?} vs {:?}", args, canonical);
+            prop_assert_eq!(o.streams, c.streams, "streams for {:?} vs {:?}", args, canonical);
+            prop_assert_eq!(o.segment_mb, c.segment_mb, "seg for {:?} vs {:?}", args, canonical);
+            prop_assert_eq!(o.subfolder, c.subfolder, "subfolder for {:?} vs {:?}", args, canonical);
+        }
+
+        /// `-n` is accepted over 1..=128 and `--seg` over 8..=512, with the
+        /// documented message outside that, and the boundary values are inside.
+        #[test]
+        fn ranges_are_inclusive_and_their_message_is_the_documented_one(
+            which in 0usize..2,
+            off in -3i64..=3,
+        ) {
+            let (flag, lo, hi, at) = if which == 0 { ("-n", 1, 128, 1) } else { ("--seg", 8, 512, 8) };
+            let edge = if off >= 0 { hi + off } else { at + off };
+            let inside = (lo..=hi).contains(&edge);
+            let got = range_check(flag, edge, lo, hi);
+            if inside {
+                prop_assert!(got.is_ok(), "{} {} was rejected: {:?}", flag, edge, got);
+            } else {
+                let want = format!("{} must be between {} and {}", flag, lo, hi);
+                prop_assert_eq!(got, Err(want), "{} {}", flag, edge);
+            }
+        }
+
+        /// A flag at the end of the line has no value: it must not borrow the
+        /// link, and it must not panic. `fio get LINK -o` leaves the destination
+        /// empty, which `Manager::start_download` rejects with "destination
+        /// folder not found"; `-n` with no number keeps the configured value.
+        #[test]
+        fn a_flag_without_a_value_takes_no_token_from_the_line(prefix in tokens()) {
+            let d = settings();
+            // A flag at the end of the line has nothing to take: the token before
+            // it is a bare word, so the flag is reached unconsumed. It must not
+            // borrow the link (or a path), and it must not panic.
+            //
+            // What it does to its own field is the current behaviour and is
+            // reported as an ambiguity: a string flag clears the field, a number
+            // flag keeps the value it already had, because a missing number does
+            // not parse. An empty destination is then refused downstream
+            // ("destination folder not found"), so `fio get LINK -o` still fails.
+            for flag in ["-o", "-p", "-n", "--seg"] {
+                let mut args = prefix.clone();
+                args.push("link".to_string());
+                let (base, base_link) = parse_get_flags(&args, &d);
+                args.push(flag.to_string());
+                let (o, link) = parse_get_flags(&args, &d);
+                prop_assert_eq!(link.clone(), base_link.clone(), "{:?}: the flag became the link", args);
+                match flag {
+                    "-o" => prop_assert_eq!(o.dir.clone(), String::new(), "{:?}", args),
+                    "-p" => prop_assert_eq!(o.pass.clone(), String::new(), "{:?}", args),
+                    "-n" => prop_assert_eq!(o.streams, base.streams, "{:?}", args),
+                    _ => prop_assert_eq!(o.segment_mb, base.segment_mb, "{:?}", args),
+                }
+            }
+            // A switch takes nothing and is idempotent.
+            let mut args = prefix.clone();
+            args.push("link".to_string());
+            let (base, base_link) = parse_get_flags(&args, &d);
+            args.push("--subfolder".to_string());
+            let (o, link) = parse_get_flags(&args, &d);
+            prop_assert_eq!(link.clone(), base_link.clone(), "{:?}: --subfolder ate the link", args);
+            prop_assert!(o.subfolder, "{:?}: --subfolder is not a switch", args);
+            prop_assert_eq!(o.dir.clone(), base.dir.clone(), "{:?}", args);
+
+            for flag in ["--account", "--folder", "-n"] {
+                let mut args = prefix.clone();
+                args.push("a.mov".to_string());
+                let (base_paths, base_acct, base_folder, base_streams) = parse_up_flags(&args, &d);
+                args.push(flag.to_string());
+                let (paths, acct, folder, streams) = parse_up_flags(&args, &d);
+                prop_assert_eq!(paths.clone(), base_paths.clone(), "{:?}: the flag became a path", args);
+                match flag {
+                    "--account" => prop_assert_eq!(acct.clone(), String::new(), "{:?}", args),
+                    "--folder" => prop_assert_eq!(folder.clone(), String::new(), "{:?}", args),
+                    _ => prop_assert_eq!(streams, base_streams, "{:?}", args),
+                }
+                let _ = (base_acct, base_folder);
+            }
+        }
+    }
+
+    /// The exact strings the command prints for the two numeric flags.
+    #[test]
+    fn out_of_range_values_are_rejected_with_the_documented_message() {
+        assert_eq!(range_check("-n", 1, 1, 128), Ok(()));
+        assert_eq!(range_check("-n", 128, 1, 128), Ok(()));
+        assert_eq!(range_check("-n", 0, 1, 128), Err("-n must be between 1 and 128".to_string()));
+        assert_eq!(range_check("-n", 129, 1, 128), Err("-n must be between 1 and 128".to_string()));
+        assert_eq!(range_check("--seg", 8, 8, 512), Ok(()));
+        assert_eq!(range_check("--seg", 512, 8, 512), Ok(()));
+        assert_eq!(range_check("--seg", 7, 8, 512), Err("--seg must be between 8 and 512".to_string()));
+        assert_eq!(range_check("--seg", 513, 8, 512), Err("--seg must be between 8 and 512".to_string()));
+    }
+
+    /// The link is the first token that is neither a flag nor a flag's value, and
+    /// `--subfolder` is a switch that takes nothing.
+    #[test]
+    fn the_link_is_the_first_bare_token() {
+        let d = settings();
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(parse_get_flags(&a(&["https://f.io/x"]), &d).1, "https://f.io/x");
+        assert_eq!(parse_get_flags(&a(&["--subfolder", "https://f.io/x"]), &d).1, "https://f.io/x");
+        assert_eq!(parse_get_flags(&a(&["-p", "pw", "https://f.io/x"]), &d).1, "https://f.io/x");
+        assert_eq!(parse_get_flags(&a(&["https://f.io/x", "-n", "4"]), &d).0.streams, 4);
+        assert_eq!(parse_get_flags(&a(&["-n", "4", "https://f.io/x"]), &d).1, "https://f.io/x");
+        // `-n` with a value that is not a number keeps the configured streams.
+        assert_eq!(parse_get_flags(&a(&["-n", "lots", "https://f.io/x"]), &d).0.streams, d.streams as i64);
+        // A second bare token is ignored: `fio get` takes one link.
+        let (o, link) = parse_get_flags(&a(&["one", "two"]), &d);
+        assert_eq!(link, "one");
+        assert_eq!(o.dir, d.download_dir);
+        // `fio up` keeps every bare token as a path.
+        let (paths, _, _, _) = parse_up_flags(&a(&["a.mov", "--account", "x", "b c.mov"]), &d);
+        assert_eq!(paths, vec!["a.mov".to_string(), "b c.mov".to_string()]);
+    }
 }
