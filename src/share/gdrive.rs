@@ -340,3 +340,138 @@ impl Source for DriveClient {
         Ok(())
     }
 }
+
+/// Property tests for the link parser, the item decoder and the id/resource-key
+/// pair that `fresh_url` takes apart again. `fresh_url` only builds a URL, so it
+/// runs here; every other `Source` method needs the network.
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    const TOKEN: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+
+    fn tokens(min: usize, max: usize) -> impl Strategy<Value = String> {
+        (min..=max)
+            .prop_flat_map(|n| prop::collection::vec(select(TOKEN), n))
+            .prop_map(|v| String::from_utf8(v).unwrap())
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+        cases: 64,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED),
+        ..ProptestConfig::default()
+    })]
+
+        /// The asset id a listing hands back is exactly what `fresh_url` needs:
+        /// the file id and its resource key come out of the download URL it
+        /// builds, and nothing else does.
+        #[test]
+        fn asset_ids_round_trip_through_the_download_url(
+            id in tokens(10, 30),
+            resource_key in proptest::option::of(tokens(4, 16)),
+        ) {
+            let item = DriveItem {
+                id: id.clone(),
+                resource_key: resource_key.clone().unwrap_or_default(),
+                ..Default::default()
+            };
+            let client = DriveClient { id: id.clone(), resource_key: item.resource_key.clone(), root: Mutex::new(None) };
+            let cx = CancellationToken::new();
+            let url = rt().block_on(async { client.fresh_url(&cx, &item.asset()).await }).expect("a URL");
+            let u = url::Url::parse(&url).expect("parses");
+            let q: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let get = |k: &str| q.iter().find(|(name, _)| name == k).map(|(_, v)| v.clone());
+            prop_assert_eq!(get("id"), Some(id.clone()), "{:?}", url);
+            prop_assert_eq!(get("resourcekey"), resource_key.clone(), "{:?}", url);
+            prop_assert_eq!(get("export"), Some("download".to_string()));
+            prop_assert_eq!(get("confirm"), Some("t".to_string()));
+            prop_assert_eq!(q.iter().filter(|(k, _)| k == "id").count(), 1, "{:?}", url);
+        }
+
+        /// A listed item becomes one safe path component, keeps its size, and is
+        /// flagged rather than offered when it is a Docs/Sheets/shortcut entry.
+        #[test]
+        fn items_become_one_safe_path_component(
+            title in any::<String>(),
+            size in proptest::option::of(any::<i64>()),
+            size_text in select(vec!["", "0", "12", "-3", "1e9", "not a number", "9999999999999999999999"]),
+            mime in select(vec![
+                "video/quicktime", "image/png", DRIVE_FOLDER, "application/vnd.google-apps.document",
+                "application/vnd.google-apps.shortcut", "application/vnd.google-apps.",
+            ]),
+        ) {
+            let item = DriveItem { id: "id".to_string(), title: title.clone(), mime_type: mime.to_string(), file_size: size_text.to_string(), resource_key: String::new() };
+            let f = item.file("folder");
+            let want = format!("folder/{}", safe_name(&title));
+            prop_assert_eq!(f.rel_path.as_str(), want.as_str(), "title {:?}", title);
+            prop_assert!(!f.rel_path.contains("//"), "title {:?}", title);
+            prop_assert_eq!(f.size, size_text.parse::<i64>().unwrap_or(0), "size {:?}", size_text);
+            let app = mime.starts_with(DRIVE_APPS);
+            prop_assert_eq!(!f.problem.is_empty(), app, "mime {:?}", mime);
+            let _ = size;
+            // A file with a resource key is fetched by "id/key".
+            let with_key = DriveItem { resource_key: "rk".to_string(), ..item.clone() };
+            let a = with_key.asset();
+            prop_assert_eq!(a.as_str(), "id/rk");
+            let b = item.asset();
+            prop_assert_eq!(b.as_str(), "id");
+        }
+
+        /// The item decoder tolerates junk: an empty object is a default item, a
+        /// sequence in its place is an error, and a well-formed item keeps every
+        /// field. Numbers where the API sends strings are errors, not panics.
+        #[test]
+        fn item_decoding_takes_junk(body in prop::collection::vec(any::<u8>(), 0..48), shape in 0usize..4) {
+            let payload: Vec<u8> = match shape {
+                0 => body.clone(),
+                1 => b"{}".to_vec(),
+                2 => b"[1,2,3]".to_vec(),
+                _ => br#"{"id":"abc","title":"clip.mov","mimeType":"video/quicktime","fileSize":"42","resourceKey":"rk"}"#.to_vec(),
+            };
+            let r = serde_json::from_slice::<DriveItem>(&payload);
+            match shape {
+                1 => prop_assert!(r.is_ok(), "an empty object is a default item"),
+                2 => prop_assert!(r.is_err(), "a sequence is not an item"),
+                3 => {
+                    let it = r.expect("an item");
+                    prop_assert_eq!(it.id.as_str(), "abc");
+                    prop_assert_eq!(it.title.as_str(), "clip.mov");
+                    prop_assert_eq!(it.mime_type.as_str(), "video/quicktime");
+                    prop_assert_eq!(it.file_size.as_str(), "42");
+                    let asset = it.asset();
+                    prop_assert_eq!(asset.as_str(), "abc/rk");
+                }
+                _ => prop_assert!(r.is_ok() || r.is_err(), "junk must not panic"),
+            }
+        }
+
+        /// `set_q` replaces a parameter instead of adding a second one: a request
+        /// carries one key, one page token.
+        #[test]
+        fn set_q_replaces_the_parameter(
+            start in prop::collection::vec(select(vec!["q", "fields", "key", "pageToken"]), 0..6),
+            k in select(vec!["q", "fields", "key"]),
+            new_value in "[a-zA-Z0-9=&%/. ]{0,16}",
+        ) {
+            let mut q: Vec<(String, String)> = start.iter().enumerate().map(|(i, s)| (s.to_string(), format!("v{}", i))).collect();
+            set_q(&mut q, k, new_value.clone());
+            let mine: Vec<&(String, String)> = q.iter().filter(|(name, _)| name == k).collect();
+            prop_assert_eq!(mine.len(), 1, "{:?}", q);
+            prop_assert_eq!(mine[0].1.as_str(), new_value.as_str());
+            prop_assert_eq!(q.last().map(|(name, _)| name.as_str()), Some(k));
+            for (name, value) in &q {
+                if name != k {
+                    prop_assert!(start.iter().any(|s| s == name), "a parameter went missing: {:?}", q);
+                    let _ = value;
+                }
+            }
+        }
+    }
+}

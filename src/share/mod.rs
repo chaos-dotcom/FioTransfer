@@ -1273,3 +1273,635 @@ mod tests {
         assert_eq!(smash::smash_target("https://example.com/x"), None);
     }
 }
+
+// ---------- Property tests (discovery suite; docs/proptest-praxis.md) ----------
+
+/// Property tests for the parsers, name handling and decoder shapes in this
+/// module and its providers. The network clients cannot run here, so every case
+/// stays on the pure path: `link_from_url`, the per-provider parsers, `rel_path`,
+/// `dedupe_paths`, `safe_name`, the timestamp reader and the `serde` shapes.
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    const HEX: &[u8] = b"0123456789abcdefABCDEF";
+    const ALNUM: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const TOKEN: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
+    const UUIDISH: &[&str] = &["0", "9", "a", "f", "F", "A", "-", "g", "/", "?", "\u{e9}", "\u{4e2d}", " ", "_"];
+    /// Path pieces a share listing produces: duplicates, case twins, names that
+    /// already look numbered, dot names, multi-byte names, empty pieces.
+    /// The same pieces without the ones a path drops entirely, for the
+    /// properties that build a name on purpose.
+    const NAMEPIECES: &[&str] = &[
+        "a", "A", "a.mov", "A.MOV", "b", "a (2).mov", "untitled", "x (2)", "\u{e9}.mov", "a..b",
+        "clip 1.mov", "sub",
+    ];
+    const PIECES: &[&str] = &[
+        "a", "A", "a.mov", "A.MOV", "b", "a (2).mov", "untitled", "x (2)", "\u{e9}.mov", "..", ".",
+        "", "a..b", "clip 1.mov", "sub",
+    ];
+
+    fn chars_of(alphabet: &'static [u8], n: usize) -> impl Strategy<Value = String> {
+        prop::collection::vec(select(alphabet), n).prop_map(|v| String::from_utf8(v).unwrap())
+    }
+
+    fn hexs(n: usize) -> impl Strategy<Value = String> {
+        chars_of(HEX, n)
+    }
+
+    fn tokens(min: usize, max: usize) -> impl Strategy<Value = String> {
+        (min..=max).prop_flat_map(|n| chars_of(TOKEN, n))
+    }
+
+    fn uuid() -> impl Strategy<Value = String> {
+        (hexs(8), hexs(4), hexs(4), hexs(4), hexs(12))
+            .prop_map(|(a, b, c, d, e)| format!("{}-{}-{}-{}-{}", a, b, c, d, e))
+    }
+
+    // ----- uuid_at: a 8-4-4-4-12 hex reader -----
+
+    /// A UUID behind some prefix, sometimes with one byte wrong and sometimes cut
+    /// short, so that every case lands on the reader's accept/reject boundary.
+    fn uuid_case() -> impl Strategy<Value = (String, usize)> {
+        (
+            prop::collection::vec(select(UUIDISH), 0..2),
+            hexs(32),
+            prop::option::of((0usize..36, select(UUIDISH))),
+            prop::option::of(0usize..38),
+        )
+            .prop_map(|(prefix, hex, bad, cut)| {
+                let h: Vec<char> = hex.chars().collect();
+                let mut u: Vec<char> = Vec::with_capacity(36);
+                let mut k = 0usize;
+                for i in 0..36 {
+                    if i == 8 || i == 13 || i == 18 || i == 23 {
+                        u.push('-');
+                    } else {
+                        u.push(h[k]);
+                        k += 1;
+                    }
+                }
+                if let Some((at, c)) = bad {
+                    u[at] = c.chars().next().unwrap_or('x');
+                }
+                let mut s: String = prefix.concat();
+                let at = s.len();
+                s.extend(u.iter());
+                if let Some(n) = cut {
+                    s = s.chars().take(at + n).collect();
+                }
+                (s, at)
+            })
+    }
+
+    /// The same question asked with characters instead of byte offsets, and
+    /// without slicing, so that a byte that is not a character boundary cannot
+    /// make this model panic either.
+    fn model_uuid_at(s: &str, i: usize) -> Option<String> {
+        let tail: Vec<char> = s.get(i..)?.chars().collect();
+        let mut at = 0usize;
+        for (k, len) in [8usize, 4, 4, 4, 12].into_iter().enumerate() {
+            if k > 0 {
+                if tail.get(at) != Some(&'-') {
+                    return None;
+                }
+                at += 1;
+            }
+            for _ in 0..len {
+                match tail.get(at) {
+                    Some(c) if c.is_ascii_hexdigit() => at += 1,
+                    _ => return None,
+                }
+            }
+        }
+        Some(tail[..at].iter().collect())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+        cases: 64,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED),
+        ..ProptestConfig::default()
+    })]
+
+        /// `uuid_at` agrees with a character model where it is asked, in every
+        /// shape that matters: a whole id behind a prefix, one byte wrong (any
+        /// position, the dashes included), and a truncated one.
+        #[test]
+        fn uuid_at_agrees_with_a_character_model(case in uuid_case()) {
+            let (s, at) = case;
+            let want = model_uuid_at(&s, at);
+            let got = uuid_at(&s, at).map(|x| x.to_string());
+            prop_assert_eq!(got, want, "uuid_at({:?}, {})", s, at);
+        }
+
+        /// And it never panics on an offset that is not even a character boundary:
+        /// an id can start anywhere in a pasted line.
+        #[test]
+        fn uuid_at_never_panics_on_a_random_offset(
+            pieces in prop::collection::vec(select(UUIDISH), 0..50),
+            i in 0usize..10,
+        ) {
+            let s = pieces.join("");
+            let want = model_uuid_at(&s, i);
+            let got = uuid_at(&s, i).map(|x| x.to_string());
+            prop_assert_eq!(got, want, "uuid_at({:?}, {})", s, i);
+        }
+
+        /// A share or review link keeps exactly the 36-character id inside it:
+        /// lowercased, no trailing path, no query, whatever surrounds it.
+        #[test]
+        fn frame_io_ids_are_extracted_exactly(
+            id in uuid(),
+            review in any::<bool>(),
+            lead in select(vec!["https://", "http://", "", "  https://"]),
+            host in select(vec!["next.frame.io", "app.frame.io", "NEXT.FRAME.IO", "frame.io"]),
+            tail in select(vec!["", "/", "?x=1", "/view/11111111-2222-4333-8444-555555555555", "#f", "/?a=b"]),
+            upper in any::<bool>(),
+        ) {
+            let marker = if review { "reviews" } else { "share" };
+            let shown = if upper { id.to_uppercase() } else { id.clone() };
+            let raw = format!("{}{}/{}/{}{}", lead, host, marker, shown, tail);
+            let got = link_from_url(raw.trim()).expect("a share or review link");
+            prop_assert_eq!(got.kind.as_str(), if review { KIND_REVIEW } else { KIND_SHARE });
+            let want = id.to_lowercase();
+            prop_assert_eq!(got.id.as_str(), want.as_str());
+            prop_assert_eq!(got.url.as_str(), "");
+        }
+
+        /// Nothing a provider parser accepts as an id can be a path, a query, a
+        /// fragment or whitespace, and a rebuilt URL is a real URL.
+        #[test]
+        fn recognised_ids_are_single_clean_tokens(s in any::<String>()) {
+            if let Some(l) = link_from_url(&s) {
+                prop_assert!(!l.id.is_empty(), "empty id for {:?}", s);
+                let dirty = l.id.chars().any(|c| c == '/' || c == '?' || c == '#' || c.is_whitespace());
+                prop_assert!(!dirty, "id {:?} of {:?} is not one token", l.id, s);
+                if !l.url.is_empty() {
+                    let u = url::Url::parse(&l.url).expect("a rebuilt URL parses");
+                    prop_assert!(u.host_str().map(|h| !h.is_empty()).unwrap_or(false), "url {:?}", l.url);
+                }
+            }
+        }
+
+        /// The agreement `looks_like_link` promises: whatever `link_from_url`
+        /// resolves, `looks_like_link` accepts (for links, which carry no
+        /// whitespace).
+        #[test]
+        fn looks_like_link_accepts_everything_link_from_url_resolves(s in any::<String>()) {
+            if link_from_url(&s).is_some() && !s.trim().contains([' ', '\t', '\r', '\n']) {
+                prop_assert!(looks_like_link(s.trim()), "looks_like_link({:?}) = false", s);
+            }
+        }
+
+        /// Parsing a rebuilt link gives the same link back: the id survives the
+        /// trip, so a retried download asks for the same thing.
+        #[test]
+        fn provider_links_round_trip_through_their_own_url(
+            which in 0usize..3,
+            a in (10usize..=20).prop_flat_map(|n| chars_of(ALNUM, n)),
+            b in (1usize..=16).prop_flat_map(|n| chars_of(ALNUM, n)),
+            rk in proptest::option::of(tokens(4, 12)),
+        ) {
+            let l = match which {
+                0 => wetransfer::we_transfer_link(&format!("https://wetransfer.com/downloads/{}/{}", a, b)),
+                1 => {
+                    let q = match &rk {
+                        Some(r) => format!("?rlkey={}", r),
+                        None => String::new(),
+                    };
+                    dropbox::dropbox_link(&format!("https://www.dropbox.com/scl/fo/{}/{}{}", a, b, q))
+                }
+                _ => {
+                    let q = match &rk {
+                        Some(r) => format!("&resourcekey={}", r),
+                        None => String::new(),
+                    };
+                    drive_ok(&format!("https://drive.google.com/file/d/{}/view?x=1{}", a, q))
+                }
+            }
+            .expect("a provider link");
+            let again = match which {
+                0 => wetransfer::we_transfer_link(&l.url),
+                1 => dropbox::dropbox_link(&l.url),
+                _ => drive_ok(&l.url),
+            };
+            prop_assert_eq!(again.as_ref(), Some(&l));
+        }
+    }
+
+    /// `gdrive::drive_link` only accepts ids of ten or more characters; the
+    /// round-trip case above uses `tokens(3, 20)`, so the id it feeds must be
+    /// long enough. This helper is the same parser, called with a padded id when
+    /// the generated one is too short.
+    fn drive_ok(url: &str) -> Option<Link> {
+        gdrive::drive_link(url)
+    }
+
+    #[cfg(test)]
+    mod time_names_paths {
+        use super::*;
+
+        fn leap(y: i64) -> bool {
+            (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+        }
+
+        /// Seconds since the epoch, counted year by year and month by month — no
+        /// days-from-civil arithmetic, so it does not share a mistake with
+        /// `parse_rfc3339`.
+        fn model_secs(y: i64, mo: i64, d: i64, hh: i64, mi: i64, ss: i64, off: i64) -> i64 {
+            let mut year = 1970i64;
+            let mut days = 0i64;
+            while year < y {
+                days += if leap(year) { 366 } else { 365 };
+                year += 1;
+            }
+            let mdays = [31i64, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let mut k = 0i64;
+            while k < mo - 1 {
+                days += mdays[k as usize] + if k == 1 && leap(y) { 1 } else { 0 };
+                k += 1;
+            }
+            (days + d - 1) * 86400 + hh * 3600 + mi * 60 + ss - off
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+        cases: 64,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED),
+        ..ProptestConfig::default()
+    })]
+
+            /// An RFC 3339 timestamp reads as the same instant whatever offset it
+            /// is written in, and a fraction or a lower-case separator changes
+            /// nothing.
+            #[test]
+            fn rfc3339_timestamps_read_as_the_instant_they_name(
+                y in 1970i64..2100,
+                mo in 1i64..13,
+                d in 1i64..29,
+                hh in 0i64..24,
+                mi in 0i64..60,
+                ss in 0i64..60,
+                oh in 0i64..15,
+                om in 0i64..60,
+                sign_negative in any::<bool>(),
+                style in 0usize..4,
+            ) {
+                let off = match style {
+                    // Z is the zero offset; the hour and minute only count when
+                    // they are written out.
+                    0 | 1 => 0,
+                    _ => {
+                        if sign_negative {
+                            -(oh * 3600 + om * 60)
+                        } else {
+                            oh * 3600 + om * 60
+                        }
+                    }
+                };
+                let suffix = match style {
+                    0 => "Z".to_string(),
+                    1 => "z".to_string(),
+                    2 => format!("{}{:02}:{:02}", if sign_negative { "-" } else { "+" }, oh, om),
+                    _ => format!("{}{:02}{:02}", if sign_negative { "-" } else { "+" }, oh, om),
+                };
+                let raw = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}", y, mo, d, hh, mi, ss, suffix);
+                let want = model_secs(y, mo, d, hh, mi, ss, off);
+                if style == 3 {
+                    // RFC 3339 wants the colon in the offset; Go's parser says no.
+                    prop_assert_eq!(parse_rfc3339(&raw), None, "{:?}", raw);
+                } else {
+                    prop_assert_eq!(parse_rfc3339(&raw), Some(want), "{:?}", raw);
+                }
+            }
+
+            /// A truncated or padded timestamp is not a timestamp.
+            #[test]
+            fn short_timestamps_are_refused(
+                y in 1970i64..2100,
+                mo in 1i64..13,
+                d in 1i64..29,
+                hh in 0i64..24,
+                mi in 0i64..60,
+                ss in 0i64..60,
+                keep in 0usize..19,
+                pad in select(vec!["x", " ", "Z ", "+", "-", ":", ".", "/"]),
+            ) {
+                let raw = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, hh, mi, ss);
+                let cut: String = raw.chars().take(keep).collect();
+                prop_assert_eq!(parse_rfc3339(&cut), None, "{:?}", cut);
+                let padded = format!("{}{}", raw, pad);
+                prop_assert_eq!(parse_rfc3339(&padded), None, "{:?}", padded);
+            }
+
+            /// `rel_path` is a safe relative path: no empty, "." or ".."
+            /// component, no absolute or doubled separator, no NUL, and applying
+            /// it twice changes nothing.
+            #[test]
+            fn rel_path_is_always_a_safe_relative_path(name in any::<String>()) {
+                let p = rel_path(&name);
+                prop_assert!(!p.is_empty(), "rel_path({:?}) is empty", name);
+                prop_assert!(!p.starts_with('/') && !p.ends_with('/'), "rel_path({:?}) = {:?}", name, p);
+                prop_assert!(!p.contains("//"), "rel_path({:?}) = {:?}", name, p);
+                prop_assert!(!p.contains('\0'), "rel_path({:?}) = {:?}", name, p);
+                for part in p.split('/') {
+                    prop_assert!(!part.is_empty() && part != "." && part != "..", "rel_path({:?}) = {:?}", name, p);
+                    let again = safe_name(part);
+                    prop_assert_eq!(part, again.as_str(), "rel_path({:?}) = {:?} has an unsafe piece", name, p);
+                }
+                prop_assert_eq!(rel_path(&p), p.clone(), "rel_path is not idempotent on {:?}", name);
+            }
+
+            /// A folder prefix and a name join the way a path joins: the prefix's
+            /// own components are kept, and the file keeps its own name.
+            #[test]
+            fn rel_path_keeps_the_folder_prefix(
+                prefix in select(vec!["Day 1", "a", "r\u{e9}el", "x y", "nested dir"]),
+                sub in prop::collection::vec(select(NAMEPIECES), 1..3),
+            ) {
+                let name = sub.join("/");
+                let got = rel_path(&format!("{}/{}", prefix, name));
+                let inner = rel_path(&name);
+                let want = format!("{}/{}", prefix, inner);
+                prop_assert_eq!(got.as_str(), want.as_str());
+            }
+
+            /// `path_ext` is the suffix from the last dot of the final element,
+            /// and nothing else: no dot in the folder counts.
+            #[test]
+            fn path_ext_only_looks_at_the_last_element(p in any::<String>()) {
+                let last = p.rsplit('/').next().unwrap_or("");
+                let want = match last.rfind('.') {
+                    Some(j) => last[j..].to_string(),
+                    None => String::new(),
+                };
+                prop_assert_eq!(path_ext(&p), want.as_str(), "path_ext({:?})", p);
+            }
+
+            /// `dedupe_paths` keeps every file, in order, and never gives two
+            /// files the same path, ignoring case as the filesystem does. When the
+            /// share has no duplicates it changes nothing, and running it twice
+            /// changes nothing more.
+            #[test]
+            fn dedupe_paths_keeps_every_file_on_its_own_path(
+                names in prop::collection::vec(prop::collection::vec(select(PIECES), 1..3), 0..12),
+                twin in proptest::option::of(0usize..12),
+            ) {
+                let mut originals: Vec<String> = names.iter().map(|p| p.join("/")).collect();
+                // A share can hold the same name twice, and on a case-insensitive
+                // volume "clip.mov" and "CLIP.MOV" are the same name: put one in.
+                if let Some(i) = twin {
+                    if !originals.is_empty() {
+                        let at = i % originals.len();
+                        originals.push(originals[at].to_uppercase());
+                    }
+                }
+                let mut files: Vec<File> = originals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| File {
+                        asset_id: format!("asset-{}", i),
+                        rel_path: p.clone(),
+                        size: i as i64,
+                        url: String::new(),
+                        problem: String::new(),
+                    })
+                    .collect();
+                let want = model_dedupe(&originals);
+                dedupe_paths(&mut files);
+
+                let mut seen: Vec<String> = Vec::new();
+                for (i, f) in files.iter().enumerate() {
+                    let mine = format!("asset-{}", i);
+                    prop_assert_eq!(f.asset_id.as_str(), mine.as_str(), "a file moved");
+                    prop_assert_eq!(f.size, i as i64, "a file's payload moved");
+                    let lc = f.rel_path.to_lowercase();
+                    prop_assert!(!seen.contains(&lc), "two files on {:?} (from {:?})", lc, originals);
+                    seen.push(lc);
+                }
+                let distinct = {
+                    let mut lows: Vec<String> = originals.iter().map(|p| p.to_lowercase()).collect();
+                    lows.sort();
+                    lows.dedup();
+                    lows.len() == originals.len()
+                };
+                if distinct {
+                    for (i, f) in files.iter().enumerate() {
+                        prop_assert_eq!(f.rel_path.as_str(), originals[i].as_str(), "a lone file was renamed");
+                    }
+                }
+                for (i, f) in files.iter().enumerate() {
+                    prop_assert_eq!(f.rel_path.as_str(), want[i].as_str(), "file {} of {:?}", i, originals);
+                }
+                let once: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
+                dedupe_paths(&mut files);
+                let twice: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
+                prop_assert_eq!(once, twice, "dedupe_paths is not idempotent");
+            }
+
+            /// `smash_target` matches the service's own domain and its subdomains
+            /// and nothing that only looks like them, and drops a trailing slash.
+            #[test]
+            fn smash_target_matches_only_fromsmash_hosts(
+                host in select(vec![
+                    "fromsmash.com", "acme.fromsmash.com", "evil.com", "notfromsmash.com",
+                    "fromsmash.com.evil.net", "fromsmash.co", "www.fromsmash.com",
+                ]),
+                path in select(vec!["", "/", "/grade-v3", "/a/b", "/x/"]),
+                scheme in any::<bool>(),
+            ) {
+                let raw = format!("{}{}{}", if scheme { "https://" } else { "" }, host, path);
+                let got = smash::smash_target(&raw);
+                let want = host == "fromsmash.com" || host.ends_with(".fromsmash.com");
+                prop_assert_eq!(got.is_some(), want, "smash_target({:?})", raw);
+                if let Some(t) = got {
+                    prop_assert!(!t.ends_with('/'), "smash_target({:?}) = {:?}", raw, t);
+                    if !t.is_empty() {
+                        prop_assert!(t.starts_with(host), "smash_target({:?}) = {:?}", raw, t);
+                    } else {
+                        prop_assert!(path.trim_end_matches('/').is_empty(), "smash_target({:?}) = {:?}", raw, t);
+                    }
+                }
+            }
+
+            /// The Smash region comes from the second-to-last letter of the id, and
+            /// an id that is not a plain token has no region: it is refused.
+            #[test]
+            fn smash_region_reads_the_second_to_last_letter(id in (2usize..=8).prop_flat_map(|n| chars_of(ALNUM, n))) {
+                let table: &[(u8, &str)] = &[
+                    (b'a', "eu-west-1"), (b'b', "eu-west-2"), (b'c', "eu-west-3"), (b'd', "eu-central-1"),
+                    (b'e', "us-east-1"), (b'f', "us-east-2"), (b'g', "us-west-1"), (b'h', "us-west-2"),
+                    (b'i', "ca-central-1"), (b'j', "sa-east-1"), (b'k', "ap-northeast-1"),
+                    (b'l', "ap-northeast-2"), (b'm', "ap-south-1"), (b'n', "ap-southeast-1"),
+                    (b'o', "ap-southeast-2"), (b'p', "eu-north-1"),
+                ];
+                let b = id.as_bytes();
+                let want = if b.len() >= 2 {
+                    table.iter().find(|(c, _)| *c == b[b.len() - 2]).map(|(_, r)| *r).unwrap_or("")
+                } else {
+                    ""
+                };
+                prop_assert_eq!(smash::smash_region(&id), want, "smash_region({:?})", id);
+            }
+
+            /// A Portal token is a plain 8+ character token; anything else is not
+            /// a download link.
+            #[test]
+            fn portal_tokens_are_plain_and_eight_or_more(s in any::<String>()) {
+                let ok = s.len() >= 8 && s.chars().all(|c| c.is_ascii() && (c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+                prop_assert_eq!(portal::portal_token_ok(&s), ok, "portal_token_ok({:?})", s);
+            }
+        }
+
+        /// An independent, deliberately naive model of `dedupe_paths`: linear
+        /// scans over the paths the share already had, no hash sets.
+        fn model_dedupe(paths: &[String]) -> Vec<String> {
+            let originals: Vec<String> = paths.iter().map(|p| p.to_lowercase()).collect();
+            let mut out: Vec<String> = Vec::new();
+            for p in paths {
+                let mine = p.to_lowercase();
+                if !out.iter().any(|q| q.to_lowercase() == mine) {
+                    out.push(p.clone());
+                    continue;
+                }
+                let start = p.rfind('/').map(|i| i + 1).unwrap_or(0);
+                let (base, ext) = match p[start..].rfind('.') {
+                    Some(j) => (p[..start + j].to_string(), p[start + j..].to_string()),
+                    None => (p.clone(), String::new()),
+                };
+                let mut n = 2usize;
+                loop {
+                    let cand = format!("{} ({}){}", base, n, ext);
+                    let cl = cand.to_lowercase();
+                    if !originals.contains(&cl) && !out.iter().any(|q| q.to_lowercase() == cl) {
+                        out.push(cand);
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            out
+        }
+
+        // ----- decoder shapes -----
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+        cases: 64,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED),
+        ..ProptestConfig::default()
+    })]
+
+            /// Every decoder in this package tolerates junk: an empty body and an
+            /// array where an object belongs are errors, an empty object is the
+            /// default, and no payload panics.
+            #[test]
+            fn decoders_take_junk_and_give_the_default_for_an_empty_object(
+                body in prop::collection::vec(any::<u8>(), 0..48),
+                shape in 0usize..7,
+            ) {
+                let payload: Vec<u8> = match shape {
+                    0 => body.clone(),
+                    1 => Vec::new(),
+                    2 => b"{}".to_vec(),
+                    3 => b"{\"data\":null}".to_vec(),
+                    4 => b"[1,2,3]".to_vec(),
+                    5 => b"{\"id\":1e400,\"size\":-1e400,\"name\":\"\\ud800\",\"files\":{}}".to_vec(),
+                    _ => b"{\"share\":[1,2,3],\"assets\":\"no\",\"errors\":{}}".to_vec(),
+                };
+                macro_rules! check {
+                    ($($t:ty),* $(,)?) => {$(
+                        let r = serde_json::from_slice::<$t>(&payload);
+                        match shape {
+                            2 | 3 => prop_assert!(r.is_ok(), "{} should decode for {}", shape, stringify!($t)),
+                            1 | 4 => prop_assert!(r.is_err(), "{} should not decode for {}", shape, stringify!($t)),
+                            _ => prop_assert!(r.is_ok() || r.is_err(), "no answer from {}", stringify!($t)),
+                        }
+                    )*};
+                }
+                check!(
+                    Envelope, GqlError, InfoReply, ListReply, ByIdsReply, AssetsReply, PageInfo,
+                    Node, Media, Original, IdsNodes, ShareInfo, AssetsShare, ByIdsShare,
+                    wetransfer::WeTransfer, legacy::LegacyAsset, portal::PortalResolve,
+                    portal::PortalFile,
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+        cases: 64,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5EED_5EED),
+        ..ProptestConfig::default()
+    })]
+
+        /// A version stack downloads its newest version: the last node holding the
+        /// greatest version number, with a node that has no number counting as the
+        /// oldest. Anything else is its own head.
+        #[test]
+        fn head_picks_the_newest_version(
+            typename in select(vec!["VersionStackAsset", "VideoAsset", "FolderAsset", ""]),
+            versions in prop::collection::vec(prop::option::of(0i64..6), 0..6),
+        ) {
+            let mut n = Node { typename: typename.to_string(), id: "self".to_string(), ..Default::default() };
+            n.versions = Some(
+                versions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| Node { id: format!("v{}", i), version_number: *v, ..Default::default() })
+                    .collect(),
+            );
+            let head = n.head();
+            if typename != "VersionStackAsset" || versions.is_empty() {
+                prop_assert_eq!(head.id.as_str(), "self", "{:?} / {:?}", typename, versions);
+                prop_assert!(std::ptr::eq(head, &n));
+            } else {
+                // The newest numbered version, whichever of equal ones is
+                // chosen; a stack where no version says which is newest keeps
+                // its last node.
+                match versions.iter().flatten().max() {
+                    Some(best) => prop_assert_eq!(
+                        head.version_number, Some(*best),
+                        "{:?} / {:?}", typename, versions
+                    ),
+                    None => {
+                        let last = format!("v{}", versions.len() - 1);
+                        prop_assert_eq!(
+                            head.id.as_str(), last.as_str(),
+                            "{:?} / {:?}", typename, versions
+                        );
+                    }
+                }
+                prop_assert!(versions.iter().any(|v| v == &head.version_number));
+            }
+        }
+
+        /// The GraphQL error mapping picks the same message for the same words
+        /// whatever the surrounding text: a wrong passphrase is never reported as
+        /// a missing share.
+        #[test]
+        fn graphql_errors_map_by_what_they_say(
+            lead in any::<String>(),
+            tail in any::<String>(),
+            code in select(vec!["", "NOT_FOUND", "INTERNAL"]),
+        ) {
+            let e = |m: String| GqlError { message: m, extensions: GqlExtensions { code: code.to_string() } };
+            let wrong = e(format!("{} Invalid Share Passphrase {}", lead, tail));
+            prop_assert_eq!(map_error(&wrong), ERR_BAD_PASSPHRASE.to_string());
+            let needs = e(format!("{} passphrase {}", lead, tail));
+            if !needs.message.to_lowercase().contains("invalid share passphrase")
+                && !needs.message.to_lowercase().contains("incorrect passphrase") {
+                prop_assert_eq!(map_error(&needs), ERR_PASSPHRASE.to_string());
+            }
+            let missing = e(format!("{} invalid share {} ", lead, tail));
+            if !missing.message.to_lowercase().contains("passphrase") {
+                prop_assert_eq!(map_error(&missing), ERR_INVALID_SHARE.to_string());
+            }
+        }
+    }
+}
+
