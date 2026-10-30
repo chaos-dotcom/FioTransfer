@@ -20,6 +20,25 @@ make bench                             # build bin/fio-bench
 make test                              # cargo test --workspace
 ```
 
+## Portal
+
+FioTransfer can take its watch folders from [Portal](../portal-traefik) instead of being configured by
+hand. Portal marks a project's Frame.io folder with a `.turbosort` file naming the `Live_Work` folder it
+belongs to; FioTransfer reads Portal's upload links and keeps a **mirrored** watch at
+`~/Live_Work/<that name>` for each one. Media still moves only between FioTransfer and Frame.io — Portal
+never carries a byte of it.
+
+Connect in the app (**Settings → Portal**) or from a terminal:
+
+```sh
+fio portal signin https://your-portal you@yourdomain   # password, or a one-time code if you use one
+fio portal reconcile                                   # what it did, and what it refused
+```
+
+A folder that already holds media is baselined rather than re-downloaded or re-uploaded, and when a link
+disappears its folder is **unwatched, not deleted**. Full guide, including every refusal message and what
+it means: [`docs/PORTAL.md`](docs/PORTAL.md).
+
 ## The command line
 
 `fio` is also how a headless install sets the Portal connection up and checks it — `fio portal status | signin <url> <email> | signout | reconcile [--url URL] | token <token> | token --clear` — so a machine reached over ssh, or a cron job, needs no window for either.
