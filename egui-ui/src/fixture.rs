@@ -174,6 +174,7 @@ pub fn fixture_state(view: View) -> UiState {
             status: PortalView {
                 enabled: true,
                 signed_in: true,
+                needs_code: false,
                 email: String::new(),
                 url: "https://portal.nightfall.tv".into(),
                 root: "/Users/dana/Live_Work".into(),

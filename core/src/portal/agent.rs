@@ -77,6 +77,10 @@ pub struct PortalStatus {
     /// A credential is stored — a bearer token or a signed-in session. The
     /// credential itself is never returned.
     pub signed_in: bool,
+    /// A sign-in is half done: Portal took the password and is waiting for a
+    /// one-time code. Not a credential and not `signed_in` — the code finishes
+    /// the same sign-in, and there is nothing to send until it does.
+    pub needs_code: bool,
     /// The admin the stored session belongs to, when one is stored. Empty for a
     /// token, which names no account: Portal's token path picks the only active
     /// admin there is.

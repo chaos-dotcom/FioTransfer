@@ -118,6 +118,12 @@ pub struct App {
     /// The signed-in admin's email, cached with the flag above for the same
     /// reason: the row that shows "Signed in as …" is drawn every frame.
     portal_email: Mutex<String>,
+    /// A sign-in whose password step Portal accepted and whose one-time code is
+    /// still owed: the client holds Portal's *pending* session, so the code
+    /// finishes that same sign-in. Not a stored credential — it is dropped when
+    /// the sign-in completes, when it is signed out of, and when a new password
+    /// sign-in replaces it.
+    portal_pending: Mutex<Option<portal::PortalClient>>,
     upd: Mutex<UpdaterState>,
     updating: AtomicBool,
 }
@@ -171,6 +177,7 @@ impl App {
             portal_running: AtomicBool::new(false),
             portal_signed_in: AtomicBool::new(false),
             portal_email: Mutex::new(String::new()),
+            portal_pending: Mutex::new(None),
             upd: Mutex::new(UpdaterState {
                 st: UpdateStatus { current: crate::VERSION.to_string(), state: "idle".into(), ..Default::default() },
                 rel: None,
@@ -1131,12 +1138,17 @@ impl App {
     /// Whether Portal is on, which credential is stored, and how the last
     /// reconcile went. No network and no Keychain read: the numbers are the last
     /// run's, and the credential is the cached one.
+    ///
+    /// `needs_code` is the exception that is not cached: it is whether a
+    /// password step is waiting for its one-time code. Nothing about that
+    /// half-finished sign-in is a credential, so it never shows as signed in.
     pub fn portal_status(&self) -> portal::agent::PortalStatus {
         let s = self.settings();
         let last = self.portal_last.lock().unwrap().clone().unwrap_or_default();
         portal::agent::PortalStatus {
             enabled: s.portal_enabled,
             signed_in: self.portal_signed_in.load(Ordering::Relaxed),
+            needs_code: self.portal_pending.lock().unwrap().is_some(),
             email: self.portal_email.lock().unwrap().clone(),
             url: s.portal_url.clone(),
             root: s.portal_root_path().to_string_lossy().into_owned(),
@@ -1227,7 +1239,22 @@ impl App {
         if password.is_empty() {
             return Err("enter the password".to_string());
         }
-        let client = portal::PortalClient::login(&url, &email, password).await.map_err(|e| e.to_string())?;
+        // A new password step replaces any half-finished one: Portal's pending
+        // session is bound to the cookie this call is about to make.
+        *self.portal_pending.lock().unwrap() = None;
+        let client = match portal::PortalClient::signin(&url, &email, password).await {
+            Ok(portal::SignIn::Done(c)) => c,
+            // The password was right and the account has a second factor. The
+            // client holds Portal's pending session, which finishes the sign-in
+            // on the same cookie; it is kept here, in memory, and nothing is
+            // stored until the code lands.
+            Ok(portal::SignIn::Totp(c)) => {
+                *self.portal_pending.lock().unwrap() = Some(c);
+                self.emit("portal", serde_json::to_value(self.portal_status()).unwrap_or(Value::Null));
+                return Err(portal::PortalErr::TotpRequired.to_string());
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         // Portal's own name for the account; the typed address is an acceptable
         // fallback when the read fails, and nothing is stored unless a cookie
         // came back.
@@ -1247,10 +1274,49 @@ impl App {
         Ok(self.portal_status())
     }
 
+    /// Finishes a sign-in Portal asked a one-time code for: the same pending
+    /// session, the six digits, and then the session Portal issues is kept
+    /// exactly as a password sign-in keeps it.
+    ///
+    /// The code is this call's argument and nothing else: it is not stored, not
+    /// written anywhere and not part of any answer. A refused code changes
+    /// nothing — the pending step stays, so the next six digits can be tried —
+    /// and this returns Portal's own sentence, which says whether the code was
+    /// wrong or the step is over.
+    pub async fn portal_sign_in_totp(self: &Arc<Self>, code: &str) -> Result<portal::agent::PortalStatus, String> {
+        let Some(mut client) = self.portal_pending.lock().unwrap().clone() else {
+            return Err(portal::PortalErr::NoPendingSignIn.to_string());
+        };
+        match client.login_totp(code).await {
+            Ok(()) => {
+                *self.portal_pending.lock().unwrap() = None;
+                // Portal's own name for the account, which the code step read
+                // from `/api/auth/me`; the typed address is the fallback and is
+                // empty here, because `login_totp` keeps it.
+                let email = client.session().map(|s| s.email.clone()).unwrap_or_default();
+                let saved = config::update(|st| st.portal_email = email.clone()).map_err(|e| e.to_string())?;
+                self.settings.lock().unwrap().portal_email = saved.portal_email;
+                self.refresh_portal_credential();
+                self.emit("portal", serde_json::to_value(self.portal_status()).unwrap_or(Value::Null));
+                Ok(self.portal_status())
+            }
+            // A refusal stores nothing, but the pending step is kept: a wrong
+            // code, or a Portal that could not be reached, is worth another
+            // try on the same session. Only a finished sign-in, a sign-out or
+            // a new password step drops it.
+            Err(e) => {
+                *self.portal_pending.lock().unwrap() = Some(client);
+                Err(e.to_string())
+            }
+        }
+    }
+
     /// Forgets the stored session (the cookie jar), and the cached "signed in"
     /// flag with it. A stored bearer token is a different credential under a
-    /// different key, and stays.
+    /// different key, and stays. A sign-in still waiting for its one-time code
+    /// goes too: signing out finishes with it.
     pub fn portal_sign_out(&self) -> portal::agent::PortalStatus {
+        *self.portal_pending.lock().unwrap() = None;
         portal::clear_session();
         self.refresh_portal_credential();
         self.portal_status()

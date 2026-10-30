@@ -324,6 +324,439 @@ fn live_portal_refuses_a_wrong_password_and_keeps_nothing() {
     }
 }
 
+// ---------- the second factor ----------
+//
+// A Portal account can have TOTP on (Portal's own Settings → Security), and then
+// the password sign-in is only half of one: `POST /api/auth/login` answers
+// `totp_required` and Portal keeps a pending uid in the same session until the
+// six digits arrive at `POST /api/auth/login/totp`. These cases are that path
+// against a live Portal, and the enrolment they need is done through Portal's own
+// three routes — the app deliberately has no code that creates or reads a TOTP
+// secret.
+//
+// The instance this runs against must be left exactly as it was found. The
+// restore therefore runs whether the body succeeded or not (and also after a
+// panic in it), and the last thing the case asserts is that a password-only
+// sign-in works again. If the process is killed outright the restore cannot run;
+// the documented manual step is, with the admin's own password:
+//
+//   curl -s -c /tmp/j -X POST http://127.0.0.1:18080/api/auth/login \
+//     -H 'Content-Type: application/json' \
+//     -d '{"email":"chaos@localhost","password":"portal-local-dev-pass-1"}'
+//   curl -s -b /tmp/j -X POST http://127.0.0.1:18080/api/settings/totp/disable \
+//     -H 'Content-Type: application/json' -d '{"password":"portal-local-dev-pass-1"}'
+//
+// (with the password in the second call too: `totp_disable` accepts the password
+// or a current code, and the password is the one that is always to hand).
+
+/// The secret Portal handed out at `totp/begin`, so the restore can still finish
+/// a sign-in after the body has panicked. A test file's scratch slot, and the
+/// only place a secret lives: it is not printed and not written anywhere.
+static ENROLLED_SECRET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn remember_secret(secret: Option<String>) {
+    *ENROLLED_SECRET.lock().unwrap_or_else(|e| e.into_inner()) = secret;
+}
+
+fn remembered_secret() -> Option<String> {
+    ENROLLED_SECRET.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+// ---------- RFC 6238, over `std` ----------
+//
+// Portal verifies with `pyotp`'s defaults: HMAC-SHA-1, a 30 s step, six digits,
+// and a ±1 step window. The arithmetic below is the same and is about sixty
+// lines, which is cheaper than a crate added to the lock file for one test — and
+// it is checked against the RFC's own published vectors first.
+
+/// RFC 4648 base32, the shape Portal's `generate_secret` writes: uppercase,
+/// unpadded.
+fn base32_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut bits: u32 = 0;
+    let mut acc: u64 = 0;
+    for ch in s.chars() {
+        let v = match ch.to_ascii_uppercase() {
+            c @ 'A'..='Z' => c as u32 - 'A' as u32,
+            c @ '2'..='7' => c as u32 - '2' as u32 + 26,
+            '=' | ' ' | '-' => continue,
+            other => return Err(format!("{:?} is not a base32 character", other)),
+        };
+        acc = (acc << 5) | v as u64;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+        acc &= (1u64 << bits) - 1;
+    }
+    Ok(out)
+}
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0];
+    let mut msg = data.to_vec();
+    let bits = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bits.to_be_bytes());
+    for block in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([block[4 * i], block[4 * i + 1], block[4 * i + 2], block[4 * i + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
+        for (i, word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999u32),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let tmp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = tmp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> [u8; 20] {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..20].copy_from_slice(&sha1(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + msg.len());
+    inner.extend(block.iter().map(|b| b ^ 0x36));
+    inner.extend_from_slice(msg);
+    let digest = sha1(&inner);
+    let mut outer = Vec::with_capacity(84);
+    outer.extend(block.iter().map(|b| b ^ 0x5c));
+    outer.extend_from_slice(&digest);
+    sha1(&outer)
+}
+
+/// The six digits a authenticator app would show at `unix` for `secret`.
+fn totp_at(secret: &str, unix: u64) -> Result<String, String> {
+    let key = base32_decode(secret)?;
+    let counter = unix / 30;
+    let mac = hmac_sha1(&key, &counter.to_be_bytes());
+    let offset = (mac[19] & 0x0f) as usize;
+    let bin = ((mac[offset] as u32 & 0x7f) << 24)
+        | ((mac[offset + 1] as u32) << 16)
+        | ((mac[offset + 2] as u32) << 8)
+        | (mac[offset + 3] as u32);
+    Ok(format!("{:06}", bin % 1_000_000))
+}
+
+/// The same, for now.
+fn totp_now(secret: &str) -> Result<String, String> {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| e.to_string())?;
+    totp_at(secret, unix)
+}
+
+/// A six-digit code that is not `current`: Portal answers it with "Invalid code"
+/// and the pending step survives, which is what a typo looks like.
+fn a_wrong_code(current: &str) -> String {
+    let n: u32 = current.parse().unwrap_or(0);
+    let wrong = (n + 1) % 1_000_000;
+    let text = format!("{wrong:06}");
+    if text == current { "000000".to_string() } else { text }
+}
+
+/// Portal's own security routes, called with the session cookie the app keeps.
+/// Nothing here is product code: the app never creates or reads a TOTP secret.
+struct Raw {
+    base: String,
+    cookie: String,
+}
+
+impl Raw {
+    fn new(base: &str, jar: &portal::Session) -> Raw {
+        let cookie = jar
+            .cookies
+            .iter()
+            .filter_map(|c| c.split(';').next())
+            .map(|c| c.trim().to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Raw { base: base.trim().trim_end_matches('/').to_string(), cookie }
+    }
+
+    async fn post(&self, path: &str, body: serde_json::Value) -> Result<(u16, String), String> {
+        let res = reqwest::Client::new()
+            .post(format!("{}{}", self.base, path))
+            .header("Accept", "application/json")
+            .header("Cookie", &self.cookie)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("{}: {}", path, e))?;
+        let status = res.status().as_u16();
+        let text = res.text().await.map_err(|e| format!("{}: {}", path, e))?;
+        Ok((status, text))
+    }
+}
+
+/// What one run of the body saw, so the case can assert after the instance is
+/// back the way it was found.
+#[derive(Debug, Default)]
+struct TotpRun {
+    /// `portal_sign_in` on an instance with no second factor.
+    found_without_totp: bool,
+    /// What the next password step said, and what the app reported.
+    needs_code: bool,
+    needs_code_said: String,
+    nothing_stored_by_the_password_step: bool,
+    /// What Portal said about a wrong code, and what the app reported.
+    wrong_code_said: String,
+    wrong_code_stored_nothing: bool,
+    /// The right code's answer.
+    signed_in_as: String,
+    signed_in: bool,
+    needs_code_cleared: bool,
+    /// `GET /api/upload-links` with the session the code produced.
+    links: usize,
+    /// The jar's keys: the credential is the only thing kept.
+    kept_keys: Vec<String>,
+    /// The secret appears in no file the app wrote.
+    secret_in_no_document: bool,
+}
+
+/// The body of the case: sign in, enrol, prove the three answers, sign in with
+/// the code, read the links. Returns what it saw; it does not assert, because the
+/// instance has to be restored before anything can fail the test.
+async fn totp_round_trip(w: &World, url: &str, email: &str, password: &str) -> Result<TotpRun, String> {
+    let mut run = TotpRun::default();
+    let app = &w.app;
+
+    // 1. As found: the password alone signs in, so this instance had no second
+    //    factor.
+    portal::clear_token();
+    portal::clear_session();
+    let st = app.portal_sign_in(email, password).await?;
+    run.found_without_totp = st.signed_in && !st.needs_code;
+    let jar = portal::session().ok_or("the password sign-in stored no session")?;
+
+    // 2. Enrol, through Portal's own routes.
+    let raw = Raw::new(url, &jar);
+    let (status, text) = raw.post("/api/settings/totp/begin", serde_json::json!({})).await?;
+    if status != 200 {
+        return Err(format!("totp/begin answered {}: {}", status, text));
+    }
+    let begun: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("totp/begin: {}", e))?;
+    let secret = begun
+        .get("secret")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .ok_or("totp/begin sent no secret")?;
+    remember_secret(Some(secret.clone()));
+    let code = totp_now(&secret)?;
+    let (status, text) = raw.post("/api/settings/totp/enable", serde_json::json!({ "code": code })).await?;
+    if status != 200 {
+        return Err(format!("totp/enable answered {}: {}", status, text));
+    }
+
+    // 3. A fresh password step now stops at the code.
+    app.portal_sign_out();
+    let said = app.portal_sign_in(email, password).await.expect_err("a second factor must not sign in");
+    run.needs_code_said = said;
+    run.needs_code = app.portal_status().needs_code;
+    run.nothing_stored_by_the_password_step = portal::session().is_none() && !app.portal_status().signed_in;
+
+    // 4. A wrong code is a refusal with Portal's sentence, and keeps nothing.
+    let right = totp_now(&secret)?;
+    let wrong = a_wrong_code(&right);
+    let said = app.portal_sign_in_totp(&wrong).await.expect_err("a wrong code must not sign in");
+    run.wrong_code_said = said;
+    run.wrong_code_stored_nothing = portal::session().is_none() && !app.portal_status().signed_in;
+
+    // 5. The right code finishes the same sign-in.
+    let code = totp_now(&secret)?;
+    let st = app.portal_sign_in_totp(&code).await?;
+    run.signed_in_as = st.email.clone();
+    run.signed_in = st.signed_in;
+    run.needs_code_cleared = !st.needs_code;
+
+    // 6. The session it produced works: the links are what a reconcile reads.
+    let client = portal::PortalClient::from_settings(&app.settings()).map_err(|e| e.to_string())?;
+    run.links = client.upload_links().await.map_err(|e| e.to_string())?.len();
+
+    // 7. What is kept is the session and nothing else: the jar has its three
+    //    fields, and no file the app wrote carries the secret.
+    let kept = portal::session().ok_or("the code left no session")?;
+    let as_json: serde_json::Value = serde_json::to_value(&kept).map_err(|e| e.to_string())?;
+    run.kept_keys = as_json
+        .as_object()
+        .map(|o| o.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    run.secret_in_no_document = [fiotransfer::config::dir(), fiotransfer::config::log_dir()]
+        .iter()
+        .all(|dir| every_document_under(dir).iter().all(|(_, text)| !text.contains(&secret)));
+    Ok(run)
+}
+
+/// Puts the instance back: a password-only sign-in works again, or there is a
+/// sentence saying what is still on. Takes the secret when there is one, so a
+/// body that stopped halfway can still be finished.
+async fn restore_without_totp(
+    w: &World,
+    email: &str,
+    password: &str,
+    secret: Option<&str>,
+) -> Result<String, String> {
+    let app = &w.app;
+    app.portal_sign_out();
+    // The state to restore is "the password alone signs in". When it already
+    // does, there is nothing to turn off.
+    if app.portal_sign_in(email, password).await.is_ok() {
+        app.portal_sign_out();
+        return Ok("left without two-factor: the password alone signs in".to_string());
+    }
+    // A code is wanted. With the secret, finish that sign-in and turn the second
+    // factor off with the password Portal still accepts for it.
+    let Some(secret) = secret else {
+        return Err(
+            "the instance still has two-factor on and the test does not hold its secret: sign in with a current code and POST /api/settings/totp/disable {\"password\":…} (see the note at the head of these cases)".to_string(),
+        );
+    };
+    let code = totp_now(secret)?;
+    let st = app.portal_sign_in_totp(&code).await?;
+    let jar = portal::session().ok_or("the code left no session")?;
+    let raw = Raw::new(&st.url, &jar);
+    let (status, text) = raw
+        .post("/api/settings/totp/disable", serde_json::json!({ "password": password }))
+        .await?;
+    if status != 200 {
+        return Err(format!("totp/disable answered {}: {}", status, text));
+    }
+    // …and the proof it worked is the same check the test opened with.
+    app.portal_sign_out();
+    let st = app.portal_sign_in(email, password).await?;
+    if st.needs_code {
+        return Err("two-factor is still on after totp/disable".to_string());
+    }
+    app.portal_sign_out();
+    Ok("left without two-factor: totp/disable ran and the password alone signs in".to_string())
+}
+
+/// The code generator, against RFC 6238's own SHA-1 vectors — no Portal needed,
+/// so this one runs in every `cargo test`. The eight-digit values are the RFC's;
+/// the six digits are the same truncation with the modulus Portal verifies.
+#[test]
+fn the_code_generator_matches_the_rfc_6238_vectors() {
+    // "12345678901234567890", base32, unpadded: the seed every vector uses.
+    let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    assert_eq!(base32_decode(secret).expect("base32"), b"12345678901234567890".to_vec());
+    let cases: [(u64, &str); 6] = [
+        (59, "94287082"),
+        (1_111_111_109, "07081804"),
+        (1_111_111_111, "14050471"),
+        (1_234_567_890, "89005924"),
+        (2_000_000_000, "69279037"),
+        (20_000_000_000, "65353130"),
+    ];
+    for (t, eight) in cases {
+        assert_eq!(totp_at(secret, t).expect("a code"), eight[2..].to_string(), "at {}", t);
+    }
+    // A secret that is not base32 is refused rather than hashed as nonsense.
+    assert!(base32_decode("not base32!").is_err());
+    // The wrong-code helper never hands back the right one.
+    for code in ["000000", "999999", "123456"] {
+        let wrong = a_wrong_code(code);
+        assert_ne!(wrong, code, "{}", code);
+        assert_eq!(wrong.len(), 6);
+    }
+}
+
+/// The whole second-factor path against a live Portal: a password-only sign-in
+/// that works, the enrolment, a password step that stops at a code, a wrong code
+/// that is refused, the right code that signs in, the links it reads — and the
+/// instance restored, whether or not any of that worked.
+#[test]
+fn live_portal_signs_in_with_a_one_time_code_and_leaves_the_instance_as_it_was() {
+    let _serial = one_at_a_time();
+    let Some((url, email, password)) = live_login() else { return };
+    let w = world(&url);
+    // Whatever the last run left, nothing of it is reused here.
+    remember_secret(None);
+    let _g = w.rt.enter();
+
+    // The body may not assert: a panic inside `block_on` would skip the restore
+    // below, which is the one thing that must always happen.
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w.rt.block_on(async { totp_round_trip(&w, &url, &email, &password).await })
+    }));
+    let restored = w.rt.block_on(async {
+        restore_without_totp(&w, &email, &password, remembered_secret().as_deref()).await
+    });
+    println!("restore: {:?}", restored);
+    assert!(
+        restored.is_ok(),
+        "the live Portal was NOT put back the way it was found — see the manual step at the head of these cases: {:?}",
+        restored
+    );
+
+    // Now the body's own result: a panic and a described failure both fail here.
+    let run = match body {
+        Ok(Ok(run)) => run,
+        Ok(Err(e)) => panic!("the second-factor round trip failed: {e}"),
+        Err(_) => panic!("the second-factor round trip panicked (the instance was restored first)"),
+    };
+    println!("the run: {:#?}", run);
+
+    assert!(run.found_without_totp, "the case starts on an instance whose password sign-in works");
+    assert!(run.needs_code, "Portal reported the second factor, and the app says a code is owed");
+    assert!(run.needs_code_said.contains("one-time code"), "{}", run.needs_code_said);
+    assert!(
+        run.nothing_stored_by_the_password_step,
+        "a half-finished sign-in must store nothing: {:?}",
+        portal::session()
+    );
+    assert!(run.wrong_code_said.contains("refused the one-time code"), "{}", run.wrong_code_said);
+    assert!(run.wrong_code_said.contains("Invalid code"), "Portal's own sentence: {}", run.wrong_code_said);
+    assert!(run.wrong_code_stored_nothing, "a wrong code must store nothing");
+    assert!(run.signed_in, "the right code signs in");
+    assert_eq!(run.signed_in_as, email, "Portal names the admin the code signed in");
+    assert!(run.needs_code_cleared, "the code row is done with");
+    assert!(run.links > 0, "GET /api/upload-links with the session the code produced");
+    let mut keys = run.kept_keys.clone();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["base".to_string(), "cookies".to_string(), "email".to_string()],
+        "the session and nothing else is kept"
+    );
+    assert!(run.secret_in_no_document, "a file the app wrote carries the TOTP secret");
+}
+
 /// A session Portal will not accept says the session expired, and offers the fix
 /// — never the token's message, because the fix is not the same one.
 #[test]

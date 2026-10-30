@@ -103,6 +103,9 @@ pub enum Action {
     /// "Sign in" next to the email and the password: Portal's own login, with
     /// the password on its way to the app as a [`Secret`].
     SignInPortal { email: String, password: Secret },
+    /// "Sign in" next to the one-time code: the six digits that finish the
+    /// sign-in the password started.
+    SignInPortalTotp { code: Secret },
     /// "Sign out" of the stored Portal session.
     SignOutPortal,
     /// The "Enabled" toggle.
@@ -154,6 +157,7 @@ fn ask(state: &mut UiState, action: Action) {
         Action::SignInPortal { email, password } => {
             state.ask(Request::SignInPortal { email, password })
         }
+        Action::SignInPortalTotp { code } => state.ask(Request::SignInPortalTotp { code }),
         Action::SignOutPortal => state.ask(Request::SignOutPortal),
         Action::SetPortalEnabled(on) => state.ask(Request::SetPortalEnabled(on)),
         Action::ReconcileNow => state.ask(Request::PortalReconcile),
@@ -237,6 +241,13 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
             portal_token_line(ui, state, &mut action);
             rule(ui);
             portal_signin_line(ui, state, &mut action);
+            // While Portal waits for a one-time code the row above is only half
+            // the sign-in; this row is the other half, and it is drawn only
+            // then.
+            if state.portal.status.needs_code {
+                rule(ui);
+                portal_totp_line(ui, state, &mut action);
+            }
             rule(ui);
             portal_root_line(ui, state, &mut action);
             rule(ui);
@@ -800,6 +811,15 @@ const TOKEN_MISSING: &str = "not set";
 /// password field that says nothing about the password it is waiting for.
 const PORTAL_EMAIL_HINT: &str = "admin@example.com";
 const PORTAL_PASSWORD_HINT: &str = "your Portal password";
+/// A one-time code is six digits (RFC 6238, a 30 s step): Portal's own login
+/// asks for exactly that, so the field takes exactly that.
+const TOTP_DIGITS: usize = 6;
+/// The code field's placeholder, which is the whole instruction it needs.
+const PORTAL_CODE_HINT: &str = "6 digits";
+/// What the code row says under its field: which code, and the promise that it
+/// is not kept.
+const PORTAL_CODE_NOTE: &str =
+    "Six digits from your authenticator app, to finish this sign-in. The code is not stored.";
 /// What the sign-in row says under its fields: the one promise the row makes.
 const PASSWORD_NOTE: &str =
     "The password is not stored: only Portal's session cookie is, in your keychain.";
@@ -1204,6 +1224,63 @@ fn portal_signin_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Optio
             Some(reason) => reason_line(ui, &reason),
             None if signing_in => help_line(ui, SIGNING_IN),
             None => help_line(ui, PASSWORD_NOTE),
+        }
+    });
+}
+
+/// "One-time code": the six digits that finish a sign-in Portal asked a second
+/// factor for.
+///
+/// The row is drawn only while the app reports `needs_code`, which is one
+/// password step away from the fields above it: Portal took the email and the
+/// password, and the same session is waiting for this. It goes away — and the
+/// digits with it — the moment the code is answered, either way.
+///
+/// The digits are not masked: six of them, read back against the phone that
+/// shows them, is exactly what the row is for. They are still a [`Secret`] on
+/// their way to the app, and the draft is emptied as soon as the answer lands.
+fn portal_totp_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let signing_in = state.portal.signing_in;
+    let ready = state.portal.code_draft.trim().len() == TOTP_DIGITS && !signing_in;
+    line(ui, |ui| {
+        let label = field_label(ui, "One-time code");
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            // Right to left, as the two rows above have it: "Sign in" on the
+            // card's edge, the field taking what is left.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let pressed = primary_button(ui, "Sign in", ready);
+                let field_width = (ui.available_width() - theme::space::XXXL).max(60.0);
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+                    let field = ui.add(
+                        TextEdit::singleline(&mut state.portal.code_draft)
+                            .hint_text(PORTAL_CODE_HINT)
+                            .char_limit(TOTP_DIGITS)
+                            .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                            .desired_width(field_width),
+                    );
+                    field.labelled_by(label.id);
+                });
+                if pressed {
+                    let code = state.portal.code_draft.trim().to_string();
+                    if code.len() == TOTP_DIGITS {
+                        *action = Some(Action::SignInPortalTotp { code: Secret::new(code) });
+                    }
+                }
+            });
+        });
+        // A code is six digits: anything else typed or pasted — a space, a dash,
+        // a letter from a copied "123 456" — is dropped rather than sent.
+        let digits: String = state.portal.code_draft.chars().filter(|c| c.is_ascii_digit()).collect();
+        state.portal.code_draft = digits;
+        ui.add_space(theme::space::XXS);
+        match state.portal.code_error.clone() {
+            // Portal's own sentence: a wrong code and a sign-in that must start
+            // again do not read the same.
+            Some(reason) => reason_line(ui, &reason),
+            None if signing_in => help_line(ui, SIGNING_IN),
+            None => help_line(ui, PORTAL_CODE_NOTE),
         }
     });
 }
@@ -2032,6 +2109,7 @@ mod tests {
         ui_state.portal.status = PortalView {
             enabled: true,
             signed_in: true,
+            needs_code: false,
             // A bearer token names no admin: the sign-in row is the signed-out
             // one, and "Signed in as …" belongs to `session_state`.
             email: String::new(),
@@ -2557,6 +2635,95 @@ mod tests {
             2,
             "the fields are still there to retry with"
         );
+    }
+
+    /// The screen the moment after a password step Portal answered with
+    /// `totp_required`: nothing is signed in, and the code row is what finishes
+    /// the sign-in.
+    fn needs_code_state() -> UiState {
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        ui_state.portal.status.needs_code = true;
+        ui_state.portal.signin_error =
+            Some("Portal wants a one-time code to finish this sign-in: type the six digits from your authenticator app".to_string());
+        ui_state
+    }
+
+    #[test]
+    fn a_sign_in_that_wants_a_code_asks_for_six_digits() {
+        let harness = screen_harness(needs_code_state());
+
+        // The row, named, and the note under it: which code, and that it is not
+        // kept. The password row is still there — Portal's pending step expires,
+        // and a fresh password sign-in is how a user gets past that.
+        harness.get_by_label("One-time code");
+        harness.get_by_label(PORTAL_CODE_NOTE);
+        // Nothing typed yet: the row's "Sign in" waits. (The password row has one
+        // too, and both are disabled with nothing typed.)
+        let buttons = harness.get_all_by_label("Sign in");
+        assert!(
+            buttons.into_iter().all(|b| b.accesskit_node().is_disabled()),
+            "neither sign-in can be pressed with nothing typed"
+        );
+        // Nothing signed in, and no "Signed in as …" to be seen.
+        assert!(harness.query_by_label("Signed in as ops@nightfall.tv").is_none());
+    }
+
+    #[test]
+    fn the_six_digits_are_sent_as_a_secret_and_never_stored() {
+        let mut ui_state = needs_code_state();
+        ui_state.portal.code_draft = "135790".to_string();
+        let mut harness = screen_harness(ui_state);
+
+        // The row's own button — the Portal card draws it after the password
+        // row's, and it is the enabled one.
+        let button = harness
+            .get_all_by_label("Sign in")
+            .max_by_key(|b| b.rect().top() as i32)
+            .expect("the code row's Sign in");
+        assert!(!button.accesskit_node().is_disabled(), "six digits are a code");
+        button.click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SignInPortalTotp { code: Secret::new("135790") }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        // A `{:?}` of the request prints the mask, never the code: no toast, no
+        // log line and no panic message can carry it.
+        let printed = format!("{:?}", harness.state().requests);
+        assert!(!printed.contains("135790"), "a request printed the code: {printed}");
+        // And it is not a setting.
+        let saved = serde_json::to_string(&harness.state().settings).expect("the settings serialise");
+        assert!(!saved.contains("135790"), "the code reached the settings: {saved}");
+    }
+
+    #[test]
+    fn a_code_row_takes_six_digits_and_a_refusal_reads_under_it() {
+        let mut ui_state = needs_code_state();
+        // What the shell leaves after Portal refuses a code: the row, the
+        // sentence, and an empty field to type the next six digits into.
+        ui_state.portal.signin_error = None;
+        ui_state.portal.code_error =
+            Some("Portal refused the one-time code (401): Invalid code".to_string());
+        let harness = screen_harness(ui_state);
+
+        harness.get_by_label("Portal refused the one-time code (401): Invalid code");
+        assert!(harness.query_by_label(PORTAL_CODE_NOTE).is_none(), "the reason takes the note's place");
+        harness.get_by_label("One-time code");
+    }
+
+    #[test]
+    fn a_code_row_is_not_drawn_when_portal_is_not_asking() {
+        // A signed-in session, and a plain bearer token: neither is waiting for a
+        // code, so neither screen has the row.
+        for ui_state in [portal_state(), session_state()] {
+            let harness = screen_harness(ui_state);
+            assert!(
+                harness.query_by_label("One-time code").is_none(),
+                "no code was asked for, so no row"
+            );
+        }
     }
 
     #[test]

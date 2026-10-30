@@ -107,6 +107,9 @@ pub enum Done {
     /// `App::portal_sign_in`'s answer: the new status, or the sentence to show
     /// under the field. The password is not part of either.
     SignedIn(Result<Box<PortalStatus>, String>),
+    /// `App::portal_sign_in_totp`'s answer: the new status, or Portal's sentence
+    /// about the code. The code is not part of either.
+    SignedInTotp(Result<Box<PortalStatus>, String>),
     /// The clipboard's text, for the composer's link field (`Paste`).
     Clipboard(String),
 }
@@ -486,6 +489,20 @@ impl Shell {
                     let _ = tx.send(Update::Done(Done::SignedIn(answer)));
                 });
             }
+            Request::SignInPortalTotp { code } => {
+                // The code finishes the same sign-in the password started: the
+                // pending step lives in the app, and the address is the one it
+                // was started for. The code is this call's argument and nothing
+                // else — never stored, never drawn, and emptied below whichever
+                // way the answer went.
+                ui.portal.signing_in = true;
+                ui.portal.code_error = None;
+                let (app, tx) = (self.app.clone(), self.tx.clone());
+                self.spawn_task(async move {
+                    let answer = app.portal_sign_in_totp(code.expose()).await.map(Box::new);
+                    let _ = tx.send(Update::Done(Done::SignedInTotp(answer)));
+                });
+            }
             Request::SignOutPortal => self.sign_out_portal(ui),
             Request::PortalReconcile => {
                 // Whatever the screen holds is what Portal is asked with: a URL
@@ -708,6 +725,8 @@ impl Shell {
                 match result {
                     Ok(status) => {
                         ui.portal.signin_error = None;
+                        ui.portal.code_error = None;
+                        ui.portal.code_draft.clear();
                         ui.portal.email_draft = status.email.clone();
                         ui.portal.status = PortalView::from_core(&status);
                         ui.portal.status.now_ms = now_ms();
@@ -719,6 +738,31 @@ impl Shell {
                         // The email stays, so the sentence under the field can
                         // be read next to the address it is about.
                         ui.portal.signin_error = Some(err);
+                        // A sign-in that stopped for a code is not a refusal:
+                        // the app now says so, and the card draws the row that
+                        // finishes it.
+                        self.read_portal(ui);
+                    }
+                }
+            }
+            Done::SignedInTotp(result) => {
+                ui.portal.signing_in = false;
+                // The code goes either way, and so does the row: a refused code
+                // is not worth keeping and the next six digits replace it.
+                ui.portal.code_draft.clear();
+                match result {
+                    Ok(status) => {
+                        ui.portal.signin_error = None;
+                        ui.portal.code_error = None;
+                        ui.portal.email_draft = status.email.clone();
+                        ui.portal.status = PortalView::from_core(&status);
+                        ui.portal.status.now_ms = now_ms();
+                        self.read_state(ui);
+                    }
+                    Err(err) => {
+                        // Portal's sentence, under the code field it is about.
+                        ui.portal.code_error = Some(err);
+                        self.read_portal(ui);
                     }
                 }
             }
