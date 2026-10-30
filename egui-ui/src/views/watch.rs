@@ -1583,6 +1583,36 @@ mod tests {
         ]
     }
 
+    /// The fixture's Watch screen with one Portal project's two lanes added: two
+    /// watches the user made, then one Smart In/Out Tray job, in the order the
+    /// screen groups them. The paths are under the fixture's own home, so the
+    /// lanes read `~/Live_Work/...` like the rows above them.
+    fn duplex_fixture() -> UiState {
+        let mut state = crate::fixture::fixture_state(crate::model::View::Watch);
+        let home = state.home.clone();
+        state.watches.extend([
+            lane_watch(
+                &format!("{home}/Live_Work/LUC/1_DRIVE"),
+                "LUC",
+                "download",
+                true,
+                4,
+                "LUC",
+                Lane::Inbound,
+            ),
+            lane_watch(
+                &format!("{home}/Live_Work/LUC/0_EXPORTS"),
+                "LUC",
+                "upload",
+                true,
+                2,
+                "LUC",
+                Lane::Outbound,
+            ),
+        ]);
+        state
+    }
+
     fn state_with(watches: Vec<WatchRow>) -> UiState {
         UiState {
             watches,
@@ -1605,13 +1635,27 @@ mod tests {
             )
     }
 
+    /// The whole window at the size the app opens: [`crate::WINDOW_WIDTH`] by
+    /// [`crate::WINDOW_HEIGHT`], with the 224 px sidebar and the shell around the
+    /// screen. A snapshot is a picture of the app, so it is drawn the size the
+    /// app is drawn and nothing of it is cropped.
+    fn window_harness(state: UiState) -> Harness<'static, crate::FioApp> {
+        Harness::builder()
+            .with_size(vec2(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT))
+            .with_pixels_per_point(1.0)
+            .build_state(
+                |ctx, app: &mut crate::FioApp| app.draw(ctx),
+                crate::FioApp::new(state),
+            )
+    }
+
     /// The job's title line on screen: the project's name, and the tray suffix
     /// beside it.
     ///
     /// The name is not unique — the Frame.io column prints the same words on
     /// every lane — so it is the one that shares the suffix's line.
-    fn job_title<'h>(
-        harness: &'h Harness<'_, UiState>,
+    fn job_title<'h, State>(
+        harness: &'h Harness<'_, State>,
         name: &'h str,
     ) -> (egui_kittest::Node<'h>, egui_kittest::Node<'h>) {
         let suffix = harness.get_by_label(TRAY_SUFFIX);
@@ -2055,23 +2099,41 @@ mod tests {
     }
 
 
-    /// The whole screen with the editor open over it: the dialog, its six rows,
-    /// and the list it was opened from underneath.
+    /// The whole window with the editor open over it: the dialog and its six
+    /// rows, the list it was opened from underneath, and the sidebar beside them
+    /// — at the app's own size, so neither the dialog nor the window around it is
+    /// cropped.
     #[test]
     fn the_watch_editor_renders_to_png() {
-        let mut harness = screen_harness(state_with(vec![
-            watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3),
-            portal_watch("/Users/chaos/Live_Work/Ep 04", "Shows / Nightfall / Ep 04", "mirror", true, 0),
-        ]));
-        if let Some(pencil) = harness.get_all_by_label("Edit").next() {
-            pencil.click();
-        }
+        let mut harness = window_harness(crate::fixture::fixture_state(crate::model::View::Watch));
+        // The pencil on the first row opens the editor for that row.
+        harness
+            .get_all_by_label("Edit")
+            .next()
+            .expect("a row's Edit")
+            .click();
         // Three frames: the click's, then the two a modal `Area` measures itself
         // in before it is drawn. (Rendering after two has the whole dialog
         // clipped away — in the tree, but not in the picture.)
         harness.run_steps(4);
         harness.get_by_label(EDITOR_TITLE_EDIT);
-        harness.get_by_label(EDITOR_SAVE);
+        // Nothing cropped: the dialog's own Save is inside the window, and the
+        // sidebar and the page head it is drawn beside are both on screen.
+        let save = harness.get_by_label(EDITOR_SAVE).rect();
+        assert!(
+            save.max.x <= crate::WINDOW_WIDTH && save.max.y <= crate::WINDOW_HEIGHT,
+            "the dialog's Save is at {save:?}, outside the {}x{} window",
+            crate::WINDOW_WIDTH,
+            crate::WINDOW_HEIGHT
+        );
+        assert_eq!(
+            harness.get_all_by_label("Watch Folders").count(),
+            2,
+            "the sidebar's item and the screen's own page head"
+        );
+        // Signed in, as the app is: the sidebar's account block, not the sign-in.
+        harness.get_by_label("Account");
+        assert!(harness.query_by_label("Sign in to Frame.io").is_none());
         // The render is the artefact: read it back, so a dialog that is in the
         // tree but not on the screen cannot pass for a picture of one.
         let image = harness.render().expect("render");
@@ -2680,21 +2742,45 @@ mod tests {
         assert_eq!(portal_link_url("https://host", ""), None);
     }
 
-    /// The two-lane job, at the size the other watch snapshots are drawn at.
-    ///
-    /// With a Portal address set, so the snapshot shows the job as a configured
-    /// app draws it: the title's two runs, and `Open in Portal` live beside the
-    /// Remove.
+    /// The two-lane job in the whole window, which is the picture the feature is
+    /// for: the watches the user made, then one Portal project drawn as one Smart
+    /// In/Out Tray job with both lanes under its title, and `Open in Portal` live
+    /// beside the job's Remove — the fixture's Portal address, so it is.
     #[test]
     fn the_watch_screen_with_a_duplex_renders_to_png() {
-        let mut rows = vec![watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3)];
-        rows.extend(luc());
-        let mut harness = screen_harness(state_with(rows));
-        harness.state_mut().settings.portal_url = "https://portal.nightfall.tv".to_string();
+        let mut harness = window_harness(duplex_fixture());
         harness.run_steps(2);
-        job_title(&harness, "LUC");
-        harness.get_by_label(LANE_INBOUND);
-        harness.get_by_label(LANE_OUTBOUND);
+        // The job's title line and both lanes are on the screen ...
+        let (title, suffix) = job_title(&harness, "LUC");
+        let inbound = harness.get_by_label(LANE_INBOUND).rect();
+        let outbound = harness.get_by_label(LANE_OUTBOUND).rect();
+        assert!(inbound.min.y < outbound.min.y, "the lanes keep the In Tray first");
+        // ... the user's own row is above it, drawn as it always was ...
+        harness.get_by_label("Renders");
+        harness.get_by_label(OPEN_IN_PORTAL);
+        // ... and nothing is cropped: the job's title and its last lane are both
+        // inside the window the app opens, with the page head above them.
+        assert!(
+            title.rect().min.y >= crate::app::PAGE_HEAD_HEIGHT,
+            "the job's title is at {}, under the page head",
+            title.rect().min.y
+        );
+        assert!(
+            suffix.rect().max.x <= crate::WINDOW_WIDTH && outbound.max.y <= crate::WINDOW_HEIGHT,
+            "the job runs to ({}, {}), outside the {}x{} window",
+            suffix.rect().max.x,
+            outbound.max.y,
+            crate::WINDOW_WIDTH,
+            crate::WINDOW_HEIGHT
+        );
+        assert_eq!(
+            harness.get_all_by_label("Watch Folders").count(),
+            2,
+            "the sidebar's item and the screen's own page head"
+        );
+        // Signed in, as the app is: the sidebar's account block, not the sign-in.
+        harness.get_by_label("Account");
+        assert!(harness.query_by_label("Sign in to Frame.io").is_none());
         harness.snapshot("watch_duplex");
     }
 

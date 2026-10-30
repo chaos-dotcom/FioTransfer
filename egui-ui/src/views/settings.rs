@@ -1600,6 +1600,34 @@ mod tests {
             )
     }
 
+    /// The whole window at the size the app opens: [`crate::WINDOW_WIDTH`] by
+    /// [`crate::WINDOW_HEIGHT`], with the 224 px sidebar and the shell around the
+    /// screen. A picture of a screen is the app's own picture, so it is drawn the
+    /// size the app is drawn and nothing of it is cropped.
+    fn window_harness(state: UiState) -> Harness<'static, crate::FioApp> {
+        Harness::builder()
+            .with_size(vec2(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT))
+            .with_pixels_per_point(1.0)
+            .build_state(
+                |ctx, app: &mut crate::FioApp| app.draw(ctx),
+                crate::FioApp::new(state),
+            )
+    }
+
+    /// Where a label is on the screen, top and bottom: every node that carries
+    /// it, so a field and the label beside it count as one row.
+    fn label_span(harness: &Harness<'_, crate::FioApp>, label: &str) -> (f32, f32) {
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for node in harness.get_all_by_label(label) {
+            let rect = node.rect();
+            top = top.min(rect.min.y);
+            bottom = bottom.max(rect.max.y);
+        }
+        assert!(top.is_finite(), "no `{label}` on the screen");
+        (top, bottom)
+    }
+
     /// The toggle boxes in draw order, which is the order of the rows: "Open at
     /// login" and "Check for updates" (App), then "Save log with media"
     /// (Storage), then Portal's "Enabled". Each box's text label is drawn to its
@@ -2805,6 +2833,88 @@ mod tests {
     fn the_portal_section_draws_with_populated_status() {
         let mut harness = screen_harness(portal_state());
         harness.snapshot("settings_portal");
+    }
+
+    /// The Settings screen as the app shows it scrolled to the Portal card: the
+    /// whole 1180x780 window, the panel wheeled down the way a user scrolls it,
+    /// and every row of the card — the address, the credential, the local folder,
+    /// the on/off switch, the status line and "Reconcile now" — in frame.
+    ///
+    /// The card is below the fold at that size (the four sections above it are
+    /// taller than the window), so the picture is the scrolled window rather than
+    /// a taller render that no screen shows.
+    #[test]
+    fn the_settings_screen_scrolled_to_the_portal_card_renders_to_png() {
+        let mut harness = window_harness(crate::fixture::fixture_state(crate::model::View::Settings));
+        harness.run_steps(2);
+
+        // The pointer over the central panel, clear of the sidebar: a wheel
+        // scrolls the panel it is over, which is how the screen scrolls at all.
+        harness.hover_at(egui::pos2(crate::app::SIDEBAR_WIDTH + 200.0, 200.0));
+        harness.run_steps(1);
+        let (unscrolled, _) = label_span(&harness, "Portal");
+        assert!(
+            unscrolled > crate::WINDOW_HEIGHT,
+            "the Portal card is already in frame unscrolled, at {unscrolled}: the scroll proves nothing"
+        );
+
+        // One notch is four points of wheel, one frame at a time: the size a
+        // trackpad reports, and under egui's 8 px smoothing threshold, so it is
+        // spent in the frame it is given instead of smeared over the next few.
+        // The wheel turns until the panel cannot scroll any further — the end of
+        // the screen, where the card's last row has the `.view` bottom padding
+        // under it rather than the window's edge.
+        let mut frames = 0;
+        let mut previous = f32::INFINITY;
+        loop {
+            let (_, bottom) = label_span(&harness, "Reconcile now");
+            if (bottom - previous).abs() < 0.5 {
+                break; // the last notch moved nothing: the panel is at its end
+            }
+            previous = bottom;
+            assert!(
+                frames < 120,
+                "the wheel never reached the end of the screen: {bottom} after {frames} frames"
+            );
+            for _ in 0..4 {
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -4.0),
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.run_steps(1);
+            frames += 1;
+        }
+        assert!(frames > 1, "the wheel moved nothing: {frames} frame(s)");
+        // The cursor is not part of the picture: nothing is left hovered.
+        harness.remove_cursor();
+        harness.run_steps(1);
+
+        // Measured on the frame that is rendered: the card's title and its last
+        // row are inside the window, the status line between them is the
+        // fixture's, and the sidebar the panel scrolled beside is still there.
+        let (title_top, _) = label_span(&harness, "Portal");
+        let (first_top, _) = label_span(&harness, "Server URL");
+        let (_, last_bottom) = label_span(&harness, "Reconcile now");
+        assert!(title_top >= 0.0, "the Portal title is {title_top} px above the window");
+        assert!(first_top > title_top, "the card's first row is at {first_top}, above its title");
+        assert!(
+            last_bottom + 8.0 <= crate::WINDOW_HEIGHT,
+            "the card's last row ends at {last_bottom}, on the {} px window's edge",
+            crate::WINDOW_HEIGHT
+        );
+        let status = portal_line(&harness.state().state.portal.status).text;
+        harness.get_by_label(&status);
+        assert_eq!(
+            harness.get_all_by_label("Settings").count(),
+            2,
+            "the sidebar's item and the screen's own page head"
+        );
+        harness.get_by_label("Account");
+        assert!(harness.query_by_label("Sign in to Frame.io").is_none(), "signed in, as the app is");
+
+        harness.snapshot("settings_portal_window");
     }
 
     #[test]
