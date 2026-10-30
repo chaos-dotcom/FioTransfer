@@ -13,6 +13,13 @@
 //!   same distinction `mount(8)` prints for a human.
 //! * `strerror_text` is checked for being non-empty, stable, and free of the
 //!   static-buffer smell (the same code read from eight threads at once).
+//!
+//! unix only: every one of these is a `libc` call, and on Windows the crate
+//! answers "no" to all three without asking anything (`is_writable` is false,
+//! `is_network_volume` is false, `strerror_text` is empty), so there is no
+//! behaviour here to check against an oracle.
+
+#![cfg(unix)]
 
 mod common;
 

@@ -197,23 +197,52 @@ fn expand_home(p: &str) -> PathBuf {
     }
 }
 
+/// The user's home folder: `HOME`, or on Windows `USERPROFILE`
+/// (`C:\Users\<name>` — Windows sets no `HOME`), and `/` where neither is set.
 pub fn home_dir() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(h) => PathBuf::from(h),
-        None => PathBuf::from("/"),
+    if let Some(h) = std::env::var_os("HOME") {
+        return PathBuf::from(h);
     }
+    if cfg!(windows) {
+        if let Some(h) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(h);
+        }
+    }
+    PathBuf::from("/")
 }
 
-/// ~/Library/Application Support/FioTransfer (created on demand).
+/// The app's own folder, created on demand: `~/Library/Application
+/// Support/FioTransfer`, and on Windows `%APPDATA%\FioTransfer`.
+///
+/// That folder is the per-user roaming one, and its ACL is what keeps the token
+/// files in it to this account — that is the protection Windows has instead of
+/// the 0600 mode the same files are created with on unix (see `fileio::mode`).
 pub fn dir() -> PathBuf {
-    let dir = home_dir().join("Library").join("Application Support").join("FioTransfer");
+    let dir = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
+            .join("FioTransfer")
+    } else {
+        home_dir().join("Library").join("Application Support").join("FioTransfer")
+    };
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
 
-/// Where the human-readable transfer log lives.
+/// Where the human-readable transfer log lives: `~/Library/Logs/FioTransfer`, and
+/// on Windows `%LOCALAPPDATA%\FioTransfer\Logs` — local, not roaming: a log
+/// belongs to the machine it was written on.
 pub fn log_dir() -> PathBuf {
-    let dir = home_dir().join("Library").join("Logs").join("FioTransfer");
+    let dir = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+            .join("FioTransfer")
+            .join("Logs")
+    } else {
+        home_dir().join("Library").join("Logs").join("FioTransfer")
+    };
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

@@ -5,7 +5,6 @@ pub mod unfinished;
 pub mod watch;
 
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -447,11 +446,13 @@ FROM transfers t LEFT JOIN transfer_files f ON f.transfer_id = t.id ORDER BY t.c
         let _g = self.log_mu.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_ms();
         let p = self.log_dir.join(format!("transfers-{}.log", fmt_month(now)));
-        let fh = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o644)
-            .open(p);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        // 0644 on unix: a log a human reads. Windows has no mode bits, and the
+        // file inherits the ACL of the folder it is created in (see
+        // `fileio::mode`).
+        crate::fileio::mode(&mut opts, 0o644);
+        let fh = opts.open(p);
         if let Ok(mut fh) = fh {
             let _ = writeln!(fh, "{}  {}", fmt_stamp(now), line);
         }

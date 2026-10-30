@@ -19,4 +19,5 @@
 
 #![allow(unsafe_code)] // the workspace's C boundary: the pointer reads the libc calls need
 
+pub mod fs;
 pub mod platform;

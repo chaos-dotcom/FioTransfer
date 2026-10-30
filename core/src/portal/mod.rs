@@ -110,15 +110,13 @@ pub fn set_token(t: &str) -> Result<(), String> {
         return Ok(());
     }
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let p = token_path();
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&p)
-        .map_err(|e| format!("could not store the Portal token: {}", e))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    // 0600 on unix; on Windows the folder's ACL is what keeps this token to its
+    // owner (see `fileio::mode`).
+    crate::fileio::mode(&mut opts, 0o600);
+    let mut f = opts.open(&p).map_err(|e| format!("could not store the Portal token: {}", e))?;
     f.write_all(t.as_bytes()).map_err(|e| format!("could not store the Portal token: {}", e))
 }
 

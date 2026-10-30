@@ -1133,21 +1133,24 @@ fn walk(dir: &Path, parent: &Path, out: &mut Vec<Scanned>) -> Result<(), String>
 ///
 /// Symbolic links are not followed: a link that points at one of its own
 /// parents used to recurse until the stack ran out, and an upload that walks a
-/// tree twice sends the same bytes twice. `seen` holds (device, inode) pairs as
-/// a second guard, so a tree that reaches the same directory by two paths is
-/// walked once.
+/// tree twice sends the same bytes twice. `seen` holds file identities as a
+/// second guard, so a tree that reaches the same directory by two paths is
+/// walked once: `(device, inode)` on unix, `(volume serial, file index)` on
+/// Windows. See `fileio::FileId` for what the identity means and for the weaker
+/// answer that stands in when the file system will not give one.
 fn walk_inner(
     dir: &Path,
     parent: &Path,
     out: &mut Vec<Scanned>,
-    seen: &mut std::collections::HashSet<(u64, u64)>,
+    seen: &mut std::collections::HashSet<crate::fileio::FileId>,
 ) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = match std::fs::metadata(dir) {
-        Ok(m) => m,
-        Err(e) => return Err(format!("{}: {}", dir.display(), e)),
-    };
-    if !seen.insert((meta.dev(), meta.ino())) {
+    // A folder the walk cannot read is the caller's error to report, and
+    // `file_id` answers a weaker fallback for it rather than failing, so ask
+    // here first.
+    if let Err(e) = std::fs::metadata(dir) {
+        return Err(format!("{}: {}", dir.display(), e));
+    }
+    if !seen.insert(crate::fileio::file_id(dir)) {
         return Ok(()); // this directory was already walked by another path
     }
     let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
@@ -1194,7 +1197,10 @@ pub fn ms_from_system(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-#[cfg(test)]
+// unix only: the one test here builds a symlink cycle, and `std::fs::symlink`
+// needs a privilege on Windows. The guard it checks — a symlink is not
+// descended into — is the same code on both platforms.
+#[cfg(all(test, unix))]
 mod scan_tests {
     use super::*;
 

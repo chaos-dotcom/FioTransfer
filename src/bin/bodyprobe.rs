@@ -2,8 +2,6 @@
 //! A body-path probe: how fast can this machine PUT a file part over loopback
 //! with different request-body strategies? Measurement harness, not shipped.
 
-use std::io::Read;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -60,7 +58,7 @@ fn main() {
                     "engine" | "limit" => Body::Fresh(fh, off, len),
                     "whole" => {
                         let mut buf = vec![0u8; len as usize];
-                        fh.read_exact_at(&mut buf, off as u64).unwrap();
+                        fiotransfer_core::fileio::read_exact_at(&fh, &mut buf, off as u64).unwrap();
                         Body::Bytes(Bytes::from(buf))
                     }
                     _ => Body::Fresh(fh, off, len),
@@ -103,7 +101,7 @@ impl Stream for FreshStream {
         if me.left <= 0 { return std::task::Poll::Ready(None); }
         let want = (me.left as usize).min(1 << 20);
         let mut buf = vec![0u8; want];
-        let got = me.fh.read_at(&mut buf, me.pos as u64).unwrap();
+        let got = fiotransfer_core::fileio::read_at(&me.fh, &mut buf, me.pos as u64).unwrap();
         buf.truncate(got);
         me.pos += got as i64; me.left -= got as i64;
         me.sent.fetch_add(got as i64, Ordering::Relaxed);
@@ -119,7 +117,7 @@ impl Stream for PooledStream {
         if me.left <= 0 { return std::task::Poll::Ready(None); }
         let want = (me.left as usize).min(me.pool.buf_size());
         let mut b = me.pool.take(want);
-        let got = me.fh.read_at(b.as_mut_slice(), me.pos as u64).unwrap();
+        let got = fiotransfer_core::fileio::read_at(&me.fh, b.as_mut_slice(), me.pos as u64).unwrap();
         b.set_len(got);
         me.pos += got as i64; me.left -= got as i64;
         me.sent.fetch_add(got as i64, Ordering::Relaxed);
@@ -163,4 +161,3 @@ mod pool {
     impl AsRef<[u8]> for Owner { fn as_ref(&self) -> &[u8] { self.data.as_deref().unwrap_or(&[]) } }
     impl Drop for Owner { fn drop(&mut self) {} }
 }
-use std::io::Read as _;

@@ -896,23 +896,34 @@ fn local_root_ok(root: &str) -> Result<(), String> {
     }
     if let Some(rest) = root.strip_prefix("/Volumes/") {
         let vol = rest.split('/').next().unwrap_or("");
-        let a = std::fs::metadata(format!("/Volumes/{}", vol));
-        let b = std::fs::metadata("/Volumes");
-        match (a, b) {
-            (Ok(a), Ok(b)) => {
-                if same_device(&a, &b) {
-                    return bad();
-                }
-            }
-            _ => return bad(),
+        let share = format!("/Volumes/{}", vol);
+        // A share that isn't mounted leaves nothing at /Volumes/<name>, or a stale
+        // empty folder on the startup disk, which is the volume /Volumes itself
+        // is on. Either way it is refused.
+        if std::fs::metadata(&share).is_err() || std::fs::metadata("/Volumes").is_err() {
+            return bad();
+        }
+        if same_device(&share, "/Volumes") {
+            return bad();
         }
     }
     Ok(())
 }
 
-fn same_device(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev()
+/// Whether two paths sit on the same volume: the check that tells a mounted
+/// share from the empty folder the startup disk shows in its place.
+///
+/// The volume is half of a file's identity, so this asks `fileio::file_id` for
+/// the first half on either platform — `st_dev` on unix, the volume's serial
+/// number on Windows. Where the identity could not be read for one of the two,
+/// the two identities differ and the answer is "not the same volume": this
+/// guard only ever refuses a download, so the doubtful answer is the one that
+/// lets it through.
+fn same_device(a: &str, b: &str) -> bool {
+    match (crate::fileio::file_id(std::path::Path::new(a)), crate::fileio::file_id(std::path::Path::new(b))) {
+        (crate::fileio::FileId::Fs { a: da, .. }, crate::fileio::FileId::Fs { a: db, .. }) => da == db,
+        _ => false,
+    }
 }
 
 /// written reports whether a file that has held still for steady is done being

@@ -1,7 +1,6 @@
 //! Uploading: presigned parts, verification, replacing versions.
 
 use std::collections::HashMap;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -933,7 +932,7 @@ impl SectionStream {
             {
                 let dst = buf.as_mut_slice();
                 while got < want {
-                    match fh.read_at(&mut dst[got..], off as u64 + got as u64) {
+                    match crate::fileio::read_at(&fh, &mut dst[got..], off as u64 + got as u64) {
                         Ok(0) => break,
                         Ok(k) => got += k,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

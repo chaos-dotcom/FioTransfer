@@ -9,6 +9,11 @@
 //! the seam that supplies that client; it lives on the core's `App`
 //! (`core/src/app.rs`) and is re-exported here unchanged.
 //!
+//! unix only: the sandbox is built with `std::fs::symlink`, which needs
+//! `SeCreateSymbolicLinkPrivilege` on Windows (developer mode), and the model
+//! records links as their own kind of entry. Nothing here is verified on
+//! Windows yet; the CI job only packages there.
+//!
 //! Each case gets a fresh sandbox: a media tree of sentinel files (a fake
 //! watch-folder layout, nested folders, a symlink) that is byte-snapshotted
 //! before and after, an empty history log, and a Space cache seeded by walking
@@ -24,6 +29,8 @@
 //! Run with:
 //!   CARGO_TARGET_DIR=/tmp/target-delete cargo test --offline --test prop_delete
 //!
+//! `#![cfg(unix)]` below keeps the whole file out of a Windows build.
+//!
 //! Nothing here sets an environment variable: a test thread that did would race
 //! with the other test function in this binary. `config::dir()` is therefore the
 //! caller's HOME, so the mutation calibration in the report runs this file with
@@ -33,6 +40,8 @@
 //! unmodified code; they are the reproductions for findings F1 (unencoded id in
 //! the delete URL), F2 (cache eviction ignores the account) and F3 (the log line
 //! is not sanitised). Run them with `-- --ignored`.
+
+#![cfg(unix)] // the sandbox needs a symlink: see the header
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};

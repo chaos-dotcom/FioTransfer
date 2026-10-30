@@ -20,6 +20,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod fileio;
 pub mod host;
 pub mod limiter;
 pub mod localcert;

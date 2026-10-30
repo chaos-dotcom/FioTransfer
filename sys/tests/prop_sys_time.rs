@@ -17,6 +17,11 @@
 //!
 //! `TZ` is process-global and `localtime_r` caches the zone, so every test here
 //! takes one lock and restores `TZ` after itself.
+//!
+//! unix only: `local_time` is `localtime_r`, and on Windows it answers `None`,
+//! so every case here has nothing to compare against.
+
+#![cfg(unix)]
 
 mod common;
 
