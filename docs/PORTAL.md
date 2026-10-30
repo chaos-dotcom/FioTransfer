@@ -117,7 +117,8 @@ Then press **Reconcile now**. The status line tells you what happened:
 
 Folder counts appear only when the last reconcile succeeded — a failure is never dressed
 up as a success. While **Enabled** is on, FioTransfer re-checks every 30 seconds
-(`portal_every_secs`); while it is off, nothing goes out.
+(`portal_every_secs`, clamped to 5 s – 24 h; a value below the floor means the floor, not the
+default); while it is off, nothing goes out.
 
 ## From a terminal
 

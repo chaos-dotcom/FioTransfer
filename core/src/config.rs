@@ -129,10 +129,13 @@ impl Settings {
 
     /// Seconds between reconciles, clamped to what the poller can honour.
     pub fn portal_interval(&self) -> std::time::Duration {
-        let secs = if self.portal_every_secs < PORTAL_MIN_EVERY_SECS {
+        // `normalize` has already clamped this; the clamp is repeated here because
+        // `portal_interval` is public and is called on settings that may not have
+        // been through it (a test, a caller that built the struct by hand).
+        let secs = if self.portal_every_secs <= 0 {
             PORTAL_EVERY_SECS
         } else {
-            self.portal_every_secs.min(86_400)
+            self.portal_every_secs.clamp(PORTAL_MIN_EVERY_SECS, 86_400)
         };
         std::time::Duration::from_secs(secs as u64)
     }
@@ -167,12 +170,16 @@ impl Settings {
         if self.portal_on_change != crate::history::watch::ON_CHANGE_KEEP {
             self.portal_on_change = PORTAL_ON_CHANGE.to_string();
         }
-        if self.portal_every_secs < PORTAL_MIN_EVERY_SECS {
-            self.portal_every_secs = PORTAL_EVERY_SECS;
-        }
-        if self.portal_every_secs > 86_400 {
-            self.portal_every_secs = 86_400;
-        }
+        // Below the floor: clamp up to it, rather than quietly substituting the
+        // default. Somebody who writes `1` wants the fastest poller allowed, not
+        // thirty seconds — the old rule made a one-second setting slower than a
+        // five-second one. Zero and negatives are not a request at all (a missing
+        // key already takes the default), so those keep the default.
+        self.portal_every_secs = if self.portal_every_secs <= 0 {
+            PORTAL_EVERY_SECS
+        } else {
+            self.portal_every_secs.clamp(PORTAL_MIN_EVERY_SECS, 86_400)
+        };
         // An email address is not a secret, but a password is never written
         // here at all: this field is trimmed and nothing else.
         self.portal_email = self.portal_email.trim().to_string();
@@ -300,3 +307,49 @@ pub fn update<F: FnOnce(&mut Settings)>(f: F) -> std::io::Result<Settings> {
 }
 
 pub const ERR_NO_CLIENT_ID: &str = "no Adobe Client ID set";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A setting below the floor asks for the fastest poller allowed. It used to
+    /// mean the default — so `1` polled every 30 s and `5` every 5 s, which is the
+    /// opposite of what anybody writing `1` meant.
+    #[test]
+    fn a_short_interval_clamps_up_to_the_floor_not_to_the_default() {
+        let mut s = Settings::default();
+        s.portal_every_secs = 1;
+        s.normalize();
+        assert_eq!(s.portal_every_secs, PORTAL_MIN_EVERY_SECS);
+        assert_eq!(s.portal_interval(), std::time::Duration::from_secs(5));
+
+        // Not a request at all: keep the default.
+        let mut z = Settings::default();
+        z.portal_every_secs = 0;
+        z.normalize();
+        assert_eq!(z.portal_every_secs, PORTAL_EVERY_SECS);
+
+        // Above the ceiling: the ceiling.
+        let mut big = Settings::default();
+        big.portal_every_secs = 10_000_000;
+        big.normalize();
+        assert_eq!(big.portal_every_secs, 86_400);
+
+        // And a sane value is left alone.
+        let mut ok = Settings::default();
+        ok.portal_every_secs = 45;
+        ok.normalize();
+        assert_eq!(ok.portal_every_secs, 45);
+        assert_eq!(ok.portal_interval(), std::time::Duration::from_secs(45));
+    }
+
+    /// `portal_interval` is public, so it clamps on its own too.
+    #[test]
+    fn the_interval_itself_is_clamped() {
+        let mut s = Settings::default();
+        s.portal_every_secs = 2;
+        assert_eq!(s.portal_interval(), std::time::Duration::from_secs(5));
+        s.portal_every_secs = -1;
+        assert_eq!(s.portal_interval(), std::time::Duration::from_secs(PORTAL_EVERY_SECS as u64));
+    }
+}
