@@ -122,6 +122,12 @@ fn detail_of(body: &str) -> String {
             return d.trim().to_string();
         }
     }
+    // A web page is never Portal's answer: every error Portal sends is JSON. This is
+    // what a mistyped address looks like — `example.com` answers `405` with its home
+    // page — so say that, rather than pasting a page of HTML into a status line.
+    if t.starts_with('<') || t.to_ascii_lowercase().contains("<html") {
+        return String::new();
+    }
     crate::netx::trim_body(t.as_bytes())
 }
 
@@ -181,6 +187,14 @@ impl std::fmt::Display for PortalErr {
                         status
                     ),
                     404 => write!(f, "Portal has no /api/upload-links ({}): is that the Portal address?", status),
+                    // A page of HTML where JSON belongs means the address answered,
+                    // but it is not Portal: the mistyped-URL case, and the one a
+                    // person is most likely to hit first.
+                    _ if body.trim_start().starts_with('<') => write!(
+                        f,
+                        "that address answered {} with a web page, not Portal's API: is that the Portal address?",
+                        status
+                    ),
                     _ => {
                         let body = detail_of(body);
                         if body.is_empty() {
@@ -1389,7 +1403,27 @@ mod tests {
         assert_eq!(bare.to_string(), "Portal answered 503 (no detail)");
 
         let html = PortalErr::Status { status: 500, body: "<html>oops</html>".into() };
-        assert!(html.to_string().contains("oops"), "{}", html);
+        let text = html.to_string();
+        assert!(text.contains("web page"), "{text}");
+        assert!(!text.contains("oops"), "a bank of HTML is not a message: {text}");
+    }
+
+    #[test]
+    fn a_web_page_is_not_reported_as_portals_answer() {
+        // What example.com actually answered when the shipped CLI was pointed at it.
+        let page = PortalErr::Status {
+            status: 405,
+            body: "<!doctype html><html lang=\"en\"><head><title>Example Domain</title></head></html>".into(),
+        };
+        let text = page.to_string();
+        assert!(text.contains("web page"), "{text}");
+        assert!(text.contains("is that the Portal address"), "{text}");
+        assert!(!text.contains("<html"), "HTML reached the user: {text}");
+        assert!(text.len() < 160, "the sentence is a status line, not a page: {text}");
+
+        // Portal's own JSON still reads normally.
+        let json = PortalErr::Status { status: 502, body: r#"{"detail":"bad gateway upstream"}"#.into() };
+        assert_eq!(json.to_string(), "Portal answered 502: bad gateway upstream");
     }
 
 }
