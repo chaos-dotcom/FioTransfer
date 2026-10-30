@@ -20,6 +20,49 @@ owns the path and creates the folder; Portal's own `destination_path` / `path_te
 are deliberately ignored, because the NAS layout Portal writes for Project Zeus is not
 the layout of this machine.
 
+## Two one-way folders, instead of one mirror
+
+A project can be split in two: the client sends files to us, and we send finished work
+back. Portal says so by adding a `sync` object **inside the link's existing `folder`** —
+it rides on the row `GET /api/upload-links` already returns, so there is no new endpoint and
+nothing to configure in FioTransfer:
+
+```json
+"folder": {
+  "type": "frameio", "account_id": "…", "folder_id": "…", "path": […],
+  "turbosort": "20261028_YML-XMAS-Luc",
+  "sync": {
+    "mode": "add_only",
+    "drive":   {"local": "1_DRIVE",   "folder_id": "…"},
+    "exports": {"local": "0_EXPORTS", "folder_id": "…"}
+  }
+}
+```
+
+That link gets **two watches**, both under its marker folder and both owned by the link:
+
+| Local folder | Frame.io folder | Direction |
+| --- | --- | --- |
+| `~/Live_Work/20261028_YML-XMAS-Luc/1_DRIVE` | `sync.drive.folder_id`, or the link's own folder | **down**: Frame.io → local |
+| `~/Live_Work/20261028_YML-XMAS-Luc/0_EXPORTS` | `sync.exports.folder_id` | **up**: local → Frame.io |
+
+`exports` is optional: without it there is no upload folder, only the download one. `local` must be
+exactly one path segment — the same rule the marker follows — so a mapping can never point outside
+`~/Live_Work/<marker>/`; a bad one is refused with a stated reason and nothing is created.
+`mode` is `add_only`, and that is the only mode there is: an unknown mode is read as `add_only` and
+appears in the report as a `note:` line instead of failing the link.
+
+**Deletions never propagate, in either direction.** A one-way watch only ever moves files one way, so
+nothing that disappears on one side can take anything off the other: a `download` watch never uploads,
+an `upload` watch never downloads, and no part of the watch engine calls Frame.io's delete API. A file
+you delete locally stays on Frame.io, and a file deleted on Frame.io stays on your disk.
+
+Withdrawing a mapping — clearing `exports` in Portal, or removing the whole `sync` object — removes
+**exactly that watch** and leaves the folder on disk with everything in it. That is the rule that makes
+it safe to clear Frame.io space: the local folder becomes an ordinary folder again, not a hole.
+
+A link with no `sync` in its `folder` is unchanged: one mirrored watch at `~/Live_Work/<marker>`.
+
 ## What happens the first time it runs
 
 A marker names a `Live_Work` folder that may already hold media — from Project Zeus, a previous app, or your own
@@ -196,6 +239,9 @@ the idempotence rule, visible.
   construction.
 * When a link disappears, is switched off, or its marker is cleared, the folder it
   created is **unwatched — not deleted**. Removing local media is always your decision.
+* A `sync` link's two folders are watched one way each (`1_DRIVE` down, `0_EXPORTS` up), and
+  a deletion is never copied in either direction. Withdrawing one mapping removes that one
+  watch and no other: clearing `exports` leaves the drive watch running.
 * Reconciling twice changes nothing the second time.
 
 ## When it says no
@@ -254,6 +300,11 @@ manual step is at the head of the case in `tests/portal_live.rs`:
 ## What it does not do yet
 
 * Portal's sync rules are read for reference only; FioTransfer does not adopt them.
+* The `sync` object has one mode, `add_only`. Anything else is read as `add_only` and noted in
+  the report; a mode that means something different needs a version that implements it.
+* A `sync` mapping starts, like every Portal watch, by recording what is already there rather
+  than moving it. Files the client sent *before* the mapping existed stay on Frame.io: add the
+  folder by hand — or pause the watch, empty its record and resume — if they have to come down.
 * Nothing is sent back to Portal — a link's state in Portal is unaffected by what
   FioTransfer does with its folder.
 * The token cannot be rotated from the app; change it in Portal and re-enter it here.

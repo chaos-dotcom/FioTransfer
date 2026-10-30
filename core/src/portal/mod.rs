@@ -13,6 +13,11 @@
 //! `target_folder_name`, `folder` and `turbosort`) and `GET /api/sync-rules`
 //! (read-only reference: what Portal's own worker would do).
 //!
+//! A link's `folder` may also carry a `sync` object — see [`Sync`] — which says
+//! the project is not one mirror but two one-way folders: one the client sends
+//! into, one we make things in. It rides on the same row, so no endpoint is
+//! added for it.
+//!
 //! Two credentials open them, and the caller never has to choose:
 //!
 //! * `Authorization: Bearer <PORTAL_API_TOKEN>`, Portal's machine-client token.
@@ -491,18 +496,121 @@ fn text_at(v: &Value, key: &str) -> String {
 /// id is under `folder_id`, and the name is the last element of `path` rather
 /// than a `name` key. Both spellings are read, because getting this wrong is not
 /// a parse error — it is a link that is silently skipped for having no folder.
+///
+/// It may also carry `sync` (see [`Sync`]), which turns the link's one mirror
+/// into two one-way folders. Absent, the link is exactly what it was.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Folder {
     pub id: String,
     pub name: String,
     pub account_id: String,
+    /// The link's two one-way folders, when Portal says the link is not one
+    /// mirror. `None` — the normal case, and the only one an older Portal sends
+    /// — is the single mirrored watch this module has always made.
+    pub sync: Option<Sync>,
+}
+
+/// One side of a link's `sync` object: the local folder name and the Frame.io
+/// folder it belongs to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SyncFolder {
+    /// One path segment, under `<portal root>/<turbosort>`. The same rule the
+    /// marker follows: no `/`, `\`, `%`, control characters, `.` or `..`.
+    pub local: String,
+    /// The Frame.io folder. Empty when Portal named none: for the drive side
+    /// that means the link's own folder, and for the exports side there is
+    /// nothing to default to.
+    pub folder_id: String,
+}
+
+/// The `sync` object Portal may add **inside a link's existing `folder`**, which
+/// `GET /api/upload-links` already returns verbatim:
+///
+/// ```json
+/// "folder": {
+///   "type": "frameio", "account_id": "…", "folder_id": "…", "path": […],
+///   "turbosort": "20261028_YML-XMAS-Luc",
+///   "sync": {
+///     "mode": "add_only",
+///     "drive":   {"local": "1_DRIVE",   "folder_id": "…"},
+///     "exports": {"local": "0_EXPORTS", "folder_id": "…"}
+///   }
+/// }
+/// ```
+///
+/// `add_only` is the mode this build implements, and the only one: two one-way
+/// folders, and nothing is ever deleted at either end. `drive` is the folder the
+/// client sends into (Frame.io → local); `exports` is the one we make things in
+/// (local → Frame.io) and may be absent. An unstated or unknown mode is read as
+/// `add_only`, and the reconciler notes it instead of refusing the link: a link
+/// that watches nothing is worse than one that watches what the contract says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Sync {
+    pub mode: String,
+    pub drive: Option<SyncFolder>,
+    pub exports: Option<SyncFolder>,
+}
+
+/// The one mode this build knows: two one-way folders, no deletions propagated.
+pub const SYNC_ADD_ONLY: &str = "add_only";
+
+impl Sync {
+    /// The mode, trimmed and lowercased. Empty when Portal said nothing.
+    pub fn mode(&self) -> String {
+        self.mode.trim().to_ascii_lowercase()
+    }
+
+    /// Whether this build can act on the mode. An unstated mode is `add_only`;
+    /// anything else is not this build's to guess at, and is noted as read as
+    /// `add_only` rather than refused.
+    pub fn is_known_mode(&self) -> bool {
+        let m = self.mode();
+        m.is_empty() || m == SYNC_ADD_ONLY
+    }
+}
+
+/// The `sync` object of a `folder`, when there is a usable one.
+///
+/// A `sync` that is present but not an object is read as absent, and the link
+/// then keeps the single mirrored watch it has today. Guessing here would be the
+/// one wrong guess that turns a one-way folder into a mirror; leaving it alone
+/// means a malformed row changes nothing.
+fn sync_at(v: &Value) -> Option<Sync> {
+    let s = v.get("sync")?;
+    if !s.is_object() {
+        return None;
+    }
+    Some(Sync { mode: text_at(s, "mode"), drive: sync_folder_at(s.get("drive")), exports: sync_folder_at(s.get("exports")) })
+}
+
+/// One side of a `sync` object. A side that is absent, `null` or not an object
+/// is `None`: Portal named no such folder.
+fn sync_folder_at(v: Option<&Value>) -> Option<SyncFolder> {
+    let v = v?;
+    if !v.is_object() {
+        return None;
+    }
+    let folder_id = {
+        let id = text_at(v, "folder_id");
+        if id.is_empty() {
+            text_at(v, "id")
+        } else {
+            id
+        }
+    };
+    Some(SyncFolder { local: text_at(v, "local"), folder_id })
 }
 
 impl<'de> Deserialize<'de> for Folder {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Folder, D::Error> {
         let v = Value::deserialize(d)?;
         Ok(match &v {
-            Value::String(s) => Folder { id: String::new(), name: s.trim().to_string(), account_id: String::new() },
+            Value::String(s) => Folder {
+                id: String::new(),
+                name: s.trim().to_string(),
+                account_id: String::new(),
+                sync: None,
+            },
             Value::Object(_) => Folder {
                 id: {
                     let id = text_at(&v, "id");
@@ -530,6 +638,7 @@ impl<'de> Deserialize<'de> for Folder {
                         a
                     }
                 },
+                sync: sync_at(&v),
             },
             _ => Folder::default(),
         })

@@ -171,6 +171,100 @@ fn live_portal_reconciles_into_watch_folders() {
     assert_eq!(before, after, "a second reconcile changed the watch list");
 }
 
+/// A live Portal is the only place the real `folder` object is, and that object is
+/// what decides whether a link is one mirrored watch or two one-way folders. So:
+/// read the same rows the app reads, and check the watch list against each link's
+/// own mapping — `mirror` at `root/<marker>` when the link carries no `sync`, a
+/// `download` watch at `root/<marker>/<drive.local>` and an `upload` watch at
+/// `root/<marker>/<exports.local>` when it does.
+///
+/// Written for both shapes, so it is true of a Portal that seeds a `sync` link
+/// and of one that does not yet.
+#[test]
+fn live_portal_watches_match_each_links_own_mapping() {
+    let _serial = one_at_a_time();
+    let Some((url, token)) = live() else { return };
+    let w = world(&url);
+    portal::set_token(&token).expect("token stored");
+
+    let _g = w.rt.enter();
+    let links = {
+        let c = portal::PortalClient::from_settings(&w.app.settings()).expect("a client");
+        w.rt.block_on(async { c.upload_links().await }).expect("GET /api/upload-links")
+    };
+    let rep = w.rt.block_on(async { w.app.portal_reconcile().await });
+    println!("report: {:#?}", rep);
+    assert!(rep.error.is_empty(), "reconcile reported an error: {:?}", rep.error);
+
+    let root = w.root.to_string_lossy().into_owned();
+    let rows = w.app.hist.lock().unwrap().as_ref().unwrap().watches().expect("watches");
+    // Portal's own watches, by origin: nothing the user made is in here.
+    let by_origin: std::collections::BTreeMap<String, _> =
+        rows.iter().filter(|r| r.origin.starts_with("portal:")).map(|r| (r.origin.clone(), r)).collect();
+
+    for l in &links {
+        let marker = l.marker();
+        if marker.is_empty() || l.is_disabled() || l.acct().is_empty() {
+            continue; // Portal is not asking for a watch for this one
+        }
+        match l.folder.sync.as_ref() {
+            None => {
+                let origin = format!("portal:{}", l.id);
+                let row = by_origin.get(&origin).unwrap_or_else(|| panic!("no watch for {} ({})", l.id, marker));
+                assert_eq!(row.local_path, format!("{}/{}", root, marker), "a link with no sync is one mirror");
+                assert_eq!(row.direction, "mirror");
+            }
+            Some(sync) => {
+                println!("link {} is two one-way folders: {:?}", l.id, sync);
+                if let Some(d) = sync.drive.as_ref() {
+                    let local = format!("{}/{}/{}", root, marker, d.local);
+                    let row = by_origin
+                        .get(&format!("portal:{}", l.id))
+                        .unwrap_or_else(|| panic!("no drive watch for {} at {}", l.id, local));
+                    assert_eq!(row.local_path, local, "the drive folder, under the marker");
+                    assert_eq!(row.direction, "download", "the client's folder only comes down");
+                    let want = if d.folder_id.is_empty() { l.dest_folder() } else { d.folder_id.clone() };
+                    assert_eq!(row.folder_id, want, "drive.folder_id, or the link's own folder");
+                }
+                if let Some(x) = sync.exports.as_ref() {
+                    let local = format!("{}/{}/{}", root, marker, x.local);
+                    let row = by_origin
+                        .get(&format!("portal:{}#exports", l.id))
+                        .unwrap_or_else(|| panic!("no exports watch for {} at {}", l.id, local));
+                    assert_eq!(row.local_path, local, "the exports folder, under the marker");
+                    assert_eq!(row.direction, "upload", "what we make only goes up");
+                    assert_eq!(row.folder_id, x.folder_id);
+                    assert_ne!(
+                        row.direction, "mirror",
+                        "no mapping may ever be widened to a mirror: that is what would copy a deletion over"
+                    );
+                }
+            }
+        }
+    }
+
+    // Every Portal watch is one of these mappings, and the second run changes
+    // nothing at all.
+    let snapshot: Vec<(String, String, String)> =
+        rows.iter().map(|r| (r.id.clone(), r.origin.clone(), r.direction.clone())).collect();
+    let rep2 = w.rt.block_on(async { w.app.portal_reconcile().await });
+    assert!(rep2.error.is_empty(), "second run failed: {}", rep2.error);
+    assert_eq!((rep2.ensured, rep2.removed), (0, 0), "a second reconcile must change nothing");
+    let again: Vec<(String, String, String)> = w
+        .app
+        .hist
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .watches()
+        .expect("watches")
+        .into_iter()
+        .map(|r| (r.id, r.origin, r.direction))
+        .collect();
+    assert_eq!(snapshot, again, "the watch list changed on a second run");
+}
+
 /// The same host, with a token that is not the right one: the status line must say
 /// the token was refused, not print Portal's JSON. Runs against any Portal; skipped
 /// unless PORTAL_LIVE_URL is set.

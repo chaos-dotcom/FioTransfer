@@ -677,6 +677,361 @@ proptest! {
     }
 }
 
+// ---------- a link that is two one-way folders ----------
+//
+// A link whose `folder` carries a `sync` object is not one mirror but two
+// one-way folders: `1_DRIVE` comes down from Frame.io, `0_EXPORTS` goes up to
+// it, and neither side ever propagates a deletion. Portal sends it on the row
+// `GET /api/upload-links` already returns, so nothing about the stub changes.
+
+/// A row with a `sync` object inside its `folder`, the way Portal sends it.
+fn sync_row(id: &str, marker: &str, sync: Value) -> Value {
+    json!({
+        "id": id,
+        "name": format!("Link {}", id),
+        "target_folder_id": "F1",
+        "target_folder_name": "Folder",
+        "target_account_id": "A1",
+        "folder": {
+            "type": "frameio",
+            "account_id": "A1",
+            "folder_id": "F1",
+            "path": [{"id": "p1", "name": "Projects"}, {"id": "F1", "name": "Folder"}],
+            "turbosort": marker,
+            "sync": sync,
+        },
+        "turbosort": marker,
+    })
+}
+
+/// The marker folder every case here works under.
+const MARKER: &str = "20261028_YML-XMAS-Luc";
+
+fn row_of(w: &World, local: &str) -> Watch {
+    w.portal_watches().into_iter().find(|r| r.local_path == local).unwrap_or_else(|| panic!("no watch at {}", local))
+}
+
+#[test]
+fn a_sync_link_with_a_drive_folder_is_one_download_watch() {
+    let w = World::new();
+    let before = files_under(&w.media);
+    let dirs_before = dirs_under(&w.media);
+    w.stub.links(vec![sync_row("L1", MARKER, json!({"mode": "add_only", "drive": {"local": "1_DRIVE"}}))]);
+
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "{}", rep.error);
+    assert!(rep.skipped.is_empty(), "nothing to refuse: {:?}", rep.skipped);
+    assert_eq!(rep.ensured, 1);
+
+    let rows = w.portal_watches();
+    assert_eq!(rows.len(), 1, "one mapping, one watch: {:?}", rows.iter().map(|r| &r.origin).collect::<Vec<_>>());
+    let drive = &rows[0];
+    assert_eq!(drive.origin, "portal:L1", "the drive watch keeps the plain origin");
+    assert_eq!(drive.direction, "download", "the client's folder only ever comes down");
+    assert_eq!(
+        Path::new(&drive.local_path),
+        w.root.join(MARKER).join("1_DRIVE"),
+        "under the marker folder, in the mapped name"
+    );
+    assert_eq!(drive.account_id, "A1");
+    assert_eq!(drive.folder_id, "F1", "no folder_id on the drive side: the link's own folder");
+    assert_eq!(drive.on_change, w.app.settings().portal_change_rule());
+    assert!(drive.enabled, "a fresh Portal watch is on, as any other");
+    assert!(Path::new(&drive.local_path).is_dir(), "the mapped folder is created");
+
+    // A `download` watch takes files from Frame.io and puts nothing there: a file
+    // deleted locally can therefore never take anything off Frame.io.
+    let as_watch = Watch { direction: drive.direction.clone(), ..Watch::default() };
+    assert!(as_watch.downloads() && !as_watch.uploads(), "one-way down");
+
+    // Nothing outside the root appeared, and no file was made.
+    assert_eq!(files_under(&w.media), before, "the reconciler writes folders, never files");
+    for d in dirs_under(&w.media).difference(&dirs_before) {
+        assert!(d == "Live_Work" || d.starts_with("Live_Work/"), "a folder appeared outside the root: {}", d);
+    }
+}
+
+#[test]
+fn a_sync_link_with_drive_and_exports_is_two_watches_going_opposite_ways() {
+    let w = World::new();
+    w.stub.links(vec![sync_row(
+        "L1",
+        MARKER,
+        json!({
+            "mode": "add_only",
+            "drive": {"local": "1_DRIVE", "folder_id": "FDRIVE"},
+            "exports": {"local": "0_EXPORTS", "folder_id": "FEXPORTS"},
+        }),
+    )]);
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "{}", rep.error);
+    assert_eq!(rep.ensured, 2);
+
+    let drive = row_of(&w, &w.root.join(MARKER).join("1_DRIVE").to_string_lossy());
+    let exports = row_of(&w, &w.root.join(MARKER).join("0_EXPORTS").to_string_lossy());
+    assert_eq!(drive.origin, "portal:L1");
+    assert_eq!(exports.origin, "portal:L1#exports", "the exports watch has an origin of its own");
+    assert!(agent::link_of(&exports.origin).is_some(), "and it is still Portal's");
+    assert_eq!(drive.direction, "download");
+    assert_eq!(exports.direction, "upload", "what we make only ever goes up");
+    assert_eq!(drive.folder_id, "FDRIVE");
+    assert_eq!(exports.folder_id, "FEXPORTS");
+    assert_ne!(drive.id, exports.id);
+    assert_ne!(drive.dest_label, exports.dest_label, "two rows on screen are told apart");
+
+    // The direction is what keeps deletions from propagating: an upload watch
+    // never looks at Frame.io, and a download watch never writes to it.
+    for r in [&drive, &exports] {
+        let as_watch = Watch { direction: r.direction.clone(), ..Watch::default() };
+        assert!(!(as_watch.uploads() && as_watch.downloads()), "{} is one-way", r.local_path);
+    }
+}
+
+#[test]
+fn a_second_reconcile_of_a_sync_link_changes_nothing() {
+    let w = World::new();
+    w.stub.links(vec![sync_row(
+        "L1",
+        MARKER,
+        json!({"mode": "add_only", "drive": {"local": "1_DRIVE"}, "exports": {"local": "0_EXPORTS", "folder_id": "FEXPORTS"}}),
+    )]);
+    assert!(w.reconcile().error.is_empty());
+    let snapshot: Vec<(String, String, String, String, String)> = w
+        .watches()
+        .into_iter()
+        .map(|r| (r.id, r.origin, r.local_path, r.direction, r.folder_id))
+        .collect();
+
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "{}", rep.error);
+    assert_eq!(rep.ensured, 0, "a second run makes or edits nothing");
+    assert_eq!(rep.removed, 0, "and removes nothing");
+    let again: Vec<(String, String, String, String, String)> = w
+        .watches()
+        .into_iter()
+        .map(|r| (r.id, r.origin, r.local_path, r.direction, r.folder_id))
+        .collect();
+    assert_eq!(snapshot, again, "the watch list is unchanged, ids included");
+}
+
+#[test]
+fn clearing_the_exports_folder_removes_only_that_watch_and_leaves_the_folder_on_disk() {
+    let w = World::new();
+    w.stub.links(vec![sync_row(
+        "L1",
+        MARKER,
+        json!({"mode": "add_only", "drive": {"local": "1_DRIVE"}, "exports": {"local": "0_EXPORTS", "folder_id": "FEXPORTS"}}),
+    )]);
+    assert!(w.reconcile().error.is_empty());
+    let drive = row_of(&w, &w.root.join(MARKER).join("1_DRIVE").to_string_lossy());
+    let exports_path = w.root.join(MARKER).join("0_EXPORTS");
+    let exports = row_of(&w, &exports_path.to_string_lossy());
+
+    // Somebody has already exported into it. That file is the reason this test
+    // exists: nothing may take it away.
+    std::fs::write(exports_path.join("SHOW_EP01_v03.mov"), b"master").unwrap();
+
+    // Portal clears the exports folder (or somebody forgets the mapping).
+    w.stub.links(vec![sync_row("L1", MARKER, json!({"mode": "add_only", "drive": {"local": "1_DRIVE"}}))]);
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "{}", rep.error);
+    assert_eq!(rep.removed, 1, "exactly the exports watch goes: {:?}", rep.skipped);
+    assert_eq!(rep.ensured, 0, "the drive watch was already right");
+
+    let rows = w.portal_watches();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, drive.id, "the drive watch is the same watch, not a new one");
+    assert_eq!(rows[0].origin, "portal:L1");
+    assert!(!w.watches().iter().any(|r| r.id == exports.id), "the exports watch is gone");
+    assert!(exports_path.is_dir(), "the folder stays on disk: unwatched, not deleted");
+    assert_eq!(
+        std::fs::read(exports_path.join("SHOW_EP01_v03.mov")).unwrap(),
+        b"master",
+        "and so does what is in it"
+    );
+}
+
+#[test]
+fn an_invalid_local_refuses_the_mapping_and_creates_nothing() {
+    let w = World::new();
+    let before = dirs_under(&w.media);
+    w.stub.links(vec![sync_row(
+        "L1",
+        MARKER,
+        json!({"mode": "add_only", "drive": {"local": ".."}, "exports": {"local": "0_EXPORTS", "folder_id": "FEXPORTS"}}),
+    )]);
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "{}", rep.error);
+    assert!(rep.skipped.iter().any(|s| s.reason.contains("sync drive folder")), "{:?}", rep.skipped);
+    // The exports side is still made: one bad mapping does not lose the other.
+    assert_eq!(w.portal_watches().len(), 1);
+    assert_eq!(w.portal_watches()[0].direction, "upload");
+    // And nothing was created for the refused name: the marker folder holds the
+    // exports folder and nothing else, and `..` made no folder anywhere.
+    let made: BTreeSet<String> = dirs_under(&w.media).into_iter().filter(|d| !before.contains(d)).collect();
+    let want: BTreeSet<String> = [
+        "Live_Work".to_string(),
+        format!("Live_Work/{}", MARKER),
+        format!("Live_Work/{}/0_EXPORTS", MARKER),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(made, want, "the refused name made no folder");
+}
+
+#[test]
+fn both_locals_the_same_refuses_the_second_mapping() {
+    let w = World::new();
+    w.stub.links(vec![sync_row(
+        "L1",
+        MARKER,
+        json!({"mode": "add_only", "drive": {"local": "IN_OUT"}, "exports": {"local": "IN_OUT", "folder_id": "FEXPORTS"}}),
+    )]);
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "{}", rep.error);
+    assert_eq!(w.portal_watches().len(), 1, "one folder cannot be both one-way");
+    assert_eq!(w.portal_watches()[0].direction, "download", "the drive side is the one that was made");
+    assert!(rep.skipped.iter().any(|s| s.reason.contains("is the drive folder")), "{:?}", rep.skipped);
+}
+
+#[test]
+fn an_unknown_sync_mode_is_read_as_add_only_and_said_so() {
+    let w = World::new();
+    w.stub.links(vec![sync_row(
+        "L1",
+        MARKER,
+        json!({"mode": "two_way_merge", "drive": {"local": "1_DRIVE"}, "exports": {"local": "0_EXPORTS", "folder_id": "FEXPORTS"}}),
+    )]);
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "an unknown mode is not a failure: {}", rep.error);
+    assert_eq!(rep.ensured, 2, "it is read as add_only and acted on");
+    assert_eq!(rep.notes.len(), 1, "{:?}", rep.notes);
+    assert!(rep.notes[0].contains("two_way_merge") && rep.notes[0].contains("add_only"), "{}", rep.notes[0]);
+    assert!(rep.skipped.is_empty(), "a note is not a refusal");
+}
+
+/// The deletion promise, asserted rather than written down as a comment.
+///
+/// `Client::delete_file` and `Client::delete_project` are the only two ways
+/// this app can take a file or a project off Frame.io, and nothing on the watch
+/// path calls either: no `sync` mapping may turn "gone locally" into "delete it
+/// there", and no mapping may turn "gone on Frame.io" into "delete it here".
+///
+/// The check reads the sources of the code that decides what a watch does — the
+/// engine's tick, scan and batch, and the reconciler that makes the watches —
+/// and fails if either name appears there as a call. `core/src/xfer/upload.rs`
+/// is deliberately not in the list: a confirmed re-upload deletes the copy it
+/// replaces when the watch's OnChange rule is `overwrite`. That is a replacement
+/// the upload itself asked for, not a deletion either side propagated, and it is
+/// why the names are matched *as calls* — with the `(` attached — rather than as
+/// words.
+#[test]
+fn the_api_delete_functions_are_not_reachable_from_the_watch_path() {
+    const WATCH_PATH: [(&str, &str); 3] = [
+        ("core/src/xfer/watch.rs", include_str!("../core/src/xfer/watch.rs")),
+        ("core/src/portal/agent.rs", include_str!("../core/src/portal/agent.rs")),
+        ("core/src/portal/mod.rs", include_str!("../core/src/portal/mod.rs")),
+    ];
+    for (name, src) in WATCH_PATH {
+        let code = without_comments(src);
+        for call in ["delete_file", "delete_project"] {
+            assert!(
+                !code.contains(&format!("{}(", call)),
+                "{} calls {}: a watch must never delete on the other side",
+                name,
+                call
+            );
+        }
+    }
+    // Not a vacuous pass: the same scan does find the call where it belongs.
+    let upload = without_comments(include_str!("../core/src/xfer/upload.rs"));
+    assert!(upload.contains("delete_file("), "the scan would have seen a call if there were one");
+}
+
+/// Rust source with its comments taken out, so a sentence that mentions a
+/// deletion is not read as one. `://` is left alone: a URL is a string, not a
+/// comment.
+fn without_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut in_block = false;
+    for line in src.lines() {
+        let mut rest = line;
+        loop {
+            if in_block {
+                match rest.find("*/") {
+                    Some(i) => {
+                        rest = &rest[i + 2..];
+                        in_block = false;
+                    }
+                    None => {
+                        rest = "";
+                        break;
+                    }
+                }
+            } else {
+                match rest.find("/*") {
+                    Some(i) => {
+                        out.push_str(&rest[..i]);
+                        rest = &rest[i + 2..];
+                        in_block = true;
+                    }
+                    None => break,
+                }
+            }
+        }
+        if !in_block {
+            let cut = rest.match_indices("//").find(|(i, _)| !rest[..*i].ends_with(':')).map(|(i, _)| i);
+            out.push_str(match cut {
+                Some(i) => &rest[..i],
+                None => rest,
+            });
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn a_dry_run_of_a_sync_link_plans_both_folders_and_changes_nothing() {
+    let w = World::new();
+    let before = files_under(&w.media);
+    let dirs_before = dirs_under(&w.media);
+    w.stub.links(vec![sync_row(
+        "L1",
+        MARKER,
+        json!({"mode": "add_only", "drive": {"local": "1_DRIVE"}, "exports": {"local": "0_EXPORTS", "folder_id": "FEXPORTS"}}),
+    )]);
+    let plan = w.rt.block_on(async { agent::preview(&w.app).await });
+    assert!(plan.error.is_empty(), "{}", plan.error);
+    assert_eq!(plan.ensured, 2, "two watches would be made");
+    let want: BTreeSet<String> = ["1_DRIVE", "0_EXPORTS"]
+        .iter()
+        .map(|l| w.root.join(MARKER).join(l).to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(plan.planned.into_iter().collect::<BTreeSet<_>>(), want, "both mapped folders, and no others");
+    assert_eq!(plan.removed, 0);
+    assert!(w.watches().is_empty(), "a dry run makes no watch");
+    assert_eq!(files_under(&w.media), before, "and writes nothing");
+    assert_eq!(dirs_under(&w.media), dirs_before, "not even a folder");
+}
+
+#[test]
+fn a_link_without_sync_is_still_one_mirror() {
+    // The brief's first rule, checked against the same stub as the sync cases:
+    // no `sync` in the folder is today's behaviour, unchanged.
+    let w = World::new();
+    let mut row = sync_row("L1", MARKER, Value::Null);
+    row["folder"].as_object_mut().unwrap().remove("sync");
+    w.stub.links(vec![row]);
+    let rep = w.reconcile();
+    assert!(rep.error.is_empty(), "{}", rep.error);
+    let rows = w.portal_watches();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].direction, "mirror");
+    assert_eq!(Path::new(&rows[0].local_path), w.root.join(MARKER), "one watch at root/marker");
+    assert_eq!(rows[0].origin, "portal:L1");
+}
+
 // ---------- deterministic cases ----------
 
 #[test]
