@@ -4,10 +4,16 @@ name: package
 # the version in Cargo.toml is new.
 #
 # ONE APP. FioTransfer is the egui application (`egui-ui`, package
-# `fiotransfer-egui`). It is the only thing packaged, and it is packaged
-# everywhere: an unsigned .app, a .deb and an AppImage, and an NSIS installer.
-# The Wails-compatible WKWebView shell that used to be the macOS bundle is gone;
-# the root package is a CLI (`fio`) and a bench (`fio-bench`) and ships nothing.
+# `fiotransfer-egui`). It is what is packaged, and it is packaged everywhere: an
+# unsigned .app, a .deb and an AppImage, and an NSIS installer. The
+# Wails-compatible WKWebView shell that used to be the macOS bundle is gone.
+#
+# THE CLI RIDES ALONG. `docs/PORTAL.md` tells the reader to run `fio portal …`,
+# so every bundle carries the root package's `fio` beside the GUI — the
+# `[[package.metadata.packager.binaries]]` entries in `egui-ui/Cargo.toml` list
+# both, and the hook below builds both. `fio` is never `main`: the bundle, the
+# desktop entry, the AppImage and the installer are still named after the GUI.
+# (`fio-bench` ships nothing.)
 #
 # THE VERSION LIVES IN ONE PLACE: `[package] version` in Cargo.toml (currently
 # 1.3.0, the version the original app is at). Everything else follows it:
