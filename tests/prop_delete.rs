@@ -23,6 +23,11 @@
 //! Run with:
 //!   CARGO_TARGET_DIR=/tmp/target-delete cargo test --offline --test prop_delete
 //!
+//! Nothing here sets an environment variable: a test thread that did would race
+//! with the other test function in this binary. `config::dir()` is therefore the
+//! caller's HOME, so the mutation calibration in the report runs this file with
+//! `HOME=<scratch>` in the *cargo* environment rather than patching it in.
+//!
 //! Three probes at the bottom are `#[ignore]`d because they fail on the
 //! unmodified code; they are the reproductions for findings F1 (unencoded id in
 //! the delete URL), F2 (cache eviction ignores the account) and F3 (the log line
@@ -33,7 +38,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use proptest::collection::vec as pvec;
@@ -116,20 +121,6 @@ fn snap(root: &Path) -> BTreeMap<String, Entry> {
         }
     }
     out
-}
-
-/// HOME is only read by `config::dir()` / `config::log_dir()`; the case's own
-/// store and log dirs are passed explicitly. Pointing HOME at a scratch dir
-/// keeps a stray write into the app profile out of the real one.
-fn test_home() -> PathBuf {
-    static HOME: OnceLock<PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| {
-        let p = std::env::temp_dir().join(format!("prop-delete-home-{}", std::process::id()));
-        std::fs::create_dir_all(&p).unwrap();
-        std::env::set_var("HOME", &p);
-        p
-    })
-    .clone()
 }
 
 // ---------- the stub Frame.io ----------
@@ -283,7 +274,6 @@ impl World {
     /// `collide` seeds a second account that holds the same project id, which is
     /// what finding F2 needs.
     fn new(mode: Mode, collide: bool) -> World {
-        let _ = test_home();
         let tmp = tempfile::TempDir::new().unwrap();
         // One level down: the case runs with its working directory inside
         // `sandbox`, so even the id `..` can only reach this case's own tmp dir.
@@ -320,7 +310,7 @@ impl World {
     }
 
     fn cache(&self) -> BTreeSet<(String, String)> {
-        self.app.space().iter().map(|p| (p.account_id.clone(), p.project_id.clone())).collect()
+        self.app.space().projects.iter().map(|p| (p.account_id.clone(), p.project_id.clone())).collect()
     }
 
     fn log_lines(&self) -> Vec<String> {
@@ -629,4 +619,18 @@ fn one_delete_writes_exactly_one_log_line() {
     let lines = w.log_lines();
     assert_eq!(lines.len(), 1, "one delete wrote {} log lines: {:#?}", lines.len(), lines);
     assert!(lines[0].contains(PHRASE));
+}
+
+#[test]
+fn wire_table() {
+    let w = World::new(Mode::Deletes, false);
+    let ids = ["", ".", "..", "../files/x", "../../v4/me", "projA/../projB", "a/b", "%2e%2e%2fprojB", " projA ", "uuid-4c1f-aaaa-bbbb-ccccdddd", "p1\nSPACE    deleted project X on Frame.io (nothing local was touched)"];
+    for id in ids {
+        let n0 = w.stub.log().len();
+        let r = w.delete("acct", id);
+        let paths: Vec<String> = w.stub.log()[n0..].iter().map(|q| format!("{} {} -> {}", q.method, q.path, q.status)).collect();
+        println!("WIRE {:?} => {:?} ; {:?}", id, r.is_ok(), paths);
+    }
+    println!("LOGLINES {}", w.log_lines().len());
+    for l in w.log_lines() { println!("LOGLINE [{}]", l); }
 }
