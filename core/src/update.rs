@@ -1,89 +1,178 @@
-//! Asking GitHub for new releases, and installing one over this copy.
+//! Asking a signed update feed for new releases, and installing one over this
+//! copy.
 //!
-//! A release must carry a "-macOS.zip" and a SHA256SUMS.txt (scripts/package.sh
-//! makes both).
+//! The feed is one `latest.json` published beside the release's files, and every
+//! download it names is verified with minisign against [`PUB_KEY`] before
+//! anything on disk is touched: `cargo-packager-updater` does the check, the
+//! download and that verification. A release must therefore carry the macOS zip
+//! and a signature for exactly that file. Nothing is taken from the GitHub API
+//! on trust any more.
+//!
+//! The app's own words for the states are unchanged (`idle`, `checking`,
+//! `downloading`, `restarting`, plus the `progress`, `error` and `blocker`
+//! fields the Settings card and the CLI read).
 
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use cargo_packager_updater::{Error as UpdaterError, Update, Updater, UpdaterBuilder};
 use tokio_util::sync::CancellationToken;
 
-/// The GitHub endpoint for the newest published release.
-pub const DEFAULT_API: &str = "https://api.github.com/repos/farbhaus/FioTransfer/releases/latest";
+/// Where the newest release's feed lives: a release asset, so it always
+/// describes the newest release that has finished uploading.
+pub const ENDPOINT: &str =
+    "https://github.com/chaos-dotcom/FioTransfer/releases/latest/download/latest.json";
+
+/// The public half of the key the release workflow signs update assets with.
+///
+/// It comes from `cargo packager signer generate`, which writes two files: `key`
+/// (the private key, base64) and `key.pub` (the public one). This is the content
+/// of `key.pub`, verbatim; the private key is the release workflow's
+/// `CARGO_PACKAGER_SIGN_PRIVATE_KEY` and is never in this repository.
+///
+/// ROTATING THIS KEY STRANDS EVERY INSTALLED COPY. A build accepts only a
+/// signature made by this exact key, so the first release signed with a new one
+/// is refused by every copy already installed, and each of those has to be
+/// replaced by hand (download and drag across). If it ever has to change, ship a
+/// release signed with the old key first, then start signing with the new one.
+/// Treat this value as write-once.
+pub const PUB_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZGRTZEQ0E0Q0Q1NjM5MjUKUldRbE9WYk5wTnptYjhlZ0pEck52Y3VvaHY1M0drUE1tUDhXT2dyUHdyUWNNbDBXdFZCY3N4bmoK";
+
 /// The app's bundle identifier; an update must have the same one.
 pub const BUNDLE_ID: &str = "com.farbhaus.fiotransfer";
 
 const WORK_PREFIX: &str = ".FioTransfer-update-";
+/// The app caps a check at 30s as well; this is the crate's own bound, so the
+/// blocking request ends even when nobody is waiting for it any more.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// A transfer-sized download, bounded so a stalled connection can't last for
+/// ever.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// A published release with the files an update needs.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// How far a download has come, as a fraction of the whole (0.0..=1.0). The
+/// app draws it as "Downloading… N%".
+pub type Progress = Arc<dyn Fn(f64) + Send + Sync>;
+
+/// A published release, as the feed describes it.
+#[derive(Debug, Clone)]
 pub struct Release {
-    /// "1.0.3"
-    #[serde(default)]
+    /// The feed's `version`, "1.0.3". This is what decides "newer".
     pub version: String,
-    /// The release page.
-    #[serde(default)]
+    /// Where the update is downloaded from (the feed's `url` for this platform).
     pub url: String,
-    /// Download URL of the release's "-macOS.zip" asset.
-    #[serde(default)]
-    pub zip: String,
-    /// The release's SHA256SUMS.txt asset URL (or, if a caller sets it, the
-    /// expected 64-hex SHA-256 of the zip itself).
-    #[serde(default)]
-    pub sha256: String,
+    /// The crate's handle for it: download what it names, verified.
+    update: Update,
 }
 
+/// One update feed, and the key every download it names must carry.
+#[derive(Clone)]
 pub struct Source {
-    pub api: String,
+    pub endpoint: String,
+    pub pub_key: String,
     pub user_agent: String,
 }
 
 impl Source {
+    /// The published feed, verified against the key burnt into this build.
     pub fn new(user_agent: &str) -> Self {
-        Source { api: DEFAULT_API.to_string(), user_agent: user_agent.to_string() }
+        Source {
+            endpoint: ENDPOINT.to_string(),
+            pub_key: PUB_KEY.to_string(),
+            user_agent: user_agent.to_string(),
+        }
     }
 
-    /// Returns the newest release. A release still missing its files (they are
-    /// attached after it's created) comes back as None.
-    pub async fn latest(&self, cx: &CancellationToken) -> Result<Option<Release>, String> {
-        // A non-200 comes back as "GitHub answered HTTP %d" from get().
-        let resp = get(cx, &self.api, &self.user_agent, Some("application/vnd.github+json")).await?;
-        let body = read_capped(resp, 4 << 20).await?;
-        #[derive(Deserialize)]
-        struct Asset {
-            #[serde(default)]
-            name: String,
-            #[serde(default)]
-            browser_download_url: String,
+    /// The same, pointing somewhere else. Tests serve a feed from a socket; the
+    /// app never does.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// The same, with another key. A build with no key can verify nothing, so it
+    /// refuses to check at all.
+    pub fn with_pub_key(mut self, pub_key: impl Into<String>) -> Self {
+        self.pub_key = pub_key.into();
+        self
+    }
+
+    /// The crate's updater for this build: this version, the feed, the key, and
+    /// the one platform this copy runs on.
+    fn updater(&self, timeout: Duration) -> Result<Updater, String> {
+        if self.pub_key.trim().is_empty() {
+            return Err("no update signing key is configured".to_string());
         }
-        #[derive(Deserialize)]
-        struct Resp {
-            #[serde(default)]
-            tag_name: String,
-            #[serde(default)]
-            html_url: String,
-            #[serde(default)]
-            assets: Vec<Asset>,
-        }
-        let r: Resp = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-        let mut rel = Release {
-            version: r.tag_name.trim_start_matches('v').to_string(),
-            url: r.html_url,
-            zip: String::new(),
-            sha256: String::new(),
+        let version = match parse_semver(crate::VERSION) {
+            Some(v) => v,
+            None => return Err(format!("{} isn't a released version", crate::VERSION)),
         };
-        for a in &r.assets {
-            if a.name.ends_with("-macOS.zip") {
-                rel.zip = a.browser_download_url.clone();
-            } else if a.name == "SHA256SUMS.txt" {
-                rel.sha256 = a.browser_download_url.clone();
+        let target = cargo_packager_updater::target()
+            .ok_or_else(|| "this platform has no update target".to_string())?;
+        let url = self
+            .endpoint
+            .parse()
+            .map_err(|e| format!("the update endpoint isn't a URL: {}", e))?;
+        let config = cargo_packager_updater::Config {
+            endpoints: vec![url],
+            ..Default::default()
+        };
+        let builder = UpdaterBuilder::new(version, config)
+            // A feed may describe this one platform (url/signature at the top) or
+            // a `platforms` map; the key is `macos-aarch64` either way.
+            .target(target)
+            .pub_key(self.pub_key.clone())
+            .header("User-Agent", self.user_agent.clone())
+            .map_err(|e| e.to_string())?
+            .timeout(timeout);
+        // The crate would ask `current_exe()` itself, and that refuses a path
+        // holding a symlink (a target folder under /tmp, or an app reached
+        // through one). This app swaps the bundle itself, so the crate only ever
+        // needs this value as a placeholder.
+        let builder = match std::env::current_exe() {
+            Ok(exe) => builder.executable_path(exe),
+            Err(_) => builder,
+        };
+        builder.build().map_err(|e| e.to_string())
+    }
+
+    /// Returns the release the feed announces, or None when it announces nothing
+    /// newer than this build.
+    pub async fn latest(&self, cx: &CancellationToken) -> Result<Option<Release>, String> {
+        let updater = self.updater(CHECK_TIMEOUT)?;
+        // The crate's client is blocking, so it runs off the runtime. The app's
+        // own 30s timeout and cancellation can stop waiting for it, and the
+        // crate's timeout ends the request itself.
+        let work = tokio::task::spawn_blocking(move || updater.check());
+        let out = tokio::select! {
+            j = work => j.map_err(|e| format!("the update check stopped: {}", e))?,
+            _ = cx.cancelled() => return Err("context canceled".to_string()),
+        };
+        match out {
+            Ok(Some(update)) => Ok(Some(Release {
+                version: update.version.clone(),
+                url: update.download_url.to_string(),
+                update,
+            })),
+            // Younger or the same version, or the feed said "204 No Content".
+            Ok(None) => Ok(None),
+            // No release has published a feed yet: that is "nothing newer", not a
+            // failure to show the user.
+            Err(UpdaterError::ReleaseNotFound) => Ok(None),
+            Err(UpdaterError::Serialization(e)) => {
+                Err(format!("the update feed isn't valid JSON: {}", e))
             }
+            // The crate reads the body with reqwest's own JSON decoder, so a feed
+            // that isn't JSON arrives here rather than above.
+            Err(UpdaterError::Reqwest(e)) if e.is_decode() => {
+                Err(format!("the update feed isn't valid JSON: {}", e))
+            }
+            Err(UpdaterError::TargetNotFound(t)) => {
+                Err(format!("the update feed has no build for {}", t))
+            }
+            Err(e) => Err(e.to_string()),
         }
-        if parse_version(&rel.version).is_none() || rel.zip.is_empty() || rel.sha256.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(rel))
     }
 
     /// Downloads `rel`, checks it, and swaps it in for the app at `app`. The
@@ -94,7 +183,7 @@ impl Source {
         cx: &CancellationToken,
         rel: &Release,
         app: &Path,
-        progress: &(dyn Fn(f64) + Send + Sync),
+        progress: Progress,
     ) -> Result<String, String> {
         let app_dir = parent(app).ok_or_else(|| "not running from an app bundle".to_string())?;
         // Same volume, so the swap is two renames.
@@ -114,12 +203,11 @@ impl Source {
         rel: &Release,
         app: &Path,
         work: &Path,
-        progress: &(dyn Fn(f64) + Send + Sync),
+        progress: Progress,
     ) -> Result<(), String> {
-        let want = self.checksum(cx, rel).await?;
-        let zip_name = zip_name(rel);
-        let zip = work.join(&zip_name);
-        self.download(cx, &rel.zip, &zip, &want, progress).await?;
+        let bytes = download(cx, rel, progress).await?;
+        let zip = work.join(zip_name(rel));
+        std::fs::write(&zip, &bytes).map_err(|e| format!("saving the update: {}", e))?;
 
         let new = work.join("new");
         let out = std::process::Command::new("/usr/bin/ditto")
@@ -151,67 +239,81 @@ impl Source {
         }
         Ok(())
     }
+}
 
-    /// Reads the zip's SHA-256 from the release's SHA256SUMS.txt.
-    async fn checksum(&self, cx: &CancellationToken, rel: &Release) -> Result<String, String> {
-        // A caller may hand us the expected sum itself instead of the sums URL.
-        if is_sha256_hex(&rel.sha256) {
-            return Ok(rel.sha256.to_lowercase());
-        }
-        let resp = get(cx, &rel.sha256, &self.user_agent, None).await?;
-        let body = read_capped(resp, 1 << 20).await?;
-        let text = String::from_utf8_lossy(&body);
-        let name = zip_name(rel);
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some((sum, rest)) = line.split_once(' ') {
-                if rest.trim_start_matches([' ', '*']) == name && sum.len() == 64 {
-                    return Ok(sum.to_lowercase());
+/// Downloads `rel` and checks its signature. The bytes come back only if they
+/// are exactly what the feed's signature was made for; a tampered file, a
+/// signature from another key, or a signature that isn't one at all is refused
+/// here, before anything is unpacked.
+async fn download(
+    cx: &CancellationToken,
+    rel: &Release,
+    progress: Progress,
+) -> Result<Vec<u8>, String> {
+    if cx.is_cancelled() {
+        return Err("context canceled".to_string());
+    }
+    // The crate hands the update the timeout its check ran with (short, for a
+    // feed request); a release asset takes longer than that to arrive.
+    let mut update = rel.update.clone();
+    update.timeout = Some(DOWNLOAD_TIMEOUT);
+    let stop = cx.clone();
+    let work = tokio::task::spawn_blocking(move || {
+        // A blocking request can't be interrupted between chunks, so a cancelled
+        // context stops updating the bar and the bytes are thrown away below.
+        let canceled = Arc::new(AtomicBool::new(false));
+        let done = std::cell::Cell::new(0u64);
+        let bytes = update.download_extended(
+            |chunk, total| {
+                if canceled.load(Ordering::Relaxed) {
+                    return;
                 }
-            }
-        }
-        Err(format!("{} isn't listed in SHA256SUMS.txt", name))
+                if stop.is_cancelled() {
+                    canceled.store(true, Ordering::Relaxed);
+                    return;
+                }
+                done.set(done.get() + chunk as u64);
+                if let Some(total) = total.filter(|t| *t > 0) {
+                    progress(done.get() as f64 / total as f64);
+                }
+            },
+            || {},
+        );
+        (bytes, canceled.load(Ordering::Relaxed))
+    });
+    let (bytes, canceled) = work
+        .await
+        .map_err(|e| format!("the update download stopped: {}", e))?;
+    if canceled {
+        return Err("context canceled".to_string());
     }
+    let bytes = bytes.map_err(download_error)?;
+    if bytes.is_empty() {
+        return Err("the update file is empty".to_string());
+    }
+    Ok(bytes)
+}
 
-    async fn download(
-        &self,
-        cx: &CancellationToken,
-        url: &str,
-        dst: &Path,
-        want: &str,
-        progress: &(dyn Fn(f64) + Send + Sync),
-    ) -> Result<(), String> {
-        let mut resp = get(cx, url, &self.user_agent, None).await?;
-        let total = resp.content_length().unwrap_or(0);
-        let mut fh = std::fs::File::create(dst).map_err(|e| e.to_string())?;
-        let mut h = Sha256::new();
-        let mut done: i64 = 0;
-        loop {
-            let chunk = tokio::select! {
-                c = resp.chunk() => c,
-                _ = cx.cancelled() => return Err("context canceled".to_string()),
-            };
-            let Some(buf) = chunk.map_err(|e| format!("downloading the update: {}", e))? else {
-                break;
-            };
-            if buf.is_empty() {
-                continue;
-            }
-            fh.write_all(&buf).map_err(|e| e.to_string())?;
-            h.update(&buf);
-            done += buf.len() as i64;
-            if total > 0 {
-                progress(done as f64 / total as f64);
-            }
+/// The crate's download errors, said in this app's words. The two minisign
+/// refusals are the interesting ones: they mean the bytes on the wire are not
+/// the bytes the release signed.
+fn download_error(e: UpdaterError) -> String {
+    match e {
+        // The bytes don't match the signature, or the signature isn't this
+        // key's: either way nothing is unpacked.
+        UpdaterError::Minisign(m) => format!("the update isn't signed as published: {}", m),
+        UpdaterError::SignatureUtf8(_) | UpdaterError::Base64(_) => {
+            "the update's signature can't be read".to_string()
         }
-        let got = hex(&h.finalize());
-        if got != want {
-            return Err("the download doesn't match its checksum".to_string());
-        }
-        fh.flush().map_err(|e| e.to_string())?;
-        drop(fh);
-        Ok(())
+        UpdaterError::Network(m) => format!("downloading the update: {}", m),
+        other => format!("downloading the update: {}", other),
     }
+}
+
+/// The feed's `version` and this build's are compared as semver, so anything the
+/// crate can't read isn't a version at all.
+fn parse_semver(v: &str) -> Option<cargo_packager_updater::semver::Version> {
+    cargo_packager_updater::semver::Version::parse(v.trim_start_matches('v')).ok()
 }
 
 /// Whether `a` is a newer version than `b` ("1.0.10" > "1.0.9"). A leading "v"
@@ -356,7 +458,7 @@ fn check(fresh: &Path, version: &str, running: &Path) -> Result<(), String> {
     if !out.status.success() {
         let mut msg = String::from_utf8_lossy(&out.stdout).to_string();
         msg.push_str(&String::from_utf8_lossy(&out.stderr));
-        return Err(format!("the update's signature is invalid: {}", msg.trim()));
+        return Err(format!("the update isn't signed for macOS: {}", msg.trim()));
     }
     let plist = fresh.join("Contents").join("Info.plist");
     let id = plist_value(&plist, "CFBundleIdentifier");
@@ -413,64 +515,17 @@ fn parent(p: &Path) -> Option<PathBuf> {
     p.parent().filter(|d| !d.as_os_str().is_empty()).map(|d| d.to_path_buf())
 }
 
-/// The zip asset's file name, which SHA256SUMS.txt lists it under.
+/// The zip asset's file name: the last segment of the URL the feed gives, and
+/// only a fallback when that URL doesn't name one.
 fn zip_name(rel: &Release) -> String {
-    if let Some(last) = rel.zip.rsplit('/').next() {
-        if last.ends_with("-macOS.zip") {
+    if let Some(last) = rel.url.rsplit('/').next() {
+        if last.ends_with(".zip") {
             return last.to_string();
         }
     }
     format!("FioTransfer-{}-macOS.zip", rel.version)
 }
 
-fn is_sha256_hex(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{:02x}", x));
-    }
-    s
-}
-
-/// A GET the way the Go client made it: user agent always, no redirect tricks,
-/// and cancelled when `cx` is.
-async fn get(
-    cx: &CancellationToken,
-    url: &str,
-    user_agent: &str,
-    accept: Option<&str>,
-) -> Result<reqwest::Response, String> {
-    let client = crate::netx::api_client();
-    let mut req = client.get(url).header("User-Agent", user_agent);
-    if let Some(a) = accept {
-        req = req.header("Accept", a);
-    }
-    let resp = tokio::select! {
-        r = req.send() => r.map_err(|e| e.to_string())?,
-        _ = cx.cancelled() => return Err("context canceled".to_string()),
-    };
-    let status = resp.status().as_u16();
-    if status != 200 {
-        return Err(format!("GitHub answered HTTP {}", status));
-    }
-    Ok(resp)
-}
-
-/// Reads at most `cap` bytes of a response body.
-async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
-    let mut out: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        let room = cap.saturating_sub(out.len());
-        if room == 0 {
-            break;
-        }
-        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
-    }
-    Ok(out)
-}
 
 /// Go's os.MkdirTemp(dir, prefix): a fresh 0700 folder next to the app.
 fn mkdtemp(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
@@ -494,9 +549,13 @@ fn mkdtemp(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     Err(last)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
 
     // Go's TestNewer.
     #[test]
@@ -515,6 +574,37 @@ mod tests {
         ] {
             assert_eq!(newer(a, b), want, "newer({:?}, {:?})", a, b);
         }
+    }
+
+    // "Newer" is now the feed's semver against this build; the app's own helper
+    // must not disagree with it on anything semver can read.
+    #[test]
+    fn the_crate_and_this_module_agree_on_newer() {
+        let this = crate::VERSION;
+        let have = parse_semver(this).expect("this build's version is semver");
+        for feed in ["1.5.1", "1.6.0", "2.0.0", "1.5.0", "1.4.9", "0.0.1", "1.5.0-rc1"] {
+            let offer = parse_semver(feed).expect(feed);
+            assert_eq!(newer(feed, this), offer > have, "feed {} against {}", feed, this);
+        }
+        assert!(parse_semver("dev").is_none());
+    }
+
+    // The key in this file is what every installed copy verifies against; a
+    // truncated or re-wrapped one would refuse every release for ever.
+    #[test]
+    fn the_burnt_in_key_is_a_minisign_public_key() {
+        use base64::Engine as _;
+        let text = base64::engine::general_purpose::STANDARD
+            .decode(PUB_KEY.trim())
+            .expect("the published key is base64");
+        let text = String::from_utf8(text).expect("the published key is text");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("untrusted comment: minisign public key"), "{:?}", lines[0]);
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(lines[1])
+            .expect("the key line is base64");
+        assert_eq!(raw.len(), 42, "a minisign public key is 42 bytes");
+        assert!(ENDPOINT.ends_with("/releases/latest/download/latest.json"), "{}", ENDPOINT);
     }
 
     // Go's TestBundlePath.
@@ -545,5 +635,440 @@ mod tests {
         assert!(!released("dev"));
         assert!(!released(""));
         assert!(!released("1.x"));
+    }
+
+    // ---------- a feed on a socket, and nothing else ----------
+    //
+    // No case here ever asks GitHub anything: a stub on 127.0.0.1 answers one
+    // request per connection and closes.
+
+    struct Stub {
+        base: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl Stub {
+        /// Binds a port now, so the feed can name its own asset URL.
+        fn bind() -> (TcpListener, String) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a stub feed");
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            (listener, base)
+        }
+
+        /// Serves `routes` — `(path, body)` — until the test process ends;
+        /// anything else answers 404.
+        fn play(listener: TcpListener, routes: Vec<(String, Vec<u8>)>) -> Stub {
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    // Read the head one byte at a time: it ends at the blank line,
+                    // and the stub never waits for a body.
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(1) => head.push(byte[0]),
+                            _ => break,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    let path = head.split(' ').nth(1).unwrap_or("/").to_string();
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    let route = routes.iter().find(|(p, _)| *p == path).map(|(_, b)| b.clone());
+                    let (status, body) = match route {
+                        Some(b) => ("200 OK", b),
+                        None => ("404 Not Found", b"not found".to_vec()),
+                    };
+                    let mut out = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        body.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(&body);
+                    let _ = stream.write_all(&out);
+                    let _ = stream.flush();
+                }
+            });
+            Stub { base, hits }
+        }
+
+        fn serve(routes: Vec<(String, Vec<u8>)>) -> Stub {
+            let (listener, _) = Stub::bind();
+            Stub::play(listener, routes)
+        }
+
+        /// A source that asks this stub for its feed.
+        fn source(&self) -> Source {
+            Source::new("FioTransfer/test").with_endpoint(format!("{}/latest.json", self.base))
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The one-platform shape a release publishes: `url`, `signature` and
+    /// `format` at the top level.
+    fn feed_json(base: &str, version: &str, signature: &str) -> String {
+        serde_json::json!({
+            "version": version,
+            "pub_date": "2026-01-01T00:00:00Z",
+            "notes": "a test feed",
+            "url": format!("{}/download", base),
+            "signature": signature,
+            "format": "app",
+        })
+        .to_string()
+    }
+
+    /// A stub serving `feed` at /latest.json and `asset` at /download, and a
+    /// source pointed at it.
+    fn a_feed(version: &str, signature: &str, asset: Vec<u8>) -> (Source, Stub) {
+        let (listener, base) = Stub::bind();
+        let routes = vec![
+            ("/latest.json".to_string(), feed_json(&base, version, signature).into_bytes()),
+            ("/download".to_string(), asset),
+        ];
+        let stub = Stub::play(listener, routes);
+        (stub.source(), stub)
+    }
+
+    // ---------- the checks, without a signature ----------
+
+    #[tokio::test]
+    async fn a_newer_version_in_the_feed_is_reported() {
+        let (src, stub) = a_feed("9.9.9", "unused-by-a-check", b"not needed".to_vec());
+        let rel = src.latest(&CancellationToken::new()).await.expect("a check").expect("an update");
+        assert_eq!(rel.version, "9.9.9");
+        assert_eq!(rel.url, format!("{}/download", stub.base));
+    }
+
+    #[tokio::test]
+    async fn an_equal_or_older_version_is_not_reported() {
+        for version in [crate::VERSION, "1.4.9", "0.0.1"] {
+            let (src, _stub) = a_feed(version, "unused-by-a-check", b"not needed".to_vec());
+            let got = src.latest(&CancellationToken::new()).await.expect("a check");
+            assert!(got.is_none(), "the feed's {} came back as an update", version);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_refused() {
+        let stub = Stub::serve(vec![(
+            "/latest.json".to_string(),
+            br#"{"version": "9.9.9", "url": "#.to_vec(),
+        )]);
+        let err = stub.source().latest(&CancellationToken::new()).await.expect_err("a broken feed");
+        assert!(err.contains("isn't valid JSON"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_feed_without_a_signature_is_refused() {
+        let body = serde_json::json!({
+            "version": "9.9.9",
+            "url": "http://127.0.0.1:1/download",
+            "format": "app",
+        })
+        .to_string();
+        let stub = Stub::serve(vec![("/latest.json".to_string(), body.into_bytes())]);
+        let err = stub.source().latest(&CancellationToken::new()).await.expect_err("no signature");
+        assert!(err.contains("signature"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn the_public_key_is_required() {
+        let (src, stub) = a_feed("9.9.9", "unused-by-a-check", b"not needed".to_vec());
+        let err = src
+            .with_pub_key("")
+            .latest(&CancellationToken::new())
+            .await
+            .expect_err("a build with no key");
+        assert!(err.contains("signing key"), "{}", err);
+        assert_eq!(stub.hits(), 0, "a build with no key must not ask the feed anything");
+    }
+
+    #[tokio::test]
+    async fn a_missing_feed_reads_as_no_update() {
+        // Nothing published yet: 404, and the card says "up to date", not
+        // "couldn't check".
+        let stub = Stub::serve(vec![]);
+        let got = stub.source().latest(&CancellationToken::new()).await.expect("a check");
+        assert!(got.is_none());
+    }
+
+    // ---------- download and signature ----------
+
+    #[tokio::test]
+    async fn a_tampered_download_is_refused() {
+        let Some(signer) = Signer::ready() else { return };
+        let signed = b"the update this signature was made for".to_vec();
+        let served = b"a different file, but the same URL".to_vec();
+        let signature = signer.sign_bytes(&signed).expect("sign");
+        let (src, _stub) = a_feed("9.9.9", &signature, served);
+        let src = src.with_pub_key(signer.pub_key.clone());
+        let rel = src.latest(&CancellationToken::new()).await.expect("a check").expect("an update");
+        let err = download(&CancellationToken::new(), &rel, Arc::new(|_p| {}))
+            .await
+            .expect_err("a tampered download");
+        assert!(err.contains("isn't signed as published"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_signature_from_another_key_is_refused() {
+        let Some(signer) = Signer::ready() else { return };
+        let Some(other) = Signer::ready() else { return };
+        let asset = b"the update".to_vec();
+        let signature = other.sign_bytes(&asset).expect("sign");
+        let (src, _stub) = a_feed("9.9.9", &signature, asset);
+        let src = src.with_pub_key(signer.pub_key.clone());
+        let rel = src.latest(&CancellationToken::new()).await.expect("a check").expect("an update");
+        let err = download(&CancellationToken::new(), &rel, Arc::new(|_p| {}))
+            .await
+            .expect_err("a foreign signature");
+        assert!(err.contains("isn't signed as published"), "{}", err);
+        assert!(err.contains("different key"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_signature_that_is_not_one_is_refused() {
+        let (src, _stub) = a_feed("9.9.9", "%%%% not a signature %%%%", b"the update".to_vec());
+        let rel = src.latest(&CancellationToken::new()).await.expect("a check").expect("an update");
+        let err = download(&CancellationToken::new(), &rel, Arc::new(|_p| {}))
+            .await
+            .expect_err("garbage for a signature");
+        assert!(err.contains("signature can't be read") || err.contains("isn't a signature"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn a_signed_download_comes_back_whole() {
+        let Some(signer) = Signer::ready() else { return };
+        let asset: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let signature = signer.sign_bytes(&asset).expect("sign");
+        let (src, _stub) = a_feed("9.9.9", &signature, asset.clone());
+        let src = src.with_pub_key(signer.pub_key.clone());
+        let rel = src.latest(&CancellationToken::new()).await.expect("a check").expect("an update");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&seen);
+        let bytes = download(
+            &CancellationToken::new(),
+            &rel,
+            Arc::new(move |_p| {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .await
+        .expect("a signed download");
+        assert_eq!(bytes, asset);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_download_never_starts() {
+        let (src, _stub) = a_feed("9.9.9", "unused", b"the update".to_vec());
+        let rel = src
+            .latest(&CancellationToken::new())
+            .await
+            .expect("a check")
+            .expect("an update");
+        let cx = CancellationToken::new();
+        cx.cancel();
+        let err = download(&cx, &rel, Arc::new(|_p| {})).await.expect_err("a cancelled download");
+        assert_eq!(err, "context canceled");
+    }
+
+    // ---------- signing, with the real tool ----------
+    //
+    // `cargo packager signer` makes the key and signs the asset, exactly as the
+    // release workflow does. When it isn't on PATH these cases print why and
+    // pass: a test that needs a signature can't invent one.
+
+    struct Signer {
+        dir: tempfile::TempDir,
+        private: PathBuf,
+        /// The content of `key.pub`: what the feed's signature is checked
+        /// against.
+        pub_key: String,
+    }
+
+    impl Signer {
+        fn ready() -> Option<Signer> {
+            let help = std::process::Command::new("cargo")
+                .args(["packager", "signer", "--help"])
+                .output();
+            match help {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    println!("skipping: `cargo packager signer` is not on PATH, so no key can be made");
+                    return None;
+                }
+            }
+            let dir = tempfile::tempdir().expect("a temporary folder for the key");
+            let private = dir.path().join("key");
+            let out = std::process::Command::new("cargo")
+                .args(["packager", "signer", "generate", "-f", "--ci", "--path"])
+                .arg(&private)
+                .output()
+                .expect("run the signer");
+            if !out.status.success() {
+                println!(
+                    "skipping: `cargo packager signer generate` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return None;
+            }
+            let pub_key =
+                std::fs::read_to_string(dir.path().join("key.pub")).expect("the public key file");
+            Some(Signer { dir, private, pub_key: pub_key.trim().to_string() })
+        }
+
+        /// What the feed's `signature` field carries for `bytes`: the content of
+        /// the `.sig` file the tool writes beside the asset.
+        fn sign_bytes(&self, bytes: &[u8]) -> Option<String> {
+            let file = self.dir.path().join("asset.bin");
+            std::fs::write(&file, bytes).ok()?;
+            self.sign(&file)
+        }
+
+        fn sign(&self, file: &Path) -> Option<String> {
+            let out = std::process::Command::new("cargo")
+                .args(["packager", "signer", "sign", "-k"])
+                .arg(&self.private)
+                .arg(file)
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                println!(
+                    "skipping: `cargo packager signer sign` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return None;
+            }
+            let sig = std::fs::read_to_string(format!("{}.sig", file.display())).ok()?;
+            Some(sig.trim().to_string())
+        }
+    }
+
+    // ---------- the whole thing, over a real bundle ----------
+
+    /// A minimal .app with this app's bundle id, ad-hoc signed, so the checks
+    /// `install` makes on it (codesign, bundle id, version) can pass.
+    #[cfg(target_os = "macos")]
+    fn make_app(app: &Path, version: &str, marker: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let macos = app.join("Contents/MacOS");
+        let res = app.join("Contents/Resources");
+        std::fs::create_dir_all(&macos).expect("Contents/MacOS");
+        std::fs::create_dir_all(&res).expect("Contents/Resources");
+        std::fs::write(res.join("marker.txt"), marker).expect("the marker");
+        let exe = macos.join("FioTransfer");
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").expect("the executable");
+        let mut perms = std::fs::metadata(&exe).expect("the executable's mode").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&exe, perms).expect("chmod the executable");
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>{}</string>
+  <key>CFBundleExecutable</key><string>FioTransfer</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>{}</string>
+</dict>
+</plist>
+"#,
+                BUNDLE_ID, version
+            ),
+        )
+        .expect("the Info.plist");
+        let out = std::process::Command::new("/usr/bin/codesign")
+            .arg("--force")
+            .arg("--deep")
+            .arg("-s")
+            .arg("-")
+            .arg(app)
+            .output()
+            .expect("codesign the bundle");
+        assert!(
+            out.status.success(),
+            "codesign: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn zip_app(app: &Path, zip: &Path) {
+        let out = std::process::Command::new("/usr/bin/ditto")
+            .arg("-c")
+            .arg("-k")
+            .arg("--keepParent")
+            .arg(app)
+            .arg(zip)
+            .output()
+            .expect("zip the bundle");
+        assert!(out.status.success(), "ditto: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_signed_zip_replaces_the_app() {
+        let Some(signer) = Signer::ready() else { return };
+        let tmp = tempfile::tempdir().expect("a temporary folder");
+        let app = tmp.path().join("Applications/FioTransfer.app");
+        make_app(&app, crate::VERSION, "the copy that is running");
+        let fresh = tmp.path().join("release/FioTransfer.app");
+        make_app(&fresh, "9.9.9", "the released copy");
+        let zip = tmp.path().join("FioTransfer-9.9.9-macOS.zip");
+        zip_app(&fresh, &zip);
+        let signature = signer.sign(&zip).expect("sign the release");
+        let (src, _stub) = a_feed("9.9.9", &signature, std::fs::read(&zip).expect("the zip"));
+        let src = src.with_pub_key(signer.pub_key.clone());
+        let cx = CancellationToken::new();
+        let rel = src.latest(&cx).await.expect("a check").expect("an update");
+        let work = src.install(&cx, &rel, &app, Arc::new(|_p| {})).await.expect("install");
+
+        let marker = std::fs::read_to_string(app.join("Contents/Resources/marker.txt")).expect("the marker");
+        assert_eq!(marker, "the released copy", "the new bundle is in place");
+        let version = plist_value(&app.join("Contents/Info.plist"), "CFBundleShortVersionString");
+        assert_eq!(version, "9.9.9");
+        let work = Path::new(&work);
+        assert!(work.join("previous.app").is_dir(), "the old copy is kept until the app quits");
+        assert!(
+            std::fs::read_to_string(work.join("previous.app/Contents/Resources/marker.txt"))
+                .expect("the old marker")
+                == "the copy that is running"
+        );
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_bundle_of_another_version_is_refused_and_nothing_moves() {
+        let Some(signer) = Signer::ready() else { return };
+        let tmp = tempfile::tempdir().expect("a temporary folder");
+        let app = tmp.path().join("Applications/FioTransfer.app");
+        make_app(&app, crate::VERSION, "the copy that is running");
+        // The feed says 9.9.9; the bundle inside says 9.9.8.
+        let fresh = tmp.path().join("release/FioTransfer.app");
+        make_app(&fresh, "9.9.8", "the wrong copy");
+        let zip = tmp.path().join("FioTransfer-9.9.9-macOS.zip");
+        zip_app(&fresh, &zip);
+        let signature = signer.sign(&zip).expect("sign the release");
+        let (src, _stub) = a_feed("9.9.9", &signature, std::fs::read(&zip).expect("the zip"));
+        let src = src.with_pub_key(signer.pub_key.clone());
+        let cx = CancellationToken::new();
+        let rel = src.latest(&cx).await.expect("a check").expect("an update");
+        let err = src
+            .install(&cx, &rel, &app, Arc::new(|_p| {}))
+            .await
+            .expect_err("a bundle of another version");
+        assert!(err.contains("expected 9.9.9"), "{}", err);
+        let marker = std::fs::read_to_string(app.join("Contents/Resources/marker.txt")).expect("the marker");
+        assert_eq!(marker, "the copy that is running", "nothing was swapped in");
     }
 }

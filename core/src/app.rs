@@ -428,15 +428,17 @@ impl App {
         let cx = CancellationToken::new();
         let src = update::Source::new(&format!("FioTransfer/{}", crate::VERSION));
         let res = tokio::time::timeout(Duration::from_secs(30), src.latest(&cx)).await;
-        let (rel, err) = match res {
-            Ok(Ok(r)) => (r, false),
-            _ => (None, true),
+        // The card says one sentence either way; the reason goes to the log.
+        let (rel, err): (Option<update::Release>, Option<String>) = match res {
+            Ok(Ok(r)) => (r, None),
+            Ok(Err(e)) => (None, Some(e)),
+            Err(_) => (None, Some("the check took too long".to_string())),
         };
         let st = {
             let mut g = self.upd.lock().unwrap();
             g.st.state = "idle".into();
             g.st.checked_at = crate::xfer::now_ms();
-            if err {
+            if err.is_some() {
                 g.st.error = "Couldn't check for updates".into();
             }
             if let Some(r) = rel {
@@ -447,9 +449,9 @@ impl App {
             }
             g.st.clone()
         };
-        if err {
+        if let Some(why) = err {
             if let Some(h) = self.hist() {
-                h.log("UPDATE   check failed: could not reach GitHub");
+                h.log(&format!("UPDATE   check failed: {}", why));
             }
         }
         self.emit_update(true);
@@ -542,7 +544,7 @@ impl App {
                     me.emit_update(false);
                 })
             };
-            let old = match src.install(&cx, &rel, std::path::Path::new(&app), progress.as_ref()).await {
+            let old = match src.install(&cx, &rel, std::path::Path::new(&app), progress).await {
                 Ok(o) => o,
                 Err(e) => {
                     fail(format!("Update failed: {}", e));
