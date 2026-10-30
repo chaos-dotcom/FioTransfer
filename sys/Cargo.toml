@@ -1,0 +1,12 @@
+[package]
+name = "fiotransfer-sys"
+version = "0.1.0"
+edition = "2021"
+description = "The C boundary of FioTransfer: the AppKit shims in mac/ and the libc calls, behind safe functions"
+
+[lib]
+name = "fiotransfer_sys"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

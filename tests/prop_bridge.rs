@@ -183,6 +183,30 @@ fn args_strategy() -> impl Strategy<Value = Vec<Value>> {
 
 // ---------- the method table ----------
 
+
+/// Fields that lawfully differ between two identical calls: `checked_at` is a
+/// timestamp, stamped when a release check actually runs (with a released
+/// version it does). Everything else must match exactly.
+fn settled(v: serde_json::Value) -> serde_json::Value {
+    fn walk(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(t) = m.get_mut("checked_at") {
+                    *t = serde_json::Value::from(0);
+                }
+                for (_, x) in m.iter_mut() {
+                    walk(x);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let mut v = v;
+    walk(&mut v);
+    v
+}
+
 #[test]
 fn every_appjs_call_has_a_dispatch_arm() {
     let js = appjs_methods();
@@ -261,7 +285,7 @@ proptest! {
         padded.extend(std::iter::repeat(Value::Null).take(pad));
         let a = call(&rt, &sandbox.app(), method, args.clone());
         let b = call(&rt, &sandbox.app(), method, padded.clone());
-        prop_assert_eq!(a, b, "{} answered differently for {:?} and {:?}", method, args, padded);
+        prop_assert_eq!(a.map(settled), b.map(settled), "{} answered differently for {:?} and {:?}", method, args, padded);
     }
 
 }
@@ -277,7 +301,7 @@ fn nulls_in_every_position_decode_like_missing_ones() {
         for k in 0..=6usize {
             let empty = call(&rt, &sandbox.app(), method, vec![]);
             let filled = call(&rt, &sandbox.app(), method, vec![Value::Null; k]);
-            assert_eq!(empty, filled, "{} answered differently for no args and {} nulls", method, k);
+            assert_eq!(empty.map(settled), filled.map(settled), "{} answered differently for no args and {} nulls", method, k);
         }
     }
 }
