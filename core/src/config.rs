@@ -65,6 +65,11 @@ pub struct Settings {
     /// Seconds between Portal reconciles.
     #[serde(default = "default_portal_every")]
     pub portal_every_secs: i64,
+    /// The admin email the last Portal sign-in used. A setting, not a secret:
+    /// it is what the sign-in field is prefilled with next time. The password
+    /// is never a setting, and the session cookie goes to the Keychain.
+    #[serde(default)]
+    pub portal_email: String,
 }
 
 /// Default for `Settings::portal_root`: ~/Live_Work.
@@ -96,6 +101,7 @@ impl Default for Settings {
             portal_enabled: false,
             portal_on_change: PORTAL_ON_CHANGE.to_string(),
             portal_every_secs: PORTAL_EVERY_SECS,
+            portal_email: String::new(),
         }
     }
 }
@@ -167,6 +173,9 @@ impl Settings {
         if self.portal_every_secs > 86_400 {
             self.portal_every_secs = 86_400;
         }
+        // An email address is not a secret, but a password is never written
+        // here at all: this field is trimmed and nothing else.
+        self.portal_email = self.portal_email.trim().to_string();
     }
 }
 

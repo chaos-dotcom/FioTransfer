@@ -74,8 +74,13 @@ pub struct Report {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PortalStatus {
     pub enabled: bool,
-    /// A bearer token is stored (the token itself is never returned).
+    /// A credential is stored — a bearer token or a signed-in session. The
+    /// credential itself is never returned.
     pub signed_in: bool,
+    /// The admin the stored session belongs to, when one is stored. Empty for a
+    /// token, which names no account: Portal's token path picks the only active
+    /// admin there is.
+    pub email: String,
     pub url: String,
     pub root: String,
     pub running: bool,

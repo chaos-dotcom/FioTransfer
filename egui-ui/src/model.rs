@@ -147,6 +147,14 @@ pub enum Request {
     SetPortalToken(Secret),
     /// Forget the stored bearer token.
     ForgetPortalToken,
+    /// Sign in to Portal itself with the admin's email and password
+    /// (`App::portal_sign_in`). The password is a [`Secret`], so no `{:?}` of
+    /// this enum can print it, and it is never a setting: the app posts it,
+    /// keeps the cookie Portal answers with and hands the new status back.
+    SignInPortal { email: String, password: Secret },
+    /// Forget the stored session cookie (`App::portal_sign_out`). A bearer
+    /// token is a different credential under a different key, and stays.
+    SignOutPortal,
     /// Turn Portal's background poller on or off (`Settings::portal_enabled`).
     SetPortalEnabled(bool),
     /// Reconcile the watch folders with Portal now (`App::portal_reconcile`).
@@ -293,8 +301,10 @@ impl UpdateState {
 
 /// What the Settings screen's Portal section knows: the last status the app
 /// gave (`App::portal_status`), the fields the user is typing in, and the reason
-/// a commit was refused. The bearer token is not here either — only a draft the
-/// field masks, and a [`Secret`] on its way to the keychain.
+/// a commit was refused. Neither secret is here: the access token is only a
+/// draft the field masks plus a [`Secret`] on its way to the keychain, and the
+/// sign-in password is only a masked draft the shell empties, plus the [`Secret`]
+/// one request carries.
 #[derive(Debug, Clone, Default)]
 pub struct PortalUi {
     pub status: PortalView,
@@ -311,13 +321,28 @@ pub struct PortalUi {
     /// Why the last commit of the URL / the folder was refused.
     pub url_error: Option<String>,
     pub root_error: Option<String>,
+    /// The admin email being typed into "Sign in instead". Empty means "show
+    /// `settings.portal_email`", which is the address the last sign-in used.
+    /// An email is not a secret, so this one is a plain draft and may stay
+    /// after a failure.
+    pub email_draft: String,
+    /// The password being typed. Cleared by the shell the moment the sign-in
+    /// answers, whichever way it went: nothing here keeps a password, not even
+    /// a refused one.
+    pub password_draft: String,
+    /// Why Portal refused the last sign-in, in the app's own words.
+    pub signin_error: Option<String>,
+    /// A sign-in is in flight: the button waits rather than posting twice.
+    pub signing_in: bool,
 }
 
-/// A bearer token on its way from the Settings field to the keychain.
+/// A secret on its way out of a Settings field: the Portal bearer token (to the
+/// keychain) or the password of a Portal sign-in (to `App::portal_sign_in` and
+/// nowhere else).
 ///
-/// `Debug` prints nothing of it: a token must not be logged, and a request enum
+/// `Debug` prints nothing of it: a secret must not be logged, and a request enum
 /// that holds one would otherwise print it the first time somebody wrote
-/// `{:?}` on a `Request`. The one place it is read is the shell's store call.
+/// `{:?}` on a `Request`. The one place it is read is the shell's call.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
@@ -326,7 +351,7 @@ impl Secret {
         Secret(secret.into())
     }
 
-    /// The token itself.
+    /// The secret itself.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -354,8 +379,12 @@ impl std::fmt::Debug for Secret {
 pub struct PortalView {
     /// The background poller is on (`Settings::portal_enabled`).
     pub enabled: bool,
-    /// A bearer token is stored. The token itself is never part of a status.
+    /// A credential is stored — a bearer token or a signed-in session. The
+    /// credential itself is never part of a status.
     pub signed_in: bool,
+    /// The admin the stored session belongs to. Empty for a bearer token, which
+    /// names no account, and empty when nobody is signed in.
+    pub email: String,
     pub url: String,
     /// The local root, resolved to an absolute path.
     pub root: String,
@@ -376,7 +405,8 @@ pub struct PortalView {
 }
 
 impl PortalView {
-    /// A URL and a token are both set: the state the reconcile button needs.
+    /// A URL and a credential are both set: the state the reconcile button needs.
+    /// A session counts as much as a bearer token.
     pub fn configured(&self) -> bool {
         !self.url.trim().is_empty() && self.signed_in
     }
@@ -387,6 +417,7 @@ impl PortalView {
         PortalView {
             enabled: st.enabled,
             signed_in: st.signed_in,
+            email: st.email.clone(),
             url: st.url.clone(),
             root: st.root.clone(),
             running: st.running,

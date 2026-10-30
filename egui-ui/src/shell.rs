@@ -41,6 +41,7 @@ use fiotransfer_core::app::{App, State, UpdateStatus};
 use fiotransfer_core::history;
 use fiotransfer_core::history::watch::{DIR_UPLOAD, ON_CHANGE_OVERWRITE};
 use fiotransfer_core::host::Host;
+use fiotransfer_core::portal::agent::PortalStatus;
 use fiotransfer_core::xfer::{DownloadOptions, LinkInfo};
 
 use crate::model::{
@@ -103,6 +104,9 @@ pub enum Done {
     /// A folder chosen to watch, remembered for the `AddWatch` that follows;
     /// `None` forgets the one that was remembered.
     WatchFolder(Option<String>),
+    /// `App::portal_sign_in`'s answer: the new status, or the sentence to show
+    /// under the field. The password is not part of either.
+    SignedIn(Result<Box<PortalStatus>, String>),
     /// The clipboard's text, for the composer's link field (`Paste`).
     Clipboard(String),
 }
@@ -463,6 +467,26 @@ impl Shell {
                 }
             }
             Request::ForgetPortalToken => self.forget_portal_token(ui),
+            Request::SignInPortal { email, password } => {
+                // The address signed in to is the one on screen: a URL typed in
+                // this same frame is saved first, as Reconcile does, so a
+                // sign-in can never be aimed at the Portal that was there
+                // before. The password is this call's argument and nothing
+                // else: it is not stored, not logged, and the draft is emptied
+                // when the answer lands. `signing_in` disables the button
+                // meanwhile.
+                if !self.portal_write(ui, "") {
+                    return;
+                }
+                ui.portal.signing_in = true;
+                ui.portal.signin_error = None;
+                let (app, tx) = (self.app.clone(), self.tx.clone());
+                self.spawn_task(async move {
+                    let answer = app.portal_sign_in(&email, password.expose()).await.map(Box::new);
+                    let _ = tx.send(Update::Done(Done::SignedIn(answer)));
+                });
+            }
+            Request::SignOutPortal => self.sign_out_portal(ui),
             Request::PortalReconcile => {
                 // Whatever the screen holds is what Portal is asked with: a URL
                 // typed in this same frame is saved before the call, not lost to
@@ -676,6 +700,28 @@ impl Shell {
             Done::DownloadDir(None) => {}
             Done::WatchFolder(Some(dir)) => self.watch_folder = Some(dir),
             Done::WatchFolder(None) => self.watch_folder = None,
+            Done::SignedIn(result) => {
+                ui.portal.signing_in = false;
+                // The password goes either way: a refused one is not worth
+                // keeping, and there is nothing left to press with it.
+                ui.portal.password_draft.clear();
+                match result {
+                    Ok(status) => {
+                        ui.portal.signin_error = None;
+                        ui.portal.email_draft = status.email.clone();
+                        ui.portal.status = PortalView::from_core(&status);
+                        ui.portal.status.now_ms = now_ms();
+                        // `portal_email` was saved by the sign-in, and so was
+                        // "a credential is stored": read both back from the app.
+                        self.read_state(ui);
+                    }
+                    Err(err) => {
+                        // The email stays, so the sentence under the field can
+                        // be read next to the address it is about.
+                        ui.portal.signin_error = Some(err);
+                    }
+                }
+            }
             Done::Clipboard(text) => {
                 if text.is_empty() {
                     return;
@@ -904,6 +950,18 @@ impl Shell {
     fn forget_portal_token(&mut self, ui: &mut UiState) {
         self.app.forget_portal_token();
         ui.portal.token_draft.clear();
+        self.read_state(ui);
+    }
+
+    /// "Sign out": the session cookie goes, and with it the admin the status
+    /// named. The fields go back to the last email used, with no password in
+    /// them; a stored bearer token is a different credential and stays.
+    fn sign_out_portal(&mut self, ui: &mut UiState) {
+        self.app.portal_sign_out();
+        ui.portal.email_draft.clear();
+        ui.portal.password_draft.clear();
+        ui.portal.signin_error = None;
+        ui.portal.signing_in = false;
         self.read_state(ui);
     }
 

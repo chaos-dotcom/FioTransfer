@@ -111,10 +111,13 @@ pub struct App {
     /// The last Portal reconcile, for the status line.
     portal_last: Mutex<Option<portal::agent::Report>>,
     portal_running: AtomicBool,
-    /// Whether a Portal token is stored. Cached because the status line is
+    /// Whether a Portal credential is stored. Cached because the status line is
     /// drawn every frame and reading the Keychain is neither free nor silent.
-    /// It is refreshed when a token is stored and at every reconcile.
+    /// It is refreshed when a credential is stored and at every reconcile.
     portal_signed_in: AtomicBool,
+    /// The signed-in admin's email, cached with the flag above for the same
+    /// reason: the row that shows "Signed in as …" is drawn every frame.
+    portal_email: Mutex<String>,
     upd: Mutex<UpdaterState>,
     updating: AtomicBool,
 }
@@ -167,6 +170,7 @@ impl App {
             portal_last: Mutex::new(None),
             portal_running: AtomicBool::new(false),
             portal_signed_in: AtomicBool::new(false),
+            portal_email: Mutex::new(String::new()),
             upd: Mutex::new(UpdaterState {
                 st: UpdateStatus { current: crate::VERSION.to_string(), state: "idle".into(), ..Default::default() },
                 rel: None,
@@ -293,7 +297,7 @@ impl App {
         self.init_updates();
         self.start_services();
         // Portal's poller: idle until Portal is switched on in the settings.
-        self.portal_signed_in.store(portal::signed_in(), Ordering::Relaxed);
+        self.refresh_portal_credential();
         portal::agent::spawn(Arc::clone(self));
     }
 
@@ -641,6 +645,7 @@ impl App {
             cur.portal_enabled = s.portal_enabled;
             cur.portal_on_change = s.portal_on_change.clone();
             cur.portal_every_secs = s.portal_every_secs;
+            cur.portal_email = s.portal_email.trim().to_string();
         })
         .map_err(|e| e.to_string())?;
         *self.settings.lock().unwrap() = saved.clone();
@@ -1112,14 +1117,27 @@ impl App {
 
     // ---------- Portal ----------
 
-    /// Whether Portal is on, whether a token is stored, and how the last
-    /// reconcile went. No network: the numbers are the last run's.
+    /// Re-reads the stored credential: the `signed_in` flag and the admin email
+    /// the status line shows. The Keychain is read here and nowhere a frame is
+    /// drawn — at start, when a credential is stored or forgotten, and at every
+    /// reconcile.
+    fn refresh_portal_credential(&self) {
+        let session = portal::session();
+        self.portal_signed_in
+            .store(portal::token().is_some() || session.is_some(), Ordering::Relaxed);
+        *self.portal_email.lock().unwrap() = session.map(|s| s.email).unwrap_or_default();
+    }
+
+    /// Whether Portal is on, which credential is stored, and how the last
+    /// reconcile went. No network and no Keychain read: the numbers are the last
+    /// run's, and the credential is the cached one.
     pub fn portal_status(&self) -> portal::agent::PortalStatus {
         let s = self.settings();
         let last = self.portal_last.lock().unwrap().clone().unwrap_or_default();
         portal::agent::PortalStatus {
             enabled: s.portal_enabled,
             signed_in: self.portal_signed_in.load(Ordering::Relaxed),
+            email: self.portal_email.lock().unwrap().clone(),
             url: s.portal_url.clone(),
             root: s.portal_root_path().to_string_lossy().into_owned(),
             running: self.portal_running.load(Ordering::Relaxed),
@@ -1143,7 +1161,7 @@ impl App {
             };
         }
         let rep = portal::agent::reconcile(self).await;
-        self.portal_signed_in.store(portal::signed_in(), Ordering::Relaxed);
+        self.refresh_portal_credential();
         *self.portal_last.lock().unwrap() = Some(rep.clone());
         self.portal_running.store(false, Ordering::SeqCst);
         self.emit("portal", serde_json::to_value(&rep).unwrap_or(Value::Null));
@@ -1165,7 +1183,7 @@ impl App {
         let tok = token.trim();
         if !tok.is_empty() {
             portal::set_token(tok)?;
-            self.portal_signed_in.store(true, Ordering::Relaxed);
+            self.refresh_portal_credential();
         }
         let root = root.trim().to_string();
         let saved = config::update(|s| {
@@ -1185,7 +1203,56 @@ impl App {
     /// after the next reconcile.
     pub fn forget_portal_token(&self) -> portal::agent::PortalStatus {
         portal::clear_token();
-        self.portal_signed_in.store(portal::signed_in(), Ordering::Relaxed);
+        self.refresh_portal_credential();
+        self.portal_status()
+    }
+
+    /// Signs in to Portal with its own login (`POST /api/auth/login`), and keeps
+    /// the session cookie Portal answers with — never the password, which is not
+    /// written anywhere: it is this call's argument and nothing else.
+    ///
+    /// `portal_email` is saved so the field is prefilled next time; the admin's
+    /// name is taken from `GET /api/auth/me` in preference to what was typed, so
+    /// "Signed in as …" is Portal's own answer.
+    pub async fn portal_sign_in(self: &Arc<Self>, email: &str, password: &str) -> Result<portal::agent::PortalStatus, String> {
+        let s = self.settings();
+        let url = s.portal_url.trim().to_string();
+        if url.is_empty() {
+            return Err("add the Portal address first".to_string());
+        }
+        let email = email.trim().to_string();
+        if email.is_empty() {
+            return Err("enter the admin email address".to_string());
+        }
+        if password.is_empty() {
+            return Err("enter the password".to_string());
+        }
+        let client = portal::PortalClient::login(&url, &email, password).await.map_err(|e| e.to_string())?;
+        // Portal's own name for the account; the typed address is an acceptable
+        // fallback when the read fails, and nothing is stored unless a cookie
+        // came back.
+        let email = match client.me().await {
+            Ok(who) => who.email,
+            Err(_) => email,
+        };
+        let session = client.session().ok_or_else(|| "the sign-in produced no session".to_string())?.named(&email);
+        portal::save_session(&session)?;
+        // Only the email changes. The file is not adopted wholesale: a
+        // settings.json this app has not written holds defaults, and adopting it
+        // would lose the address the user just signed in to.
+        let saved = config::update(|st| st.portal_email = email.clone()).map_err(|e| e.to_string())?;
+        self.settings.lock().unwrap().portal_email = saved.portal_email;
+        self.refresh_portal_credential();
+        self.emit("portal", serde_json::to_value(self.portal_status()).unwrap_or(Value::Null));
+        Ok(self.portal_status())
+    }
+
+    /// Forgets the stored session (the cookie jar), and the cached "signed in"
+    /// flag with it. A stored bearer token is a different credential under a
+    /// different key, and stays.
+    pub fn portal_sign_out(&self) -> portal::agent::PortalStatus {
+        portal::clear_session();
+        self.refresh_portal_credential();
         self.portal_status()
     }
 
