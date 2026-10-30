@@ -340,6 +340,11 @@ select { width: auto; min-width: 120px; padding-right: 8px; }
 .space-total { color: var(--text-2); font-size: 12.5px; font-variant-numeric: tabular-nums; align-self: center; }
 .space-status { display: flex; align-items: center; gap: 10px; min-height: 24px; margin-top: 2px; color: var(--text-body); font-size: 12.5px; }
 .space-status .dim { color: var(--text-3); }
+/* The headline: how much of each account's limit is used, and what that leaves.
+   One line per account, bytes only — Frame.io's storage_limit and
+   storage_usage, said in words when there is no limit. */
+.space-quota { margin-top: 2px; color: var(--text-2); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.space-quota-line { line-height: 1.55; }
 .space-body { display: grid; grid-template-columns: 288px minmax(0, 1fr); gap: 20px; align-items: start; margin-top: 8px; }
 .space-chart {
   position: sticky; top: 72px; /* the page head is 64 px and the cards start at 72 */

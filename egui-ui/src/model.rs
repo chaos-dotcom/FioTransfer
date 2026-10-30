@@ -135,8 +135,11 @@ pub struct UiState {
     pub snapshot: Snapshot,
     pub history: Vec<HistoryRow>,
     pub watches: Vec<WatchRow>,
-    /// What the last Frame.io storage walk found, one row per project.
+    /// What the last Frame.io storage reading found, one row per project.
     pub space: Vec<SpaceRow>,
+    /// One row per account: how much it uses against its limit, for the Space
+    /// screen's headline. Empty until `Space` has answered.
+    pub space_accounts: Vec<SpaceAccount>,
     /// True while `RefreshSpace` is walking: the Space screen says so instead of
     /// pretending the figures are current.
     pub space_walking: bool,
@@ -217,8 +220,10 @@ pub struct UpdateState {
 ///
 /// The field names are the payload's, minus `root_folder_id` and
 /// `workspace_id`: the screen never names a folder, only the project it would
-/// delete. `bytes` and `files` are what the last walk added up; `error` is set
-/// when that walk could not finish (permissions, a folder deleted mid-walk).
+/// delete. `bytes` is what Frame.io reported for the project, or what the walk
+/// added up when it reported nothing; `walked` says which, and `files` is only
+/// counted by a walk (0 means "not counted", drawn as a dash). `error` is set
+/// when a walk could not finish (permissions, a folder deleted mid-walk).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct SpaceRow {
     #[serde(default)] pub account_id: String,
@@ -228,7 +233,28 @@ pub struct SpaceRow {
     #[serde(default)] pub name: String,
     #[serde(default)] pub bytes: i64,
     #[serde(default)] pub files: i64,
+    /// True when `bytes` came from walking the project's folders, false when
+    /// Frame.io reported it. The row says which.
+    #[serde(default)] pub walked: bool,
     #[serde(default)] pub error: String,
+}
+
+/// One account's storage, as `Account.storage_limit` and `Account.storage_usage`
+/// report it. `limit: None` is Frame.io's `null`, which means "no limit".
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct SpaceAccount {
+    #[serde(default)] pub account_id: String,
+    #[serde(default)] pub name: String,
+    #[serde(default)] pub limit: Option<i64>,
+    #[serde(default)] pub used: Option<i64>,
+}
+
+/// The `Space` payload: the project rows to chart and the per-account headline
+/// above them. `App::Space` answers this object, not a bare list of projects.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct SpacePayload {
+    #[serde(default)] pub projects: Vec<SpaceRow>,
+    #[serde(default)] pub accounts: Vec<SpaceAccount>,
 }
 
 impl SpaceRow {
@@ -272,6 +298,14 @@ pub struct Toast {
 }
 
 impl UiState {
+    /// Take a `Space` payload: the rows the chart draws and the accounts the
+    /// headline names. Both lists are replaced together, so a refresh that
+    /// finds no projects does not leave last week's accounts on screen.
+    pub fn apply_space(&mut self, payload: SpacePayload) {
+        self.space = payload.projects;
+        self.space_accounts = payload.accounts;
+    }
+
     pub fn active_jobs(&self) -> usize {
         self.snapshot.jobs.iter().filter(|j| !j.terminal()).count()
     }
@@ -374,5 +408,45 @@ mod tests {
             ..row
         };
         assert!(failed.incomplete());
+    }
+
+    /// The `Space` payload is `{ projects, accounts }`, and the account figures
+    /// are nullable: `storage_limit: null` is "no limit", not a limit of 0.
+    #[test]
+    fn the_space_payload_parses_projects_and_accounts() {
+        let json = r#"{
+            "projects":[
+                {"account_id":"acct-1","project_id":"proj-1","name":"Nightfall",
+                 "bytes":750,"files":3,"walked":false,"error":""}
+            ],
+            "accounts":[
+                {"account_id":"acct-1","name":"Farbhaus","limit":2000,"used":750},
+                {"account_id":"acct-2","name":"Archive","limit":null,"used":640},
+                {"account_id":"acct-3","name":"Quiet","limit":500,"used":null}
+            ]
+        }"#;
+        let payload: SpacePayload = serde_json::from_str(json).expect("space payload parses");
+        assert_eq!(payload.projects.len(), 1);
+        assert_eq!(payload.projects[0].name, "Nightfall");
+        assert!(!payload.projects[0].walked, "a reported size was not walked");
+        assert_eq!(payload.accounts.len(), 3);
+        assert_eq!(payload.accounts[0].limit, Some(2000));
+        assert_eq!(payload.accounts[1].limit, None, "null is no limit");
+        assert_eq!(payload.accounts[1].used, Some(640));
+        assert_eq!(payload.accounts[2].used, None, "a null usage is not reported");
+
+        let mut state = UiState::default();
+        state.apply_space(payload.clone());
+        assert_eq!(state.space.len(), 1);
+        assert_eq!(state.space_accounts.len(), 3);
+
+        // A bare list is not this payload. serde reads a sequence into a struct
+        // as positional fields, so an empty one is the empty payload rather than
+        // an error — no rows, no accounts, nothing drawn.
+        let bare: SpacePayload = serde_json::from_str("[]").expect("an empty sequence parses");
+        assert!(bare.projects.is_empty() && bare.accounts.is_empty());
+        // Both lists may be absent, and then both are empty.
+        let empty: SpacePayload = serde_json::from_str("{}").expect("an empty payload parses");
+        assert!(empty.projects.is_empty() && empty.accounts.is_empty());
     }
 }

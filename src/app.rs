@@ -99,9 +99,9 @@ pub struct App {
     open_at_login: AtomicBool,
     started: Mutex<Option<Instant>>,
 
-    /// Last Frame.io storage walk, so the Space view can be opened without
-    /// re-walking every project.
-    space: Mutex<Option<(Instant, Vec<SpaceProject>)>>,
+    /// Last Frame.io storage reading, so the Space view can be opened without
+    /// asking Frame.io again.
+    space: Mutex<Option<(Instant, SpacePayload)>>,
     space_walking: AtomicBool,
     upd: Mutex<UpdaterState>,
     updating: AtomicBool,
@@ -1214,15 +1214,46 @@ pub struct SpaceProject {
     pub name: String,
     pub root_folder_id: String,
     pub bytes: i64,
+    /// Files the walk counted. 0 means "not counted", which is what a row whose
+    /// size Frame.io reported says, so the row shows a dash instead of a zero.
     pub files: i64,
-    /// Set when the walk could not finish (permissions, a deleted folder).
+    /// True when the figures came from walking the project's folders, false
+    /// when Frame.io reported the size (`Project.storage`) and nothing was
+    /// walked. The row says which: a walked figure and a reported one are not
+    /// the same measurement, and only a walk counts files. A walk that fails
+    /// part way is still `true`, with `error` saying why it is not whole.
+    pub walked: bool,
+    /// Set when the walk could not finish (permissions, a deleted folder). An
+    /// errored row has no figure at all, whatever `walked` says.
     pub error: String,
 }
 
+/// One account's storage against its limit, straight from `Account`.
+///
+/// `limit` is `None` when Frame.io sends `storage_limit: null`, which means "no
+/// limit" — the view prints that rather than a limit of zero. `used` is `None`
+/// when the account reports no `storage_usage`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SpaceAccount {
+    pub account_id: String,
+    pub name: String,
+    pub limit: Option<i64>,
+    pub used: Option<i64>,
+}
+
+/// The Space payload: the rows to chart, and the per-account headline over
+/// them. A struct rather than a bare list of projects, because "how much is
+/// left" belongs to the account, not to any one project.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SpacePayload {
+    pub projects: Vec<SpaceProject>,
+    pub accounts: Vec<SpaceAccount>,
+}
+
 impl App {
-    /// The last walk, if there is one. Cheap: the Space view calls this on every
-    /// frame.
-    pub fn space(&self) -> Vec<SpaceProject> {
+    /// The last reading, if there is one. Cheap: the Space view calls this on
+    /// every frame.
+    pub fn space(&self) -> SpacePayload {
         self.space.lock().unwrap().as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
     }
 
@@ -1230,14 +1261,20 @@ impl App {
         self.space_walking.load(Ordering::Relaxed)
     }
 
-    /// Walks every account, workspace and project and adds up what each project
-    /// holds. Reads only: nothing here deletes or downloads anything.
+    /// Reads what Frame.io says each account and each project holds, and walks
+    /// a project's folders only when Frame.io does not report its size. Reads
+    /// only: nothing here deletes or downloads anything.
+    ///
+    /// The project list is one request per workspace and `Project.storage`
+    /// comes with it, so a refresh that never falls back costs one request per
+    /// account and per workspace rather than one per folder.
     pub async fn refresh_space(self: &Arc<Self>) {
         if self.space_walking.swap(true, Ordering::SeqCst) {
-            return; // a walk is already running
+            return; // a refresh is already running
         }
         let cx = self.api_cx();
         let mut out: Vec<SpaceProject> = Vec::new();
+        let mut quotas: Vec<SpaceAccount> = Vec::new();
         let accounts = match self.api.accounts(&cx).await {
             Ok(a) => a,
             Err(e) => {
@@ -1247,6 +1284,12 @@ impl App {
             }
         };
         for acct in accounts {
+            quotas.push(SpaceAccount {
+                account_id: acct.id.clone(),
+                name: acct.display_name.clone(),
+                limit: acct.storage_limit,
+                used: acct.storage_usage,
+            });
             let workspaces = self.api.workspaces(&cx, &acct.id).await.unwrap_or_default();
             for ws in workspaces {
                 let projects = self.api.projects(&cx, &acct.id, &ws.id).await.unwrap_or_default();
@@ -1261,19 +1304,28 @@ impl App {
                         root_folder_id: p.root_folder_id.clone(),
                         ..Default::default()
                     };
-                    match self.walk_folder(&cx, &acct.id, &p.root_folder_id, 0).await {
-                        Ok((bytes, files)) => {
-                            row.bytes = bytes;
-                            row.files = files;
+                    match p.storage {
+                        // Frame.io reported it: take the number, and leave
+                        // `files` at 0 ("not counted") rather than walk.
+                        Some(bytes) => row.bytes = bytes,
+                        // No figure from Frame.io: the walk is the fallback.
+                        None => {
+                            row.walked = true;
+                            match self.walk_folder(&cx, &acct.id, &p.root_folder_id, 0).await {
+                                Ok((bytes, files)) => {
+                                    row.bytes = bytes;
+                                    row.files = files;
+                                }
+                                Err(e) => row.error = e,
+                            }
                         }
-                        Err(e) => row.error = e,
                     }
                     out.push(row);
                 }
             }
         }
         out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-        *self.space.lock().unwrap() = Some((Instant::now(), out));
+        *self.space.lock().unwrap() = Some((Instant::now(), SpacePayload { projects: out, accounts: quotas }));
         self.space_walking.store(false, Ordering::SeqCst);
         self.state_changed();
     }
@@ -1318,8 +1370,8 @@ impl App {
         if let Some(h) = self.hist() {
             h.log(&format!("SPACE    deleted project {} on Frame.io (nothing local was touched)", project));
         }
-        if let Some((_, list)) = self.space.lock().unwrap().as_mut() {
-            list.retain(|p| p.project_id != project);
+        if let Some((_, payload)) = self.space.lock().unwrap().as_mut() {
+            payload.projects.retain(|p| p.project_id != project);
         }
         self.state_changed();
         Ok(())
@@ -1638,5 +1690,95 @@ impl crate::quick::QuickHost for App {
 
     fn start(self: Arc<Self>, link: String, pass: String, dir: String, subfolder: bool) {
         self.quick_start(&link, &pass, &dir, subfolder);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload() -> SpacePayload {
+        SpacePayload {
+            projects: vec![
+                // A row Frame.io sized, and a row the walk sized.
+                SpaceProject {
+                    project_id: "proj-reported".into(),
+                    name: "Nightfall".into(),
+                    bytes: 6_200_000_000,
+                    files: 0,
+                    walked: false,
+                    ..Default::default()
+                },
+                SpaceProject {
+                    project_id: "proj-walked".into(),
+                    name: "Archive 2024".into(),
+                    bytes: 2_100_000_000,
+                    files: 212,
+                    walked: true,
+                    ..Default::default()
+                },
+            ],
+            accounts: vec![
+                SpaceAccount {
+                    account_id: "acct-limited".into(),
+                    name: "Farbhaus".into(),
+                    limit: Some(2_000_000_000_000),
+                    used: Some(12_400_000_000),
+                },
+                // `storage_limit: null`: an account with no limit.
+                SpaceAccount {
+                    account_id: "acct-unlimited".into(),
+                    name: "Marketing".into(),
+                    limit: None,
+                    used: Some(1_050_000_000),
+                },
+            ],
+        }
+    }
+
+    /// The payload the two front ends read: a project list and an account list,
+    /// with the account's limit and usage as numbers or as null.
+    #[test]
+    fn the_space_payload_is_projects_and_accounts() {
+        let v = serde_json::to_value(payload()).expect("payload serialises");
+        let projects = v.get("projects").and_then(|p| p.as_array()).expect("projects is a list");
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0]["project_id"], "proj-reported");
+        assert_eq!(projects[0]["bytes"], 6_200_000_000_i64);
+        assert_eq!(projects[0]["walked"], false);
+        assert_eq!(projects[1]["walked"], true);
+        assert_eq!(projects[1]["files"], 212);
+
+        let accounts = v.get("accounts").and_then(|a| a.as_array()).expect("accounts is a list");
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0]["name"], "Farbhaus");
+        assert_eq!(accounts[0]["limit"], 2_000_000_000_000_i64);
+        assert_eq!(accounts[0]["used"], 12_400_000_000_i64);
+        assert!(accounts[1]["limit"].is_null(), "no limit is null, not 0");
+        assert_eq!(accounts[1]["used"], 1_050_000_000_i64);
+    }
+
+    /// An account Frame.io says nothing about still gets a row, with both
+    /// figures null, so the view can say "not reported" rather than print 0 B.
+    #[test]
+    fn an_unreported_account_serialises_as_null() {
+        let v = serde_json::to_value(SpaceAccount {
+            account_id: "acct-quiet".into(),
+            name: "Quiet".into(),
+            limit: None,
+            used: None,
+        })
+        .expect("account serialises");
+        assert!(v["limit"].is_null());
+        assert!(v["used"].is_null());
+    }
+
+    /// A payload that was never filled is empty in both lists, never a null the
+    /// front ends would have to guard against.
+    #[test]
+    fn an_empty_payload_has_two_empty_lists() {
+        let v = serde_json::to_value(SpacePayload::default()).expect("payload serialises");
+        assert_eq!(v["projects"], serde_json::json!([]));
+        assert_eq!(v["accounts"], serde_json::json!([]));
     }
 }

@@ -280,6 +280,7 @@
       root_folder_id: 'fld-ep04',
       bytes: 92500000000,
       files: 1432,
+      walked: true,
       error: '',
     },
     {
@@ -292,9 +293,12 @@
       root_folder_id: 'fld-trailer',
       bytes: 18400000000,
       files: 96,
+      walked: true,
       error: '',
     },
     {
+      // INVENTED: a project Frame.io sized itself (`Project.storage`), so the
+      // row shows a dash for files and says "from Frame.io".
       account_id: 'acc-nightfall',
       account_name: 'Nightfall',
       workspace_id: 'ws-marketing',
@@ -303,7 +307,8 @@
       name: 'Still Lives',
       root_folder_id: 'fld-stills',
       bytes: 6200000000,
-      files: 214,
+      files: 0,
+      walked: false,
       error: '',
     },
     {
@@ -318,6 +323,7 @@
       root_folder_id: 'fld-archive',
       bytes: 0,
       files: 0,
+      walked: true,
       error: '',
     },
     {
@@ -330,10 +336,22 @@
       root_folder_id: 'fld-title',
       bytes: 1050000000,
       files: 37,
+      walked: true,
       // INVENTED: one row that could not finish, so the warning is drawn.
       error: 'permission denied in fld-title/masters',
     },
   ];
+
+  // The accounts behind those rows: `Account.storage_limit` and
+  // `Account.storage_usage` as Frame.io reports them. INVENTED, but each number
+  // is a real shape: a limit with room left, `storage_limit: null` for an
+  // account with no limit, and an account that reports no usage at all.
+  var SPACE_ACCOUNTS = [
+    { account_id: 'acc-nightfall', name: 'Nightfall', limit: 500000000000, used: 118000000000 },
+    { account_id: 'acc-agency', name: 'Nightfall Agency', limit: null, used: 1050000000 },
+    { account_id: 'acc-quiet', name: 'Quiet Account', limit: 2000000000000, used: null },
+  ];
+
   var SPACE_WALKING = false;
 
   // The egui fixture has no update status at all: idle, nothing to draw.
@@ -409,7 +427,9 @@
     UpdateWatch: function () { return WATCHES; },
     RemoveWatch: function () { return WATCHES; },
     // ---- Space (the walk `Space()` returns; INVENTED above) ----
-    Space: function () { return SPACE; },
+    // `{ projects, accounts }`: the rows the chart draws and the accounts the
+    // headline counts.
+    Space: function () { return { projects: SPACE, accounts: SPACE_ACCOUNTS }; },
     SpaceWalking: function () { return SPACE_WALKING; },
     RefreshSpace: function () {
       SPACE_WALKING = true;

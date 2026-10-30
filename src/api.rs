@@ -585,6 +585,16 @@ pub struct Account {
     pub id: String,
     #[serde(default)]
     pub display_name: String,
+    /// `storage_limit`: "The number of bytes of non-archived storage in the
+    /// account. Value is nil when there is no [limit]" — so `None` is a real
+    /// answer ("no limit") and not a missing field, and it must not become a 0.
+    #[serde(default)]
+    pub storage_limit: Option<i64>,
+    /// `storage_usage`: the bytes of non-archived storage the account is using.
+    /// `None` when Frame.io does not report it, which the Space headline says
+    /// out loud instead of printing 0 B.
+    #[serde(default)]
+    pub storage_usage: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -605,6 +615,11 @@ pub struct Project {
     pub root_folder_id: String,
     #[serde(default)]
     pub workspace_id: String,
+    /// `storage`: "Storage Usage" — the bytes the project holds, which Frame.io
+    /// sends on the project itself. `None` only when the field is absent, and
+    /// then the Space view falls back to walking the project's folders.
+    #[serde(default)]
+    pub storage: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -718,5 +733,119 @@ impl SearchHit {
     /// Whether the hit was found by its own name (not only its project's).
     pub fn name_match(&self) -> bool {
         self.matches.iter().any(|m| m.type_ == "name_match")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frame.io's own example for `storage_limit` is `null` when the account
+    /// has no limit ("Value is nil when there is no [limit]"), so a null must
+    /// arrive as `None` and never as a limit of 0 bytes.
+    #[test]
+    fn an_account_with_a_null_limit_parses_as_no_limit() {
+        let json = r#"{
+            "id": "acct-1",
+            "display_name": "Farbhaus",
+            "storage_limit": null,
+            "storage_usage": 12400000000
+        }"#;
+        let acct: Account = serde_json::from_str(json).expect("account parses");
+        assert_eq!(acct.id, "acct-1");
+        assert_eq!(acct.display_name, "Farbhaus");
+        assert_eq!(acct.storage_limit, None, "null is \"no limit\", not zero");
+        assert_eq!(acct.storage_usage, Some(12_400_000_000));
+    }
+
+    #[test]
+    fn an_account_with_a_limit_parses_the_bytes() {
+        let json = r#"{
+            "id": "acct-2",
+            "display_name": "Archive",
+            "storage_limit": 2000000000000,
+            "storage_usage": 12400000000
+        }"#;
+        let acct: Account = serde_json::from_str(json).expect("account parses");
+        assert_eq!(acct.storage_limit, Some(2_000_000_000_000));
+        assert_eq!(acct.storage_usage, Some(12_400_000_000));
+    }
+
+    /// The old account shape, and any account that omits the fields: both are
+    /// still an account, with nothing known about its storage.
+    #[test]
+    fn an_account_without_the_storage_fields_parses() {
+        let acct: Account = serde_json::from_str(r#"{"id": "acct-3", "display_name": "Old"}"#)
+            .expect("account without storage parses");
+        assert_eq!(acct.id, "acct-3");
+        assert_eq!(acct.storage_limit, None);
+        assert_eq!(acct.storage_usage, None);
+    }
+
+    /// A usage of null is "not reported", which the headline has a case for.
+    #[test]
+    fn an_account_with_a_null_usage_parses_as_not_reported() {
+        let json = r#"{"id": "acct-4", "display_name": "Quiet", "storage_limit": 5, "storage_usage": null}"#;
+        let acct: Account = serde_json::from_str(json).expect("account parses");
+        assert_eq!(acct.storage_limit, Some(5));
+        assert_eq!(acct.storage_usage, None);
+    }
+
+    /// `Project.storage` is "Storage Usage" on the project itself, so a listed
+    /// project carries the number the Space view prints.
+    #[test]
+    fn a_project_carries_its_storage() {
+        let json = r#"{
+            "id": "proj-1",
+            "name": "Nightfall",
+            "root_folder_id": "root-1",
+            "workspace_id": "ws-1",
+            "storage": 6200000000
+        }"#;
+        let p: Project = serde_json::from_str(json).expect("project parses");
+        assert_eq!(p.name, "Nightfall");
+        assert_eq!(p.storage, Some(6_200_000_000));
+    }
+
+    /// An older answer, or a project that omits the field: `None`, which is what
+    /// sends the Space view down the walk.
+    #[test]
+    fn a_project_without_storage_parses() {
+        let p: Project = serde_json::from_str(r#"{"id": "proj-2", "name": "Bare"}"#)
+            .expect("project without storage parses");
+        assert_eq!(p.storage, None);
+        assert_eq!(p.root_folder_id, "");
+    }
+
+    /// A reported zero is a figure, not a missing one: Frame.io says the project
+    /// holds nothing, so there is nothing to walk.
+    #[test]
+    fn a_project_that_reports_zero_storage_is_still_reported() {
+        let p: Project = serde_json::from_str(r#"{"id": "proj-3", "name": "Empty", "storage": 0}"#)
+            .expect("project parses");
+        assert_eq!(p.storage, Some(0));
+    }
+
+    /// `storage` is sent as an integer, but the field is `Option<i64>` and the
+    /// payloads are re-serialised for the front ends, so the round trip has to
+    /// keep both the number and the null.
+    #[test]
+    fn storage_survives_a_round_trip() {
+        let acct = Account {
+            id: "acct-5".into(),
+            display_name: "Round".into(),
+            storage_limit: None,
+            storage_usage: Some(7),
+        };
+        let json = serde_json::to_string(&acct).expect("account serialises");
+        assert!(json.contains("\"storage_limit\":null"), "{json}");
+        let back: Account = serde_json::from_str(&json).expect("account re-parses");
+        assert_eq!(back.storage_limit, None);
+        assert_eq!(back.storage_usage, Some(7));
+
+        let p = Project { id: "p".into(), storage: Some(9), ..Default::default() };
+        let json = serde_json::to_string(&p).expect("project serialises");
+        let back: Project = serde_json::from_str(&json).expect("project re-parses");
+        assert_eq!(back.storage, Some(9));
     }
 }

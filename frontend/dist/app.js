@@ -1081,7 +1081,7 @@ async function renderHistoryDetails(t, box) {
 // delete a project on Frame.io. Nothing here reads or writes a local file: the
 // only call that changes anything is DeleteProject, and it names one project on
 // Frame.io. A delete goes through the confirm dialog, which says so.
-const SP = { rows: [], walking: false, walked: false, timer: 0, started: 0, at: 0, pending: null };
+const SP = { rows: [], accounts: [], walking: false, walked: false, timer: 0, started: 0, at: 0, pending: null };
 
 // ---------- the colour ramp ----------
 const hslHex = (h, s, l) => {
@@ -1129,8 +1129,14 @@ function ringArc(cx, cy, r0, r1, a0, a1) {
     + `L${round2(xi1)} ${round2(yi1)}A${r0} ${r0} 0 ${big} 0 ${round2(xi0)} ${round2(yi0)}Z`;
 }
 
+// `spaceFiles` is the delete dialog's own wording ("0 files"), so it keeps
+// counting files the way it always has; the legend shows a dash instead when no
+// walk made a count, and the title says where the figure came from.
 const spaceFiles = (p) => `${p.files || 0} file${p.files === 1 ? '' : 's'}`;
-const spaceLine = (p) => `${p.name} — ${fmtBytes(p.bytes)} — ${spaceFiles(p)}`;
+// Where the figure came from: a walk of this project, or Frame.io's own
+// Project.storage. The two are not the same measurement.
+const spaceSource = (p) => (p.walked ? 'walked' : 'from Frame.io');
+const spaceLine = (p) => `${p.name} — ${fmtBytes(p.bytes)} — ${spaceFiles(p)} — ${spaceSource(p)}`;
 
 function renderSpaceChart(rows, total) {
   const C = 240, c = C / 2, r1 = 104, r0 = 72;
@@ -1156,7 +1162,7 @@ function renderSpaceChart(rows, total) {
 function renderSpaceLegend(rows) {
   const box = $('#space-legend');
   box.innerHTML = rows.map((p, i) => {
-    const where = [p.workspace_name, p.account_name].filter(Boolean).join(' · ');
+    const where = [p.workspace_name, p.account_name, spaceSource(p)].filter(Boolean).join(' · ');
     const warn = p.error ? ` · <span class="space-warn" title="${esc(p.error)}">could not finish</span>` : '';
     return `<div class="row space-row" data-pid="${esc(p.project_id)}" title="${esc(spaceLine(p))}">
       <div class="row-main space-grid">
@@ -1165,7 +1171,7 @@ function renderSpaceLegend(rows) {
           <div class="names"><div class="name">${esc(p.name)}</div><div class="sub">${esc(where)}${warn}</div></div>
         </div>
         <div class="cell r tnum">${fmtBytes(p.bytes)}</div>
-        <div class="cell r tnum">${p.files || 0}</div>
+        <div class="cell r tnum">${p.walked ? (p.files || 0) : '—'}</div>
         <div class="actions"><button class="btn sm subtle danger space-del" title="Delete ${esc(p.name)} on Frame.io">${I.trash}<span>Delete</span></button></div>
       </div>
     </div>`;
@@ -1188,10 +1194,45 @@ function focusSlice(pid, on) {
   $$('#space-chart .slice').forEach((p) => p.classList.toggle('hot', on && p.dataset.pid === pid));
 }
 
+// ---------- how much is left ----------
+// The headline under the head: one line per account, from the account's own
+// storage_limit and storage_usage. Bytes only, and no limit is said in words:
+// Frame.io sends `storage_limit: null` for an account that has none, which is
+// not a limit of zero.
+const spaceLeft = (limit, used) => Math.max(0, (limit || 0) - (used || 0));
+
+function spaceQuotaSentence(a) {
+  const hasUsed = a.used !== null && a.used !== undefined;
+  const hasLimit = a.limit !== null && a.limit !== undefined;
+  if (hasUsed && hasLimit) {
+    return `${fmtBytes(a.used)} of ${fmtBytes(a.limit)} used · ${fmtBytes(spaceLeft(a.limit, a.used))} left`;
+  }
+  if (hasUsed) return `${fmtBytes(a.used)} used · no limit`;
+  if (hasLimit) return `${fmtBytes(a.limit)} limit · usage not reported`;
+  return 'no limit · usage not reported';
+}
+
+function spaceQuotaLine(a) {
+  const sentence = spaceQuotaSentence(a);
+  return a.name ? `${a.name} · ${sentence}` : sentence;
+}
+
+function renderSpaceQuota() {
+  const box = $('#space-quota');
+  if (!box) return;
+  const lines = (SP.accounts || []).map(
+    (a) => `<div class="space-quota-line">${esc(spaceQuotaLine(a))}</div>`,
+  );
+  box.innerHTML = lines.join('');
+  box.classList.toggle('hidden', lines.length === 0);
+}
+
 function renderSpace() {
   const rows = SP.rows.slice().sort((a, b) => (b.bytes || 0) - (a.bytes || 0));
   const total = rows.reduce((n, p) => n + (p.bytes || 0), 0);
   const n = rows.length;
+
+  renderSpaceQuota();
 
   $('#space-total').textContent = n ? `${fmtBytes(total)} · ${n} project${n === 1 ? '' : 's'}` : '';
   $('#space-total').title = SP.at ? `Counted ${fmtDate(SP.at)}` : '';
@@ -1238,9 +1279,13 @@ function renderSpace() {
 }
 
 async function loadSpace() {
-  let rows;
-  try { rows = (await call('Space')) || []; } catch (e) { toast(errMsg(e), 'err'); return; }
-  SP.rows = rows;
+  let payload;
+  try { payload = (await call('Space')) || {}; } catch (e) { toast(errMsg(e), 'err'); return; }
+  // `Space` answers `{ projects, accounts }`: the rows the chart draws and the
+  // accounts the headline counts. A bare list is an older backend, and is read
+  // as rows with no accounts rather than dropped.
+  SP.rows = Array.isArray(payload) ? payload : (Array.isArray(payload.projects) ? payload.projects : []);
+  SP.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
   renderSpace();
 }
 

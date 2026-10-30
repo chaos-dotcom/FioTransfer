@@ -724,16 +724,40 @@ async function main() {
         total: (document.querySelector('#space-total') || {}).textContent || '',
         warn: [...document.querySelectorAll('#space-legend .space-warn')].map((e) => e.getAttribute('title')),
         svg: !!document.querySelector('#space-chart svg'),
+        quota: [...document.querySelectorAll('#space-quota .space-quota-line')].map((e) => e.textContent.trim()),
+        quotaShown: !document.querySelector('#space-quota').classList.contains('hidden'),
+        subs: rows.map((r) => r.querySelector('.sub').textContent.trim()),
+        files: rows.map((r) => r.querySelectorAll('.cell')[1].textContent.trim()),
       };
     })()`);
     log('space    ' + JSON.stringify(space));
     check(space.rows === 5, 'the space legend lists every project');
-    check(space.first === 'Nightfall Ep 04 — 92.5 GB — 1432 files', 'the legend reads name — size — files, largest first');
-    check(space.last === 'Archive 2021 — 0 B — 0 files', 'a project that holds nothing still has a line');
+    check(space.first === 'Nightfall Ep 04 — 92.5 GB — 1432 files — walked', 'the legend reads name — size — files — source, largest first');
+    check(space.last === 'Archive 2021 — 0 B — 0 files — walked', 'a project that holds nothing still has a line');
     check(space.arcs === 4 && new Set(space.fills).size === 4, 'one arc per project that holds something, four distinct colours');
     check(space.fills[0] === '#5b53ff', 'the largest project is drawn in the brand colour');
     check(space.total === '118 GB · 5 projects', 'the header carries the total and the project count');
     check(space.warn.length === 1 && /permission denied/.test(space.warn[0]), 'a walk that failed is marked, with its reason');
+    // The row says where its figure came from, and a row Frame.io sized shows a
+    // dash for files instead of a 0 that would mean "no files".
+    check(space.subs[0] === 'Shows · Nightfall · walked', 'a walked row says it was walked (' + space.subs[0] + ')');
+    check(space.subs[2] === 'Marketing · Nightfall · from Frame.io', 'a row Frame.io sized says so (' + space.subs[2] + ')');
+    check(space.files[0] === '1432' && space.files[2] === '—', 'only a walk prints a file count (' + space.files.join(', ') + ')');
+    // The headline: used / limit / left per account, and the two cases Frame.io
+    // answers in words rather than numbers.
+    check(space.quotaShown, 'the space screen has a headline');
+    check(
+      space.quota[0] === 'Nightfall · 118 GB of 500 GB used · 382 GB left',
+      'a limit and a usage read used of limit, and what is left (' + space.quota[0] + ')',
+    );
+    check(
+      space.quota[1] === 'Nightfall Agency · 1.05 GB used · no limit',
+      'storage_limit: null reads "no limit", not a limit of 0 B (' + space.quota[1] + ')',
+    );
+    check(
+      space.quota[2] === 'Quiet Account · 2.00 TB limit · usage not reported',
+      'an account that reports no usage says so (' + space.quota[2] + ')',
+    );
 
     // Where the pieces landed: the chart left of the legend, the arcs inside the
     // SVG box, the hole in the middle of the ring, and no sideways scrolling.
@@ -762,6 +786,9 @@ async function main() {
       return {
         chart: box(document.querySelector('#space-chart')),
         legend: box(document.querySelector('.space-legend')),
+        quota: box(document.querySelector('#space-quota')),
+        body: box(document.querySelector('#space-body')),
+        head: box(document.querySelector('#view-space .page-head')),
         svg: box(svg),
         viewBox: { w: vb.width, h: vb.height },
         overflow: view.scrollWidth - view.clientWidth,
@@ -778,6 +805,8 @@ async function main() {
     log('geometry ' + JSON.stringify(geom));
     const radius = (p, cx, cy) => Math.hypot(Math.max(Math.abs(p.x - cx), Math.abs(p.x + p.w - cx)), Math.max(Math.abs(p.y - cy), Math.abs(p.y + p.h - cy)));
     check(geom.chart.right <= geom.legend.x, 'the chart sits left of the legend, not over it');
+    check(geom.head.bottom <= geom.quota.y + 1, 'the headline sits under the page head');
+    check(geom.quota.bottom <= geom.body.y, 'the headline sits above the chart and the legend');
     check(geom.overflow === 0, 'the space screen does not scroll sideways (' + geom.overflow + ' px)');
     check(
       geom.arcBoxes.length === 4 && geom.arcBoxes.every((b) => b.x >= 0 && b.y >= 0 && b.x + b.w <= geom.viewBox.w && b.y + b.h <= geom.viewBox.h),
@@ -806,6 +835,8 @@ async function main() {
         empty: !document.querySelector('#space-empty').classList.contains('hidden'),
         title: document.querySelector('#space-empty-title').textContent.trim(),
         body: !document.querySelector('#space-body').classList.contains('hidden'),
+        quota: !document.querySelector('#space-quota').classList.contains('hidden'),
+        quotaLines: document.querySelectorAll('#space-quota .space-quota-line').length,
       };
       SP.walking = false;
       SP.walked = true;
@@ -827,6 +858,8 @@ async function main() {
     check(/^Walking Frame\.io…/.test(walking.out.statusText), 'the walking line says what it is doing');
     check(walking.out.refreshDisabled, 'Refresh is disabled while a walk is in progress');
     check(walking.out.empty && walking.out.title === 'Walking Frame.io…' && !walking.out.body, 'an empty screen while walking says so');
+    // The account's own figures are not part of the walk: the headline stays up.
+    check(walking.out.quota && walking.out.quotaLines === 3, 'the headline stays while a walk runs (' + walking.out.quotaLines + ' lines)');
     check(walking.empty.title === 'No projects' && !walking.empty.body, 'a finished walk with nothing in it says so');
     check(walking.empty.button === 'Refresh' && !walking.empty.hiddenButton, 'the empty screen offers Refresh');
 
@@ -837,7 +870,7 @@ async function main() {
       SP.rows = [{
         account_id: 'acc-one', account_name: 'One', workspace_id: 'ws-one', workspace_name: 'Work',
         project_id: 'proj-only', name: 'Only project', root_folder_id: 'fld-only',
-        bytes: 4000000000, files: 3, error: '',
+        bytes: 4000000000, files: 3, walked: true, error: '',
       }];
       renderSpace();
       const paths = [...document.querySelectorAll('#space-chart .slice')];
@@ -893,12 +926,14 @@ async function main() {
         closed: m.classList.contains('hidden'),
         deleted: window.__bridge.deleted,
         total: (document.querySelector('#space-total') || {}).textContent,
+        quota: document.querySelectorAll('#space-quota .space-quota-line').length,
       };
     })()`);
     log('delete   ' + JSON.stringify(del));
     check(del.shown.open, 'the delete dialog opens');
     check(del.shown.name === 'Archive 2021', 'the delete dialog names the project');
     check(del.shown.size === '0 B · 0 files', 'the delete dialog names the size and the file count');
+    check(del.quota === 3, 'the delete dialog leaves the headline alone (' + del.quota + ' lines)');
     check(del.shown.where === 'Archive · Nightfall', 'the delete dialog names where the project lives');
     check(
       /deletes the project on Frame.io only. Nothing on this Mac is touched/i.test(del.shown.warn),

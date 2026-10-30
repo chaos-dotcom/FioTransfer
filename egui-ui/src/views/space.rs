@@ -8,6 +8,15 @@
 //! which starts a walk (`RefreshSpace`); while the walk runs the screen says
 //! "Walking Frame.io…" rather than implying the figures are current.
 //!
+//! Under the head is the headline: one line per account, from the account's own
+//! `storage_limit` and `storage_usage` — "12.4 GB of 2 TB used · 1.99 TB left",
+//! "640 GB used · no limit" when Frame.io sends `storage_limit: null`, and
+//! "usage not reported" when it sends no figure at all. It is the account's
+//! number, not a sum of the rows, so it stands while a walk runs. A row says
+//! whether its size came from a walk of the project ("walked", with a file
+//! count) or from Frame.io's `Project.storage` ("from Frame.io", with a dash
+//! where the count would be).
+//!
 //! Deleting is the one destructive thing this screen can ask for, so it never
 //! happens on a click: the row's Delete opens [`confirm_dialog`], which names the
 //! project, its size and where it lives, and says in as many words that the
@@ -20,7 +29,7 @@
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and the
 //! page head; the tokens come from [`crate::theme`].
 
-use crate::model::{fmt_bytes, SpaceRow, UiState, View};
+use crate::model::{fmt_bytes, SpaceAccount, SpaceRow, UiState, View};
 use crate::theme;
 use egui::{
     Align, Color32, CornerRadius, Id, Label, Layout, Margin, Painter, Pos2, Rect, Response, RichText,
@@ -58,6 +67,8 @@ const DONUT_GAP: f32 = 3.0;
 
 /// `.space-status { min-height: 24px; margin-top: 2px; gap: 10px; font-size: 12.5px }`.
 const STATUS_TOP: f32 = 2.0;
+/// `.space-quota { margin-top: 2px }` — the headline sits on the same 2 px.
+const QUOTA_TOP: f32 = 2.0;
 const STATUS_H: f32 = 24.0;
 
 /// `.space-grid { grid-template-columns: minmax(0, 1fr) 104px 56px 104px;
@@ -163,9 +174,10 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
 
     let walking = state.space_walking;
     let logged_in = state.logged_in;
-    // Only these two fields are written here, so they are borrowed apart: the
-    // rows stay readable while the empty state can still switch the view.
-    let UiState { space: rows, view, .. } = state;
+    // Only `view` is written here, so the fields are borrowed apart: the rows
+    // and the accounts stay readable while the empty state can still switch the
+    // screen. The accounts are read first: the headline sits under the head.
+    let UiState { space: rows, space_accounts: accounts, view, .. } = state;
 
     crate::app::page_head(ui, "Space", |ui| {
         // `.head-actions` reads right to left here: Refresh at the edge, the
@@ -190,6 +202,8 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
             );
         }
     });
+
+    quota_strip(ui, accounts);
 
     if walking {
         status_line(ui);
@@ -251,6 +265,61 @@ fn head_total(rows: &[SpaceRow]) -> String {
         fmt_bytes(total_bytes(rows)),
         project_word(rows.len())
     )
+}
+
+/// `.space-quota`: the headline under the head, one line per account — how much
+/// the account uses, what its limit is, and how much that leaves. Bytes only.
+///
+/// A refresh that has not answered yet, or an account list Frame.io never sent,
+/// draws nothing rather than a line of zeroes.
+fn quota_strip(ui: &mut egui::Ui, accounts: &[SpaceAccount]) {
+    if accounts.is_empty() {
+        return;
+    }
+    ui.add_space(QUOTA_TOP);
+    for account in accounts {
+        ui.add(Label::new(
+            RichText::new(quota_line(account))
+                .font(theme::note())
+                .color(theme::TEXT_2),
+        ));
+    }
+}
+
+/// One account's headline: its name, then [`quota_sentence`].
+pub fn quota_line(account: &SpaceAccount) -> String {
+    let name = account.name.trim();
+    if name.is_empty() {
+        quota_sentence(account)
+    } else {
+        format!("{name} · {}", quota_sentence(account))
+    }
+}
+
+/// The three cases, in Frame.io's own terms:
+///
+/// * a limit and a usage — "12.4 GB of 2 TB used · 1.99 TB left";
+/// * a usage and no limit — `storage_limit: null` is "no limit", never 0 B;
+/// * no usage — Frame.io said nothing, so neither does the headline about a
+///   figure it does not have.
+pub fn quota_sentence(account: &SpaceAccount) -> String {
+    match (account.used, account.limit) {
+        (Some(used), Some(limit)) => format!(
+            "{} of {} used · {} left",
+            fmt_bytes(used.max(0)),
+            fmt_bytes(limit.max(0)),
+            fmt_bytes(left_of(limit, used))
+        ),
+        (Some(used), None) => format!("{} used · no limit", fmt_bytes(used.max(0))),
+        (None, Some(limit)) => format!("{} limit · usage not reported", fmt_bytes(limit.max(0))),
+        (None, None) => "no limit · usage not reported".to_string(),
+    }
+}
+
+/// What a limit leaves. A soft limit can be exceeded; the headline says "0 B
+/// left" rather than a negative size.
+fn left_of(limit: i64, used: i64) -> i64 {
+    limit.saturating_sub(used).max(0)
 }
 
 /// `.space-status`: the spinner, then what is being walked and what that means.
@@ -574,8 +643,15 @@ fn legend_row(ui: &mut egui::Ui, index: usize, row: &SpaceRow, columns: &Columns
             ));
         });
         cell(ui, columns.files, ROW_H, true, |ui| {
+            // Only a walk counts files. A row Frame.io sized has no count, and a
+            // dash says "not counted" where a 0 would say "none".
+            let files = if row.walked {
+                row.files.max(0).to_string()
+            } else {
+                NOT_COUNTED.to_string()
+            };
             ui.add(Label::new(
-                RichText::new(row.files.max(0).to_string())
+                RichText::new(files)
                     .font(theme::body())
                     .color(theme::TEXT_2),
             ));
@@ -654,6 +730,15 @@ fn sub_line(ui: &mut egui::Ui, row: &SpaceRow, width: f32) {
         |ui| {
             ui.set_max_width(width);
             ui.spacing_mut().item_spacing.x = 0.0;
+            let source_w = ui
+                .painter()
+                .layout_no_wrap(
+                    format!(" · {}", source_word(row)),
+                    theme::detail(),
+                    theme::WHITE,
+                )
+                .size()
+                .x;
             let warn_w = if row.incomplete() {
                 ui.painter()
                     .layout_no_wrap(
@@ -666,7 +751,7 @@ fn sub_line(ui: &mut egui::Ui, row: &SpaceRow, width: f32) {
             } else {
                 0.0
             };
-            let place_w = (width - warn_w).max(0.0);
+            let place_w = (width - source_w - warn_w).max(0.0);
             ui.allocate_ui_with_layout(
                 vec2(place_w, line),
                 Layout::left_to_right(Align::Center),
@@ -681,6 +766,22 @@ fn sub_line(ui: &mut egui::Ui, row: &SpaceRow, width: f32) {
                     );
                 },
             );
+            // Where the figure came from: a walk of this project, or Frame.io's
+            // own `Project.storage`. The two are not the same measurement.
+            ui.add(Label::new(
+                RichText::new(" · ")
+                    .font(theme::detail())
+                    .color(theme::TEXT_3),
+            ));
+            ui.add(
+                Label::new(
+                    RichText::new(source_word(row))
+                        .font(theme::detail())
+                        .color(theme::TEXT_3),
+                )
+                .truncate(),
+            )
+            .on_hover_text(source_hint(row));
             if row.incomplete() {
                 ui.add(Label::new(
                     RichText::new(" · ")
@@ -699,6 +800,28 @@ fn sub_line(ui: &mut egui::Ui, row: &SpaceRow, width: f32) {
             }
         },
     );
+}
+
+/// `.space-row`'s dash in the Files column: the row was sized by Frame.io, so
+/// nothing counted its files.
+pub const NOT_COUNTED: &str = "—";
+
+/// How the row words where its size came from, as `walked` reports it.
+pub fn source_word(row: &SpaceRow) -> &'static str {
+    if row.walked {
+        "walked"
+    } else {
+        "from Frame.io"
+    }
+}
+
+/// The long form, on the pointer: what the short word in the row means.
+pub fn source_hint(row: &SpaceRow) -> &'static str {
+    if row.walked {
+        "This figure is the sum of every file in the project, counted folder by folder."
+    } else {
+        "Frame.io reported this project's storage; its folders were not walked, so its files were not counted."
+    }
 }
 
 /// The project's place: workspace and account, either one alone, or just
@@ -1301,7 +1424,8 @@ mod tests {
     use egui_kittest::kittest::{NodeT as _, Queryable as _};
     use egui_kittest::Harness;
 
-    /// A project on one account, with no error.
+    /// A project on one account, walked (so it has a file count) and with no
+    /// error.
     fn project(name: &str, workspace: &str, bytes: i64, files: i64) -> SpaceRow {
         SpaceRow {
             account_id: "acct-1".into(),
@@ -1311,7 +1435,27 @@ mod tests {
             name: name.into(),
             bytes,
             files,
+            walked: true,
             error: String::new(),
+        }
+    }
+
+    /// A project Frame.io sized itself: no walk, so no file count.
+    fn reported(name: &str, workspace: &str, bytes: i64) -> SpaceRow {
+        SpaceRow {
+            bytes,
+            walked: false,
+            files: 0,
+            ..project(name, workspace, 0, 0)
+        }
+    }
+
+    fn account(name: &str, limit: Option<i64>, used: Option<i64>) -> SpaceAccount {
+        SpaceAccount {
+            account_id: format!("acct-{}", name.to_lowercase().replace(' ', "-")),
+            name: name.into(),
+            limit,
+            used,
         }
     }
 
@@ -1912,6 +2056,149 @@ mod tests {
     fn the_chart_has_a_name_for_a_screen_reader() {
         let (harness, _) = screen(state_with(three_projects()));
         harness.get_by_label(CHART_LABEL);
+    }
+
+    // ---------- how much is left ----------
+
+    /// A screen with rows and accounts: the headline and the chart together.
+    fn screen_with(space: Vec<SpaceRow>, accounts: Vec<SpaceAccount>) -> Harness<'static, UiState> {
+        let state = UiState {
+            space,
+            space_accounts: accounts,
+            logged_in: true,
+            ..UiState::default()
+        };
+        screen(state).0
+    }
+
+    /// The three cases in Frame.io's own terms, as the sentence the headline is
+    /// built from. Bytes only: no money, no "seats", no percentage.
+    #[test]
+    fn the_headline_words_a_limit_a_usage_and_what_is_left() {
+        // 1.24 TB of 2 TB, which leaves 760 GB.
+        assert_eq!(
+            quota_sentence(&account("Farbhaus", Some(2_000_000_000_000), Some(1_240_000_000_000))),
+            "1.24 TB of 2.00 TB used · 760 GB left"
+        );
+        // `storage_limit: null` — an account with no limit at all.
+        assert_eq!(
+            quota_sentence(&account("Archive", None, Some(640_000_000_000))),
+            "640 GB used · no limit"
+        );
+        // No usage reported: the limit is named, the figure it has no number for
+        // is not invented.
+        assert_eq!(
+            quota_sentence(&account("Quiet", Some(500_000_000_000), None)),
+            "500 GB limit · usage not reported"
+        );
+        // Neither: still a line, and it says nothing it does not know.
+        assert_eq!(
+            quota_sentence(&account("Bare", None, None)),
+            "no limit · usage not reported"
+        );
+    }
+
+    /// A soft limit can be exceeded: what is left is never a negative size.
+    #[test]
+    fn an_account_past_its_limit_has_nothing_left() {
+        assert_eq!(
+            quota_sentence(&account("Over", Some(1_000), Some(4_000))),
+            "4.00 KB of 1.00 KB used · 0 B left"
+        );
+    }
+
+    #[test]
+    fn the_headline_names_the_account_it_counts() {
+        assert_eq!(
+            quota_line(&account("Farbhaus", Some(2_000_000_000_000), Some(1_240_000_000_000))),
+            "Farbhaus · 1.24 TB of 2.00 TB used · 760 GB left"
+        );
+        // An account Frame.io does not name is still counted, without a stray "·".
+        assert_eq!(
+            quota_line(&account("", Some(1_000_000_000), Some(500_000_000))),
+            "500 MB of 1.00 GB used · 500 MB left"
+        );
+    }
+
+    /// The screen draws the headline for a limit, for no limit and for no usage —
+    /// all three at once, one line per account, above the chart.
+    #[test]
+    fn the_screen_draws_one_headline_line_per_account() {
+        let harness = screen_with(
+            three_projects(),
+            vec![
+                account("Farbhaus", Some(2_000_000_000_000), Some(1_240_000_000_000)),
+                account("Farbhaus Archive", None, Some(640_000_000_000)),
+                account("Quiet Account", Some(500_000_000_000), None),
+            ],
+        );
+
+        harness.get_by_label("Farbhaus · 1.24 TB of 2.00 TB used · 760 GB left");
+        harness.get_by_label("Farbhaus Archive · 640 GB used · no limit");
+        harness.get_by_label("Quiet Account · 500 GB limit · usage not reported");
+
+        // The headline sits above the chart, not inside it.
+        let headline = harness
+            .get_by_label("Farbhaus Archive · 640 GB used · no limit")
+            .rect();
+        let head = harness.get_by_label("Project").rect();
+        assert!(
+            headline.max.y <= head.min.y,
+            "the headline is below the legend head: {headline:?} past {head:?}"
+        );
+    }
+
+    /// No accounts means no headline: an app that has not refreshed yet draws no
+    /// line of zeroes.
+    #[test]
+    fn a_screen_with_no_accounts_draws_no_headline() {
+        let harness = screen_with(three_projects(), Vec::new());
+        assert!(
+            harness.query_by_label("no limit · usage not reported").is_none(),
+            "an empty account list must draw nothing"
+        );
+        // The chart is still there.
+        harness.get_by_label("on Frame.io");
+    }
+
+    /// The headline is not the body's: an account's usage shows even when no
+    /// project has been counted, because "how much is left" is the account's own
+    /// figure.
+    #[test]
+    fn the_headline_shows_before_any_project_is_counted() {
+        let harness = screen_with(
+            Vec::new(),
+            vec![account("Farbhaus", Some(2_000_000_000_000), Some(1_240_000_000_000))],
+        );
+        harness.get_by_label("Farbhaus · 1.24 TB of 2.00 TB used · 760 GB left");
+        harness.get_by_label(EMPTY_TITLE);
+    }
+
+    /// A row Frame.io sized says so, and shows a dash where a walked row shows a
+    /// file count: a 0 would claim the project holds no files.
+    #[test]
+    fn a_row_frame_io_sized_says_so_and_counts_no_files() {
+        let harness = screen_with(
+            vec![reported("Nightfall", "Shows", 12_400_000_000)],
+            Vec::new(),
+        );
+
+        harness.get_by_label("from Frame.io");
+        harness.get_by_label(NOT_COUNTED);
+        assert!(
+            harness.query_by_label("0").is_none(),
+            "an unreported file count must not read as zero files"
+        );
+    }
+
+    /// A walked row says it was walked and prints the count it made.
+    #[test]
+    fn a_walked_row_says_walked_and_prints_its_file_count() {
+        let harness = screen_with(vec![project("Nightfall", "Shows", 12_400_000_000, 1_284)], Vec::new());
+
+        harness.get_by_label("walked");
+        harness.get_by_label("1284");
+        assert!(harness.query_by_label("from Frame.io").is_none());
     }
 }
 
