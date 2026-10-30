@@ -451,6 +451,12 @@ impl Client {
         Ok(up)
     }
 
+    /// Deletes a project on Frame.io. Nothing local is touched: this is the
+    /// one call the Space view makes, and it never runs `rm`.
+    pub async fn delete_project(&self, cx: &CancellationToken, acct: &str, project: &str) -> Result<(), ApiErr> {
+        self.call(cx, "DELETE", &format!("/v4/accounts/{}/projects/{}", acct, project), &[], None).await
+    }
+
     pub async fn delete_file(&self, cx: &CancellationToken, acct: &str, file: &str) -> Result<(), ApiErr> {
         self.call(cx, "DELETE", &format!("/v4/accounts/{}/files/{}", acct, file), &[], None).await
     }
