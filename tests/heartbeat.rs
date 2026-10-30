@@ -391,7 +391,7 @@ fn one_reconcile_sends_one_heartbeat_with_the_stored_client_id() {
     assert_eq!(p.client_id, w.app.settings().portal_client_id, "the id in the payload is the stored one");
     assert!(w.settings_file().contains(&p.client_id), "the id is in settings.json, so a restart keeps it");
     assert_eq!(p.app_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(p.app_version, "1.6.1");
+    assert_eq!(p.app_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(p.platform, format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
     assert!(!p.name.trim().is_empty(), "a client with no name is no use in a list");
     assert!(!p.name.contains('\n'), "{}", p.name);
