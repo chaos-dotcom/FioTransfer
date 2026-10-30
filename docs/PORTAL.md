@@ -90,6 +90,40 @@ Folder counts appear only when the last reconcile succeeded — a failure is nev
 up as a success. While **Enabled** is on, FioTransfer re-checks every 30 seconds
 (`portal_every_secs`); while it is off, nothing goes out.
 
+## From a terminal
+
+The same four steps without opening the window — for a machine reached over ssh, or a cron job:
+
+```sh
+fio portal signin https://portal.shed.gay you@yourdomain     # session only; the password is not stored
+fio portal reconcile                                          # what it did, and what it refused
+fio portal status                                             # the sentence the Settings card shows
+fio portal signout
+fio portal token <token>                                      # instead, for a TOTP or passkey deployment
+```
+
+`signin` takes the password from `$FIO_PORTAL_PASSWORD` when set, otherwise reads one line — and on a terminal it
+says plainly that the typing is visible, because there is no no-echo helper here.
+
+`reconcile` prints the counts, then one line per skipped marker **with the reason**, then the folders it keeps in
+step:
+
+```
+links seen: 3
+kept in step: 1
+removed: 0
+skipped 8177b73e-… "../etc": the turbosort marker "../etc" contains '/': one path segment only
+skipped 99715dbe-… ".": the turbosort marker "." is not a folder name
+watch folders:
+  ~/Live_Work/Farbhaus ← acct-1/folder-1
+```
+
+Exit codes are meant for scripts: `0` done, `1` refused or failed (with the sentence you would have seen on
+screen), `2` Portal wants a one-time code, which means this deployment needs a bearer token instead.
+
+A second `reconcile` reporting `kept in step: 0` is the system saying the first one already did the work — that is
+the idempotence rule, visible.
+
 ## What FioTransfer will and will not do
 
 * It only ever touches watches it created. Those carry `origin = portal:<link id>`; a
