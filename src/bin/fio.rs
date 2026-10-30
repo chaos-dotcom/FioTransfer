@@ -663,6 +663,11 @@ async fn portal_reconcile_command(args: &[String]) -> ! {
             let link = if s.link.is_empty() { "(no id)".to_string() } else { s.link.clone() };
             println!("skipped {} \"{}\": {}", link, s.marker, s.reason);
         }
+        // Not refusals: what Portal said that this build read differently — an
+        // unknown `sync` mode read as `add_only`, say.
+        for n in &rep.notes {
+            println!("note: {}", n);
+        }
         if !rep.planned.is_empty() {
             println!("would keep these folders:");
             for p in &rep.planned {
@@ -694,6 +699,9 @@ async fn portal_reconcile_command(args: &[String]) -> ! {
     for s in &rep.skipped {
         let link = if s.link.is_empty() { "(no id)".to_string() } else { s.link.clone() };
         println!("skipped {} \"{}\": {}", link, s.marker, s.reason);
+    }
+    for n in &rep.notes {
+        println!("note: {}", n);
     }
     // Read back from the store rather than from the report: what Portal owns now,
     // which is exactly the folders this run created or brought in line.
