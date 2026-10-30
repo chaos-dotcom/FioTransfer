@@ -115,6 +115,12 @@ impl Window {
     }
 
     fn build(url: &str, token: Option<&str>) -> Window {
+        Window::build_with(url, token, false, 30)
+    }
+
+    /// The same window with the background poller configured: `enabled` and the
+    /// interval, which the other cases deliberately keep off.
+    fn build_with(url: &str, token: Option<&str>, enabled: bool, every_secs: u64) -> Window {
         let home = tempfile::tempdir().expect("a temporary HOME");
         std::env::set_var("HOME", home.path());
         std::env::set_var("FIO_NO_KEYCHAIN", "1");
@@ -126,9 +132,10 @@ impl Window {
         fiotransfer::config::update(|s| {
             s.portal_url = url.trim().trim_end_matches('/').to_string();
             s.portal_root = root.to_string_lossy().into_owned();
-            // The poller stays off: this file is about the button, and a
-            // background reconcile firing mid-case would answer for it.
-            s.portal_enabled = false;
+            // Off for the button cases, so a background reconcile cannot answer
+            // for a press; on for the poller's own case.
+            s.portal_enabled = enabled;
+            s.portal_every_secs = every_secs as i64;
         })
         .expect("settings.json in the temporary HOME");
         if let Some(t) = token {
@@ -643,4 +650,43 @@ fn signing_in_on_the_card_creates_the_folders() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(farbhaus(&w.root).is_dir(), "the mirrored folder is not on disk");
+}
+
+/// The poller is what makes "Portal controls the folders" true between visits: turn
+/// it on and the app reconciles by itself, with nobody pressing anything. Every
+/// other case here keeps it off so a background run cannot answer for a button.
+#[test]
+fn the_poller_reconciles_by_itself() {
+    let Some((url, token)) = live() else { return };
+    let _g = one_at_a_time();
+    let mut w = Window::build_with(&url, Some(&token), true, 5);
+
+    // The app's own startup has to have finished before the poller exists at all —
+    // it is spawned at the end of `App::start`. Wait for the card to read the
+    // credential, which only happens after that.
+    let startup = Instant::now() + Duration::from_secs(10);
+    loop {
+        if w.line().text.starts_with("Configured") {
+            break;
+        }
+        assert!(Instant::now() < startup, "the app never finished starting: {:?}", w.line().text);
+        w.frame();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // No click anywhere. Only frames and real time, until the watch appears.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        if w.watch_paths().iter().any(|p| p.ends_with("Farbhaus")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the poller never reconciled on its own: {:?}",
+            w.line().text
+        );
+        w.frame();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(farbhaus(&w.root).is_dir(), "the polled reconcile left no folder on disk");
 }
