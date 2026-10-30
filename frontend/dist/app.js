@@ -21,6 +21,7 @@ const I = {
   chevronUp: '<svg viewBox="0 0 20 20"><path d="M7 12l3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   open: '<svg viewBox="0 0 20 20"><path d="M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12M11 4h5v5M16 4l-7 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   copy: '<svg viewBox="0 0 20 20"><rect x="7" y="7" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M13 7V5.5A1.5 1.5 0 0 0 11.5 4h-6A1.5 1.5 0 0 0 4 5.5v6A1.5 1.5 0 0 0 5.5 13H7" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>',
+  trash: '<svg viewBox="0 0 20 20"><path d="M4.5 6h11M8 6V4.5h4V6M6 6l.7 9.5h6.6L14 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   pencil: '<svg viewBox="0 0 20 20"><path d="M12.8 4.7l2.5 2.5M4 16l.7-3.2 8.6-8.6a1.2 1.2 0 0 1 1.7 0l.8.8a1.2 1.2 0 0 1 0 1.7l-8.6 8.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>',
   sync: '<svg viewBox="0 0 20 20"><path d="M6.5 15V5m0 0L3.8 7.7M6.5 5l2.7 2.7M13.5 5v10m0 0l-2.7-2.7m2.7 2.7l2.7-2.7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   external: '<svg viewBox="0 0 20 20" width="12" height="12"><path d="M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12M11 4h5v5M16 4l-7 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
@@ -133,6 +134,7 @@ async function init() {
     S.state = await call('GetState');
     S.dlDest = S.state.settings.download_dir; // the menu bar's download panel can change it
     renderState();
+    if (SP.walking) tickSpace(); // a space walk ends with this event
   });
   window.runtime.EventsOn('update', (u) => { S.update = u; renderUpdate(); });
   S.update = await call('UpdateStatus');
@@ -155,6 +157,7 @@ function bindUI() {
     if (e.key !== 'Escape') return;
     if (!$('#dest-modal').classList.contains('hidden')) closeDest();
     else if (!$('#watch-modal').classList.contains('hidden')) closeWatchEdit();
+    else if (!$('#space-confirm').classList.contains('hidden')) closeSpaceConfirm();
   });
 
   const inspectSoon = debounce(inspectLink, 450);
@@ -219,6 +222,11 @@ function bindUI() {
     toast('Copied', 'ok', 2000);
   });
 
+  $('#space-refresh').addEventListener('click', () => startSpaceWalk());
+  $('#sc-close').addEventListener('click', closeSpaceConfirm);
+  $('#sc-cancel').addEventListener('click', closeSpaceConfirm);
+  $('#sc-del').addEventListener('click', deleteSpaceProject);
+
   $('#watch-add').addEventListener('click', addWatch);
   $('#we-close').addEventListener('click', closeWatchEdit);
   $('#we-cancel').addEventListener('click', closeWatchEdit);
@@ -258,6 +266,7 @@ function showView(v) {
   $$('.view').forEach((s) => s.classList.toggle('active', s.id === `view-${v}`));
   if (v === 'history') loadHistory();
   if (v === 'watch') loadWatches();
+  if (v === 'space') openSpace();
 }
 
 function onMenu(what) {
@@ -1065,6 +1074,287 @@ async function renderHistoryDetails(t, box) {
     <div class="files">${files.length ? fileRows(files, t.kind) : '<div class="files-more">No files</div>'}</div>`;
   bindReveal(box);
   $$('a.copy-share', box).forEach((a) => a.addEventListener('click', (e) => { e.preventDefault(); copyShare(t.id); }));
+}
+
+// ---------- space: what Frame.io is holding ----------
+// One arc per project, sized by the bytes it holds, largest first, and a row to
+// delete a project on Frame.io. Nothing here reads or writes a local file: the
+// only call that changes anything is DeleteProject, and it names one project on
+// Frame.io. A delete goes through the confirm dialog, which says so.
+const SP = { rows: [], walking: false, walked: false, timer: 0, started: 0, at: 0, pending: null };
+
+// ---------- the colour ramp ----------
+const hslHex = (h, s, l) => {
+  h = ((h % 360) + 360) % 360;
+  s /= 100;
+  l /= 100;
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const two = (v) => Math.round(v * 255).toString(16).padStart(2, '0');
+  return `#${two(f(0))}${two(f(8))}${two(f(4))}`;
+};
+
+// spaceColor walks the ramp the stylesheet already owns: --brand #5b53ff is the
+// first project, and the ramp runs through --info #729fff towards --success
+// #21c17b. Neighbours are 18° of hue apart and alternate lightness, so two arcs
+// that touch never read as one.
+function spaceColor(i) {
+  if (i === 0) return '#5b53ff'; // --brand itself
+  const hue = 243 - 18 * (i % 6);
+  const light = (Math.floor(i / 6) % 2 === 0 ? 66 : 52) - Math.min(Math.floor(i / 12) * 6, 18);
+  return hslHex(hue, Math.floor(i / 6) % 2 === 0 ? 96 : 76, Math.max(28, light));
+}
+
+// ---------- the donut ----------
+const ptOn = (cx, cy, r, deg) => {
+  const a = ((deg - 90) * Math.PI) / 180;
+  return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+};
+const round2 = (v) => Math.round(v * 100) / 100;
+
+// ringArc is one slice of the ring, degrees clockwise from 12 o'clock. A slice
+// of a whole turn is drawn as two halves: an arc that ends where it starts has
+// no direction for the renderer to take.
+function ringArc(cx, cy, r0, r1, a0, a1) {
+  const span = a1 - a0;
+  if (span <= 0.08) return '';
+  if (span >= 359.9) return ringArc(cx, cy, r0, r1, a0, a0 + 180) + ringArc(cx, cy, r0, r1, a0 + 180, a0 + 360);
+  const big = span > 180 ? 1 : 0;
+  const [xo0, yo0] = ptOn(cx, cy, r1, a0);
+  const [xo1, yo1] = ptOn(cx, cy, r1, a1);
+  const [xi1, yi1] = ptOn(cx, cy, r0, a1);
+  const [xi0, yi0] = ptOn(cx, cy, r0, a0);
+  return `M${round2(xo0)} ${round2(yo0)}A${r1} ${r1} 0 ${big} 1 ${round2(xo1)} ${round2(yo1)}`
+    + `L${round2(xi1)} ${round2(yi1)}A${r0} ${r0} 0 ${big} 0 ${round2(xi0)} ${round2(yi0)}Z`;
+}
+
+const spaceFiles = (p) => `${p.files || 0} file${p.files === 1 ? '' : 's'}`;
+const spaceLine = (p) => `${p.name} — ${fmtBytes(p.bytes)} — ${spaceFiles(p)}`;
+
+function renderSpaceChart(rows, total) {
+  const C = 240, c = C / 2, r1 = 104, r0 = 72;
+  const slices = rows.filter((p) => (p.bytes || 0) > 0);
+  let at = 0;
+  const arcs = slices.map((p, i) => {
+    const span = (p.bytes / total) * 360;
+    // A lone project closes the ring: there is no neighbour to separate it from.
+    const pad = slices.length === 1 ? 0 : Math.min(0.9, span * 0.12);
+    const d = ringArc(c, c, r0, r1, at + pad, at + span - pad);
+    at += span;
+    return `<path class="slice" data-pid="${esc(p.project_id)}" d="${d}" fill="${spaceColor(i)}"><title>${esc(spaceLine(p))}</title></path>`;
+  }).join('');
+  const ring = arcs || `<circle cx="${c}" cy="${c}" r="${(r0 + r1) / 2}" fill="none" stroke="var(--raised)" stroke-width="${r1 - r0}"/>`;
+  $('#space-chart').innerHTML = `<svg viewBox="0 0 ${C} ${C}" width="${C}" height="${C}" role="img"
+      aria-label="What each project holds on Frame.io, largest first">
+      ${ring}
+      <text class="donut-value" x="${c}" y="${c - 1}" text-anchor="middle">${esc(fmtBytes(total))}</text>
+      <text class="donut-label" x="${c}" y="${c + 17}" text-anchor="middle">on Frame.io</text>
+    </svg>`;
+}
+
+function renderSpaceLegend(rows) {
+  const box = $('#space-legend');
+  box.innerHTML = rows.map((p, i) => {
+    const where = [p.workspace_name, p.account_name].filter(Boolean).join(' · ');
+    const warn = p.error ? ` · <span class="space-warn" title="${esc(p.error)}">could not finish</span>` : '';
+    return `<div class="row space-row" data-pid="${esc(p.project_id)}" title="${esc(spaceLine(p))}">
+      <div class="row-main space-grid">
+        <div class="cell-name">
+          <span class="swatch" style="background:${(p.bytes || 0) > 0 ? spaceColor(i) : 'var(--raised)'}"></span>
+          <div class="names"><div class="name">${esc(p.name)}</div><div class="sub">${esc(where)}${warn}</div></div>
+        </div>
+        <div class="cell r tnum">${fmtBytes(p.bytes)}</div>
+        <div class="cell r tnum">${p.files || 0}</div>
+        <div class="actions"><button class="btn sm subtle danger space-del" title="Delete ${esc(p.name)} on Frame.io">${I.trash}<span>Delete</span></button></div>
+      </div>
+    </div>`;
+  }).join('');
+  $$('#space-legend .space-row').forEach((el) => {
+    const p = rows.find((x) => x.project_id === el.dataset.pid);
+    if (!p) return;
+    $('.space-del', el).onclick = () => openSpaceConfirm(p);
+    el.addEventListener('mouseenter', () => focusSlice(p.project_id, true));
+    el.addEventListener('mouseleave', () => focusSlice(p.project_id, false));
+  });
+}
+
+// Hovering a row lights its arc and dims the others, so a small slice can still
+// be found by name.
+function focusSlice(pid, on) {
+  const svg = $('#space-chart svg');
+  if (!svg) return;
+  svg.classList.toggle('focus', on);
+  $$('#space-chart .slice').forEach((p) => p.classList.toggle('hot', on && p.dataset.pid === pid));
+}
+
+function renderSpace() {
+  const rows = SP.rows.slice().sort((a, b) => (b.bytes || 0) - (a.bytes || 0));
+  const total = rows.reduce((n, p) => n + (p.bytes || 0), 0);
+  const n = rows.length;
+
+  $('#space-total').textContent = n ? `${fmtBytes(total)} · ${n} project${n === 1 ? '' : 's'}` : '';
+  $('#space-total').title = SP.at ? `Counted ${fmtDate(SP.at)}` : '';
+
+  const status = $('#space-status');
+  status.classList.toggle('hidden', !SP.walking);
+  if (SP.walking) {
+    status.innerHTML = `<span class="spinner"></span><span>Walking Frame.io…</span><span class="dim">Adding up every project. Nothing is downloaded, nothing is deleted.</span>`;
+  }
+  $('#space-refresh').disabled = SP.walking;
+
+  $('#space-body').classList.toggle('hidden', n === 0);
+  const empty = $('#space-empty');
+  empty.classList.toggle('hidden', n > 0);
+  const title = $('#space-empty-title'), sub = $('#space-empty-sub'), btn = $('#space-empty-btn');
+  if (n > 0) {
+    // nothing to say: the chart and the legend are up
+  } else if (!S.state?.logged_in) {
+    title.textContent = 'Sign in to see your space';
+    sub.textContent = 'The size of each Frame.io project appears here once you are signed in.';
+    btn.classList.remove('hidden');
+    btn.textContent = 'Open Settings';
+    btn.onclick = () => showView('settings');
+  } else if (SP.walking) {
+    title.textContent = 'Walking Frame.io…';
+    sub.textContent = 'Adding up every project. This can take a minute on a big account.';
+    btn.classList.add('hidden');
+    btn.onclick = null;
+  } else {
+    title.textContent = SP.walked ? 'No projects' : 'Nothing counted yet';
+    sub.textContent = SP.walked ? 'There is nothing on Frame.io to count yet.' : 'Refresh adds up what every project on Frame.io is holding.';
+    btn.classList.remove('hidden');
+    btn.textContent = 'Refresh';
+    btn.onclick = () => startSpaceWalk();
+  }
+
+  if (n === 0) {
+    $('#space-chart').innerHTML = '';
+    $('#space-legend').innerHTML = '';
+    return;
+  }
+  renderSpaceChart(rows, total);
+  renderSpaceLegend(rows);
+}
+
+async function loadSpace() {
+  let rows;
+  try { rows = (await call('Space')) || []; } catch (e) { toast(errMsg(e), 'err'); return; }
+  SP.rows = rows;
+  renderSpace();
+}
+
+// openSpace draws the last walk at once, adopts a walk that is already running
+// (one started before this window opened), and starts the first walk itself: an
+// empty Space screen would otherwise ask the user to press Refresh to see
+// anything.
+async function openSpace() {
+  renderSpace();
+  if (SP.walking) return;
+  await loadSpace();
+  if (!SP.rows.length && !SP.walked) {
+    let walking = false;
+    try { walking = !!(await call('SpaceWalking')); } catch { walking = false; }
+    if (walking) {
+      SP.walking = true;
+      SP.started = Date.now();
+      renderSpace();
+      startSpacePoll();
+    } else {
+      startSpaceWalk();
+    }
+  }
+}
+
+async function startSpaceWalk() {
+  if (SP.walking) return;
+  SP.walking = true;
+  SP.started = Date.now();
+  renderSpace();
+  try {
+    await call('RefreshSpace');
+  } catch (e) {
+    SP.walking = false;
+    renderSpace();
+    toast(errMsg(e), 'err');
+    return;
+  }
+  startSpacePoll();
+}
+
+function startSpacePoll() {
+  if (!SP.timer) SP.timer = setInterval(tickSpace, 900);
+}
+
+// tickSpace asks the backend whether the walk is still going. RefreshSpace
+// starts it in a task of its own, so the flag can take a moment to rise: a
+// "not walking" answer in the first couple of seconds is not the end of a walk.
+async function tickSpace() {
+  if (!SP.walking) {
+    stopSpacePoll();
+    return;
+  }
+  let walking = true;
+  try { walking = !!(await call('SpaceWalking')); } catch { walking = false; }
+  if (walking) return;
+  if (Date.now() - SP.started < 1500) return;
+  stopSpacePoll();
+  SP.walking = false;
+  SP.walked = true;
+  SP.at = Date.now();
+  renderSpace();
+  await loadSpace();
+}
+
+function stopSpacePoll() {
+  if (SP.timer) {
+    clearInterval(SP.timer);
+    SP.timer = 0;
+  }
+}
+
+// ---------- deleting a project ----------
+// The one destructive call in the app. It is reached only from this dialog, the
+// dialog names the project and what it holds, and Cancel holds the focus: Enter
+// therefore cancels, and deleting takes a deliberate second press.
+function openSpaceConfirm(p) {
+  SP.pending = p;
+  const where = [p.workspace_name, p.account_name].filter(Boolean).join(' · ') || 'Frame.io';
+  $('#sc-name').textContent = p.name;
+  $('#sc-name').title = p.name;
+  $('#sc-size').textContent = `${fmtBytes(p.bytes)} · ${spaceFiles(p)}`;
+  $('#sc-where').textContent = where;
+  $('#sc-where').title = where;
+  const del = $('#sc-del');
+  del.disabled = false;
+  del.textContent = 'Delete on Frame.io';
+  $('#space-confirm').classList.remove('hidden');
+  $('#sc-cancel').focus();
+}
+
+function closeSpaceConfirm() {
+  $('#space-confirm').classList.add('hidden');
+  SP.pending = null;
+}
+
+async function deleteSpaceProject() {
+  const p = SP.pending;
+  if (!p) return;
+  const del = $('#sc-del');
+  del.disabled = true;
+  del.textContent = 'Deleting…';
+  try {
+    await call('DeleteProject', p.account_id, p.project_id);
+  } catch (e) {
+    del.disabled = false;
+    del.textContent = 'Delete on Frame.io';
+    toast(errMsg(e), 'err', 10000);
+    return;
+  }
+  SP.rows = SP.rows.filter((x) => !(x.project_id === p.project_id && x.account_id === p.account_id));
+  closeSpaceConfirm();
+  renderSpace();
+  toast(`Deleted ${p.name} on Frame.io`, 'ok', 4000);
 }
 
 // ---------- watch folders ----------

@@ -12,9 +12,9 @@ cd /Users/chaos/work/FioTransfer-rs/bench/web-ref
 ./render.sh
 ```
 
-Writes `/tmp/web-shots/{transfers,watch,history,settings}.png` (1180x780,
-deviceScaleFactor 1) and prints the checks, the DOM values it read back, and the
-four file sizes. Exit code 0 means every check passed.
+Writes `/tmp/web-shots/{transfers,watch,history,settings,space}.png`
+(1180x780, deviceScaleFactor 1) and prints the checks, the DOM values it read
+back, and the five file sizes. Exit code 0 means every check passed.
 
 Flags: `--out DIR`, `--dist DIR`, `--chromium PATH`, `--settle MS`,
 `--no-expand`, `--no-toasts`, `--no-events`, `--keep-profile`.
@@ -43,11 +43,18 @@ Flags: `--out DIR`, `--dist DIR`, `--chromium PATH`, `--settle MS`,
 3. Navigates, waits for the fixture's first job row, waits for
    `document.fonts.ready` (Inter is a webfont), then opens the fixture's
    expanded row, adds the fixture's two toasts, and settles.
-4. For each of the four views: clicks `[data-view="<view>"]`, waits for
+4. For each of the five views: clicks `[data-view="<view>"]`, waits for
    `#view-<view>.active`, settles, and saves `Page.captureScreenshot` output.
 5. Reads the DOM back and compares the values with the fixture, then decodes
    the PNGs (`node:zlib`, unfiltered in JS) and checks 1180x780, non-empty,
-   drawn content, and that the four differ pairwise.
+   drawn content, and that the five differ pairwise.
+6. On the Space screen (after the shots): the legend's lines, the four arcs and
+   their fills, the header total; the geometry (chart left of the legend, arcs
+   inside the SVG box, the ring's hole, the Delete button inside its card, no
+   sideways scroll); the walking and empty states through `renderSpace()`; and
+   the delete dialog - what it says, that Cancel holds the focus and deletes
+   nothing, that Escape deletes nothing, and that a confirmed delete asks for
+   exactly one project and drops its row.
 
 ## The bridge (`bridge.js`, served as `/__bridge.js`)
 
@@ -55,7 +62,8 @@ Defines, before `app.js` runs:
 
 * `window.go.main.App[method](...) -> Promise` for every method the front end
   can call. Boot asks for `GetState`, `Snapshot`, `UpdateStatus`, `Watches` and
-  `TakeServiceRequests`, and the History view asks for `History`; the rest of
+  `TakeServiceRequests`, the History view asks for `History`, and the Space view
+  for `Space` / `SpaceWalking` / `RefreshSpace` / `DeleteProject`; the rest of
   app.js's call sites are answered with the empty/default shape. The object
   is a `Proxy`, so a method that is not answered rejects loudly and is recorded
   in `window.__bridge.unhandled` (the render prints it and fails).
@@ -81,6 +89,21 @@ web front end reads. Field names and values are the egui ones:
 | `toasts` (ok + err) | drawn through the page's own `toast()` |
 | `expanded: Some("up-1")` | the row is opened by clicking its `.a-files` button |
 | `destination` | `settings.last_folder_label` |
+
+### The Space screen has no egui source
+
+`Space()` is new: `src/app.rs` walks the account and `frontend/dist` draws it,
+but the egui shell has no Space screen and `fixture_state()` no projects. So
+`bridge.js` carries an invented walk - five `SpaceProject` rows across three
+workspaces and two accounts, sized to print at every branch of `fmtBytes`
+(92.5 GB, 18.4 GB, 6.20 GB, 1.05 GB, 0 B; 118 GB in total). One row holds
+nothing (so the "0 B" line and the arc-less swatch are drawn) and one carries a
+walk `error` (so the "could not finish" mark is drawn). `RefreshSpace` answers
+`null` and flips `SpaceWalking` for 1.2 s, and `DeleteProject` drops the row and
+appends the arguments it was given to `window.__bridge.deleted`, so the render
+can prove what the one destructive call was asked to delete. The four fills are
+the ramp `app.js` computes from the stylesheet's `--brand`, `--info` and
+`--success`, so the first project is `#5b53ff` and the check pins that.
 
 ### Values that had to be invented
 
