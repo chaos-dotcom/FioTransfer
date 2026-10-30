@@ -1378,7 +1378,10 @@ name = "fiotransfer"
 version = "1.4.3"
 dependencies = [
  "bytes",
+ "egui",
+ "egui_kittest",
  "fiotransfer-core",
+ "fiotransfer-egui",
  "fiotransfer-sys",
  "futures",
  "libc",
