@@ -948,7 +948,16 @@ pub fn portal_line(status: &PortalView) -> PortalLine {
         return line("Reconciling…".to_string(), false);
     }
     if status.last_at <= 0 {
-        return line("Configured. Portal has not been checked yet.".to_string(), false);
+        // Nothing has run yet, so say what to press and whether the background
+        // poller is even on — a signed-in card that stays silent looks broken.
+        return line(
+            if status.enabled {
+                "Configured. Nothing has run yet: press Reconcile now.".to_string()
+            } else {
+                "Configured. Press Reconcile now, or switch it on to check every 30 s.".to_string()
+            },
+            false,
+        );
     }
     let mut text = format!(
         "{} · {}, {} kept in step, {} removed",
@@ -2310,7 +2319,7 @@ mod tests {
         // Configured, and never run: no numbers to claim yet.
         status.signed_in = true;
         let words = portal_line(&status);
-        assert_eq!(words.text, "Configured. Portal has not been checked yet.");
+        assert_eq!(words.text, "Configured. Press Reconcile now, or switch it on to check every 30 s.");
         assert!(!words.failed);
 
         // A reconcile in flight says so.
@@ -2640,4 +2649,20 @@ mod tests {
         // The label carries the whole path, shortened to `~` by `shortPath`.
         harness.get_by_label(short_path(&long, "/Users/chaos").as_str());
     }
+    #[test]
+    fn a_configured_card_says_what_to_press_and_whether_the_poller_is_on() {
+        let mut status = PortalView::default();
+        status.url = "https://portal.example.com".to_string();
+        status.signed_in = true;
+        status.root = "/tmp/Live_Work".to_string();
+        status.enabled = false;
+        assert_eq!(
+            portal_line(&status).text,
+            "Configured. Press Reconcile now, or switch it on to check every 30 s."
+        );
+        status.enabled = true;
+        assert_eq!(portal_line(&status).text, "Configured. Nothing has run yet: press Reconcile now.");
+        assert!(!portal_line(&status).failed);
+    }
+
 }
