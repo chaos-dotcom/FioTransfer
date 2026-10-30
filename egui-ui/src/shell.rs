@@ -44,7 +44,8 @@ use fiotransfer_core::host::Host;
 use fiotransfer_core::xfer::{DownloadOptions, LinkInfo};
 
 use crate::model::{
-    fmt_bytes, Crumb, HistoryRow, LinkInfo as UiLinkInfo, Request, ToastKind, UiState, UpdateState, View, WatchRow,
+    fmt_bytes, Crumb, HistoryRow, LinkInfo as UiLinkInfo, PortalView, Request, ToastKind, UiState,
+    UpdateState, View, WatchRow,
 };
 use crate::platform;
 
@@ -437,6 +438,45 @@ impl Shell {
                 });
             }
 
+            // ---- Portal ----
+            // Every one of these writes through `App::set_portal`, the single
+            // call that stores the URL, the local root and the enabled flag (and
+            // the token, when one is given: it goes to the keychain, never to
+            // settings.json).
+            Request::SetPortalUrl(url) => {
+                ui.settings.portal_url = url;
+                self.portal_write(ui, "");
+            }
+            Request::SetPortalRoot(root) => {
+                ui.settings.portal_root = root;
+                self.portal_write(ui, "");
+            }
+            Request::SetPortalEnabled(on) => {
+                ui.settings.portal_enabled = on;
+                self.portal_write(ui, "");
+            }
+            Request::SetPortalToken(token) => {
+                // Stored: the field empties, so the token is on screen nowhere
+                // at all. Refused: the field keeps it, so it can be retried.
+                if !token.is_empty() && self.portal_write(ui, token.expose()) {
+                    ui.portal.token_draft.clear();
+                }
+            }
+            Request::ForgetPortalToken => self.forget_portal_token(ui),
+            Request::PortalReconcile => {
+                // Whatever the screen holds is what Portal is asked with: a URL
+                // typed in this same frame is saved before the call, not lost to
+                // the one-request-a-frame rule.
+                if !self.portal_write(ui, "") {
+                    return;
+                }
+                let (app, tx) = (self.app.clone(), self.tx.clone());
+                self.spawn_task(async move {
+                    app.portal_reconcile().await;
+                    let _ = tx.send(Update::Done(Done::Changed));
+                });
+            }
+
             // ---- settings, sign-in, updates ----
             Request::SaveSettings => self.save_settings(ui),
             Request::SetOpenAtLogin(on) => match self.app.set_open_at_login(on) {
@@ -585,6 +625,12 @@ impl Shell {
             // Finder's right-click menu: "Upload with FioTransfer", "Create Watch
             // Folder in FioTransfer".
             "service" => self.on_service(ui),
+            // A Portal reconcile finished: the status line's numbers are new, and
+            // its watches may have been added, edited or removed.
+            "portal" => {
+                self.read_portal(ui);
+                self.read_watches(ui);
+            }
             // Files dropped on the window (the webview's `files-dropped`).
             "files-dropped" => {
                 let paths: Vec<String> = serde_json::from_value(payload).unwrap_or_default();
@@ -669,6 +715,18 @@ impl Shell {
         let state = self.app.get_state();
         self.apply_state(ui, state);
         ui.update = UpdateState::from_core(&self.app.update_status());
+        self.read_portal(ui);
+    }
+
+    /// The Portal status line: the last reconcile's report, whether a token is
+    /// stored and where the local root is. All of it is the app's own cache, so
+    /// this rides with every state read rather than on a channel of its own; and
+    /// the moment it was taken comes with it, so "2 min ago" is the caller's
+    /// clock and not the frame's.
+    fn read_portal(&mut self, ui: &mut UiState) {
+        let mut view = PortalView::from_core(&self.app.portal_status());
+        view.now_ms = now_ms();
+        ui.portal.status = view;
     }
 
     fn apply_state(&mut self, ui: &mut UiState, state: State) {
@@ -817,6 +875,36 @@ impl Shell {
             Ok(state) => self.apply_state(ui, state),
             Err(err) => ui.push_toast(err, ToastKind::Err),
         }
+    }
+
+    /// The Portal settings, written through the one call that owns them.
+    ///
+    /// `token` is empty for a URL, folder or toggle change: `App::set_portal`
+    /// keeps the token already in the keychain when it is given none, which is
+    /// also why an untouched (masked) field cannot wipe it. Answers whether the
+    /// app stored them; a refusal is a toast here, and the screen goes back to
+    /// the values that are really saved.
+    fn portal_write(&mut self, ui: &mut UiState, token: &str) -> bool {
+        let s = ui.settings.clone();
+        let saved = self.app.set_portal(&s.portal_url, token, &s.portal_root, s.portal_enabled);
+        let ok = match &saved {
+            Ok(_) => true,
+            Err(err) => {
+                ui.push_toast(err.clone(), ToastKind::Err);
+                false
+            }
+        };
+        // Whatever happened, the screen follows the app: the normalised URL, the
+        // root it kept, or the values it refused to replace.
+        self.read_state(ui);
+        ok
+    }
+
+    /// "Forget": the token goes, and the status line's `signed_in` with it.
+    fn forget_portal_token(&mut self, ui: &mut UiState) {
+        self.app.forget_portal_token();
+        ui.portal.token_draft.clear();
+        self.read_state(ui);
     }
 
     fn start_upload(&mut self, ui: &mut UiState, paths: Vec<String>) {
