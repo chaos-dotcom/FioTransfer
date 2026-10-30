@@ -372,3 +372,55 @@ fn live_portal_says_the_session_expired_not_that_the_token_was_refused() {
         );
     }
 }
+
+
+/// Connecting to a Portal whose projects already hold media must not push a second
+/// copy of it. A watch made by the reconciler is added with `include_existing =
+/// false`, which baselines what is already in the folder and tells the next remote
+/// listing to record matches instead of fetching them. This asserts that against a
+/// folder that was populated before the reconcile ever ran — the state a machine
+/// coming from Project Zeus is actually in.
+#[test]
+fn a_folder_that_already_holds_media_is_baselined_not_re_uploaded() {
+    let Some((url, token)) = live() else { return };
+    let w = world(&url);
+    portal::set_token(&token).expect("token stored");
+
+    // Populate the folder the marker names *before* anything reconciles: three
+    // files and a nested one, as a project folder from the old workflow would look.
+    let folder = w.root.join("Farbhaus");
+    std::fs::create_dir_all(folder.join("Rushes/Day 1")).unwrap();
+    std::fs::write(folder.join("slate.txt"), b"slate").unwrap();
+    std::fs::write(folder.join("Rushes/Day 1/A001.bin"), vec![7u8; 4096]).unwrap();
+    std::fs::write(folder.join("Rushes/Day 1/A002.bin"), vec![8u8; 2048]).unwrap();
+
+    let _g = w.rt.enter();
+    let report = w.rt.block_on(async { w.app.portal_reconcile().await });
+    assert!(report.error.is_empty(), "{:?}", report.error);
+    assert_eq!(report.ensured, 1, "the marker's folder should have been kept in step");
+
+    let watches = w.app.hist.lock().unwrap().as_ref().unwrap().watches().expect("watches");
+    let farb = watches
+        .iter()
+        .find(|r| r.local_path.ends_with("Farbhaus"))
+        .expect("the mirrored watch");
+    assert!(farb.ignore_remote, "the next remote listing must record what is already here, not fetch it");
+
+    let known = w
+        .app
+        .hist
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .watch_files(&farb.id)
+        .expect("the baseline");
+    assert_eq!(known.len(), 3, "three files were there before the first reconcile: {:?}", known.keys().collect::<Vec<_>>());
+    for name in ["slate.txt", "Rushes/Day 1/A001.bin", "Rushes/Day 1/A002.bin"] {
+        assert!(known.contains_key(name), "{} is not in the baseline: {:?}", name, known.keys().collect::<Vec<_>>());
+    }
+
+    // And the files themselves are untouched — a reconcile is not a transfer.
+    assert_eq!(std::fs::read(folder.join("slate.txt")).unwrap(), b"slate");
+    assert_eq!(std::fs::metadata(folder.join("Rushes/Day 1/A001.bin")).unwrap().len(), 4096);
+}
