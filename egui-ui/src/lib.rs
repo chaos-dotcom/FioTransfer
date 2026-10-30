@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod chrome;
 pub mod fixture;
 pub mod model;
 pub mod theme;

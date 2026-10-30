@@ -22,9 +22,10 @@ use std::path::{Path, PathBuf};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use fiotransfer_egui::app::{show_screen, toast_max_width};
+use fiotransfer_egui::chrome::{self, Dot};
 use fiotransfer_egui::fixture::fixture_state;
 use fiotransfer_egui::model::{Toast, ToastKind, UiState, View, WatchRow};
-use fiotransfer_egui::{FioApp, WINDOW_HEIGHT, WINDOW_WIDTH};
+use fiotransfer_egui::{FioApp, WINDOW_HEIGHT, WINDOW_WIDTH, theme};
 
 /// Where the PNGs land: /tmp/egui-shots, created if it is not there.
 fn shots_dir() -> PathBuf {
@@ -226,6 +227,210 @@ fn long_strings_do_not_panic() {
     harness.run_steps(2);
     let image = harness.render().expect("render");
     assert_eq!(image.width(), WINDOW_WIDTH as u32);
+}
+
+/// The window's own chrome: the title strip at the top of the window, its three
+/// dots, and the sidebar and the page head starting below it.
+///
+/// It writes `egui-ui/tests/snapshots/chrome.png` — the picture the change is
+/// about — and, because this session cannot see a picture, it measures the
+/// window instead: the dots' widgets are the 12 px boxes the strip paints at
+/// x = 20, 40 and 60, in the top 32 px; their pixels are `#FF5F57`, `#FEBC2E`
+/// and `#28C840`; the band is `--panel` with z 1 px `--border` hairline along
+/// its bottom; and no widget of the app starts above y = 32.
+#[test]
+fn the_chrome_strip_sits_at_the_top_of_the_window() {
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(WINDOW_WIDTH, WINDOW_HEIGHT))
+        .with_pixels_per_point(1.0)
+        .build_state(
+            |ctx, app: &mut FioApp| app.draw(ctx),
+            FioApp::new(fixture_state(View::Transfers)),
+        );
+    harness.run_steps(2);
+
+    // Three dots, left to right, 12 x 12, the first at x = 20, all centred in
+    // the 32 px strip (so 10 px down), 8 px apart.
+    for (index, dot) in Dot::ALL.into_iter().enumerate() {
+        let rect = harness.get_by_label(dot.label()).rect();
+        assert_eq!(rect.size(), egui::vec2(chrome::DOT_SIZE, chrome::DOT_SIZE), "{dot:?}");
+        assert_eq!(rect.left(), 20.0 + 20.0 * index as f32, "{dot:?}");
+        assert_eq!(rect.top(), 10.0, "{dot:?}");
+        assert!(rect.bottom() <= chrome::STRIP_HEIGHT, "{dot:?}");
+    }
+
+    // The strip sits above everything: the sidebar's brand, the nav item and the
+    // page head's title all start at or below y = 32. ("Transfers" is both the
+    // nav item and the page head's title, so both are checked.)
+    let brand = harness.get_by_label("FioTransfer").rect();
+    assert!(
+        brand.top() >= chrome::STRIP_HEIGHT,
+        "the sidebar starts at y = {}, not below the 32 px strip",
+        brand.top()
+    );
+    let nav = harness.get_by_label("Transfers").rect();
+    assert!(
+        nav.top() >= chrome::STRIP_HEIGHT,
+        "the sidebar's nav item starts at y = {}",
+        nav.top()
+    );
+    // The page head's own button — the screen's `Transfers` title is painted,
+    // not a widget, so the button beside it is what the tree can be asked about.
+    let head = harness.get_by_label("Clear finished").rect();
+    assert!(
+        head.top() >= chrome::STRIP_HEIGHT,
+        "the page head starts at y = {}, above the strip",
+        head.top()
+    );
+
+    // The picture: the band, its hairline, the three dot colours, and the page
+    // below it.
+    let image = harness.render().expect("render");
+    let pixel = |x: u32, y: u32| {
+        let p = image.get_pixel(x, y);
+        [p[0], p[1], p[2]]
+    };
+    assert_eq!(pixel(600, 5), [theme::PANEL.r(), theme::PANEL.g(), theme::PANEL.b()]);
+    assert_ne!(
+        pixel(600, chrome::STRIP_HEIGHT as u32 - 1),
+        [theme::PANEL.r(), theme::PANEL.g(), theme::PANEL.b()],
+        "the strip's bottom hairline is not drawn"
+    );
+    assert_eq!(pixel(600, chrome::STRIP_HEIGHT as u32), [theme::BASE.r(), theme::BASE.g(), theme::BASE.b()]);
+    for dot in Dot::ALL {
+        let centre = dot.centre();
+        let expected = dot.color();
+        assert_eq!(
+            pixel(centre.x as u32, centre.y as u32),
+            [expected.r(), expected.g(), expected.b()],
+            "{dot:?} is not {} at {centre:?}",
+            dot.label()
+        );
+    }
+
+    // `chrome.png`, in the same directory as the other goldens.
+    let mut options = egui_kittest::SnapshotOptions::new();
+    options.output_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("snapshots");
+    harness.snapshot_options("chrome", &options);
+}
+
+/// A harness over the whole window, the state the other pictures use.
+fn window_harness() -> Harness<'static, FioApp> {
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(WINDOW_WIDTH, WINDOW_HEIGHT))
+        .with_pixels_per_point(1.0)
+        .build_state(
+            |ctx, app: &mut FioApp| app.draw(ctx),
+            FioApp::new(fixture_state(View::Transfers)),
+        );
+    harness.run_steps(2);
+    harness
+}
+
+/// The viewport commands the window was sent on its last frame.
+fn window_commands(harness: &Harness<'_, FioApp>) -> Vec<egui::ViewportCommand> {
+    harness.output().viewport_output[&egui::ViewportId::ROOT]
+        .commands
+        .clone()
+}
+
+/// The dots are wired to the window the way the platform's buttons were: red
+/// asks for the close the app has always answered, yellow for the minimise, and
+/// green maximises — then restores, when the window already is maximised.
+#[test]
+fn the_dots_send_the_window_commands() {
+    let mut harness = window_harness();
+    harness.get_by_label("Close window").click();
+    harness.step();
+    assert!(
+        window_commands(&harness).contains(&egui::ViewportCommand::Close),
+        "{:?}",
+        window_commands(&harness)
+    );
+
+    let mut harness = window_harness();
+    harness.get_by_label("Minimise window").click();
+    harness.step();
+    assert!(
+        window_commands(&harness).contains(&egui::ViewportCommand::Minimized(true)),
+        "{:?}",
+        window_commands(&harness)
+    );
+
+    // Green, on a normal window: maximise.
+    let mut harness = window_harness();
+    harness.get_by_label("Maximise window").click();
+    harness.step();
+    assert!(
+        window_commands(&harness).contains(&egui::ViewportCommand::Maximized(true)),
+        "{:?}",
+        window_commands(&harness)
+    );
+
+    // Green again, now that the window says it is maximised: restore.
+    let mut harness = window_harness();
+    harness
+        .input_mut()
+        .viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .expect("the root viewport")
+        .maximized = Some(true);
+    harness.run_steps(1);
+    harness.get_by_label("Maximise window").click();
+    harness.step();
+    assert!(
+        window_commands(&harness).contains(&egui::ViewportCommand::Maximized(false)),
+        "{:?}",
+        window_commands(&harness)
+    );
+}
+
+/// The strip is the window's drag handle: a press on the band and a move asks
+/// the platform to drag the window, and a press on a dot does not.
+#[test]
+fn a_drag_on_the_strip_asks_the_window_to_move() {
+    let mut harness = window_harness();
+    let strip = egui::pos2(600.0, chrome::STRIP_HEIGHT * 0.5);
+    harness.hover_at(strip);
+    harness.drag_at(strip);
+    harness.event(egui::Event::PointerMoved(strip + egui::vec2(20.0, 10.0)));
+    harness.step();
+    let commands = window_commands(&harness);
+    assert!(
+        commands.contains(&egui::ViewportCommand::StartDrag),
+        "a drag on the strip asked for {commands:?}"
+    );
+    harness.drop_at(strip + egui::vec2(20.0, 10.0));
+
+    // The same gesture that begins on a dot is the dot's, not a drag.
+    let mut harness = window_harness();
+    let dot = Dot::Yellow.centre();
+    harness.hover_at(dot);
+    harness.drag_at(dot);
+    harness.event(egui::Event::PointerMoved(dot + egui::vec2(20.0, 10.0)));
+    harness.step();
+    let commands = window_commands(&harness);
+    assert!(
+        !commands.contains(&egui::ViewportCommand::StartDrag),
+        "a drag from a dot asked for {commands:?}"
+    );
+}
+
+/// The window is undecorated: `main.rs` asks for no platform title bar, so every
+/// platform gets the strip this file tests. (The builder is built in `main`, so
+/// this holds the *source* to it — the one place a regression would be silent.)
+#[test]
+fn the_window_asks_for_no_platform_decorations() {
+    let main = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("main.rs"),
+    )
+    .expect("read main.rs");
+    assert!(
+        main.contains(".with_decorations(false)"),
+        "the window is decorated again: the platform draws its own title bar"
+    );
+    assert_eq!(chrome::STRIP_HEIGHT, 32.0);
 }
 
 /// `page_head` is the strip every screen opens with: 64 px tall, the title on

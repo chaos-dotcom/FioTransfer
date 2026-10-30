@@ -33,7 +33,14 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WINDOW_WIDTH, WINDOW_HEIGHT])
             .with_min_inner_size([MIN_WIDTH, MIN_HEIGHT])
-            .with_title("FioTransfer"),
+            .with_title("FioTransfer")
+            // No title bar on any platform: the app draws its own strip
+            // (`chrome.rs`) — the same one on macOS, Windows and Linux — and
+            // that strip is also the window's drag handle and its resize edges.
+            // The title stays: the taskbar, the dock and Mission Control still
+            // need something to call the window. `WINDOW_WIDTH` x
+            // `WINDOW_HEIGHT` is still the whole window, strip included.
+            .with_decorations(false),
         ..Default::default()
     };
     eframe::run_native(

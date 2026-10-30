@@ -1594,6 +1594,9 @@ mod tests {
             .build_state(
                 |ctx, state: &mut UiState| {
                     crate::app::apply_style_once(ctx);
+                    // The window's own chrome: the screen is drawn in a window
+                    // that has a title strip, so the picture of it does too.
+                    crate::chrome::show(ctx);
                     egui::CentralPanel::default().show(ctx, |ui| show(ui, state));
                 },
                 state,

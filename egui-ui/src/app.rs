@@ -97,7 +97,14 @@ impl FioApp {
     /// harness, which is why it takes a plain `&egui::Context` and no frame.
     pub fn draw(&mut self, ctx: &egui::Context) {
         apply_style_once(ctx);
-        // The shell goes first: requests out, answers in, the app read on its
+        // The window's own chrome first: its 32 px strip is a `TopBottomPanel`,
+        // so it takes that band off the top of the window and every panel below
+        // starts under it — the window is still `WINDOW_WIDTH` x
+        // `WINDOW_HEIGHT` overall, and `--fixture` draws the same strip the
+        // running app does. The resize bands are foreground areas and do not
+        // care when they are added.
+        crate::chrome::show(ctx);
+        // The shell goes next: requests out, answers in, the app read on its
         // tick — all before a single pixel of this frame.
         self.drive_shell(ctx);
         self.tick_toasts(ctx);
