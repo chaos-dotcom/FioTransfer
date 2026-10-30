@@ -244,6 +244,42 @@ the idempotence rule, visible.
   watch and no other: clearing `exports` leaves the drive watch running.
 * Reconciling twice changes nothing the second time.
 
+## Telling Portal this machine is alive
+
+Portal's Live Work page shows which machines are connected and what each one is keeping in
+step. That is one `POST` from FioTransfer, and it is the only thing the app ever *writes*
+to Portal:
+
+```json
+POST /api/live-work/heartbeat          Authorization: Bearer … (or the session cookie)
+{
+  "client_id": "0f0c1c1e-…-…", "name": "studio-mac",
+  "app_version": "1.6.1", "platform": "macos-aarch64",
+  "lanes": [ { "link_id": "L1", "project": "20261028_YML-XMAS-Luc", "local": "1_DRIVE",
+               "direction": "download", "folder_id": "…",
+               "path": "/Users/…/Live_Work/20261028_YML-XMAS-Luc/1_DRIVE" } ]
+}
+```
+
+It answers `204` and nothing else. Four things about it:
+
+* **The lanes are what is on disk, not what Portal asked for.** One lane per watch Portal
+  owns (`origin = portal:<link id>`), so a `sync` link is two lanes — `1_DRIVE` `download`,
+  `0_EXPORTS` `upload` — and a plain link is one `mirror` lane on the project folder. A
+  link FioTransfer had to skip has no lane, and a watch you made by hand is never reported.
+  `project` is the link's `.turbosort` marker, read back from where the folder actually is.
+* **`client_id` is this machine, not a run.** A uuid v4 made on the first heartbeat and kept
+  in `settings.json` (`portal_client_id`), so a restart updates one row instead of adding a
+  second.
+* **When:** after every reconcile that read Portal — which is the poller's every tick,
+  whether or not the watch list changed, so "last seen" stays honest on a quiet machine —
+  and once five seconds after startup. Never when Portal is switched off, has no address, or
+  has no credential.
+* **A failure is not your problem.** Portal unreachable, a `500`, a dropped connection: the
+  app says nothing, shows nothing, and changes no watch. It is not retried straight away
+  either — the next tick sends it again. Set `FIO_TRACE=1` to see
+  `[portal heartbeat] …` lines on stderr if you want to know why it was not sent.
+
 ## When it says no
 
 Every refusal is a sentence you can act on. The status line, the CLI and the logs use the same words, so
@@ -305,8 +341,9 @@ manual step is at the head of the case in `tests/portal_live.rs`:
 * A `sync` mapping starts, like every Portal watch, by recording what is already there rather
   than moving it. Files the client sent *before* the mapping existed stay on Frame.io: add the
   folder by hand — or pause the watch, empty its record and resume — if they have to come down.
-* Nothing is sent back to Portal — a link's state in Portal is unaffected by what
-  FioTransfer does with its folder.
+* Nothing is written back to a link — a link's state in Portal is unaffected by what
+  FioTransfer does with its folder. The one exception is the heartbeat above, which reports
+  this machine and its lanes and changes nothing on either side.
 * The token cannot be rotated from the app; change it in Portal and re-enter it here.
 * A passkey sign-in is not something the app can complete: sign in with a browser and use a
   bearer token on such a deployment. TOTP is: see "An account with a second factor".

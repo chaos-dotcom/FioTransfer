@@ -1177,6 +1177,17 @@ impl App {
         let rep = portal::agent::reconcile(self).await;
         self.refresh_portal_credential();
         *self.portal_last.lock().unwrap() = Some(rep.clone());
+        // Telemetry, after the reconcile it describes and before the guard is
+        // released: one heartbeat saying this machine is alive and which lanes
+        // it now holds. A reconcile that read Portal is the trigger — the
+        // poller's every tick is one, whether or not the watch list changed, so
+        // "last seen" stays honest on a quiet machine. It runs while
+        // `portal_running` is still set, so a heartbeat and a reconcile never
+        // overlap, and its answer is dropped: nothing here may change the
+        // report, and nothing here can fail the reconcile.
+        if rep.error.is_empty() {
+            let _ = portal::heartbeat::send(self, "reconcile").await;
+        }
         self.portal_running.store(false, Ordering::SeqCst);
         self.emit("portal", serde_json::to_value(&rep).unwrap_or(Value::Null));
         if rep.ensured + rep.removed > 0 {

@@ -40,6 +40,7 @@
 //! Frame.io), so every string field also goes through [`nullable`].
 
 pub mod agent;
+pub mod heartbeat;
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -887,6 +888,15 @@ impl std::fmt::Debug for PortalClient {
     }
 }
 
+/// What a retry may repeat: a `GET` is safe to send again whatever happened; a
+/// `POST` only when it provably did not reach Portal (a connect error) or was
+/// refused before acting (429).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repeat {
+    Always,
+    OnlyUnsent,
+}
+
 impl PortalClient {
     /// `base_url` is used as given, less a trailing slash, so `base + "/api/…"`
     /// has exactly one separator.
@@ -1192,6 +1202,31 @@ impl PortalClient {
     /// connect error or timeout repeated (a GET is safe to repeat), and 429 or a
     /// server error repeated. 4xx is the answer: it is not tried again.
     async fn get(&self, path: &str) -> Result<Vec<u8>, PortalErr> {
+        self.request(reqwest::Method::GET, path, None, Repeat::Always).await
+    }
+
+    /// One `POST` of a JSON body, on the same stack as [`PortalClient::get`]:
+    /// the same credential, the same backoff, the same [`PortalErr`] values.
+    ///
+    /// It is repeated only where a repeat cannot double an effect: a connect
+    /// error, which never reached Portal, and a 429, which Portal refused
+    /// before acting. A timeout, a 5xx or a broken connection is reported as it
+    /// is — the caller (`portal::heartbeat`) sends again on its next tick
+    /// rather than guess whether the first one was written.
+    pub async fn post_json(&self, path: &str, body: &[u8]) -> Result<Vec<u8>, PortalErr> {
+        self.request(reqwest::Method::POST, path, Some(body), Repeat::OnlyUnsent).await
+    }
+
+    /// One request, retried the way `api::Client` retries. `repeat` says what
+    /// may be sent twice: everything (`GET`), or only what provably did not
+    /// reach Portal (`POST`).
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&[u8]>,
+        repeat: Repeat,
+    ) -> Result<Vec<u8>, PortalErr> {
         if self.base.is_empty() {
             return Err(PortalErr::NoUrl);
         }
@@ -1205,9 +1240,12 @@ impl PortalClient {
         loop {
             // A bearer token goes in the header; a session's cookie is added to
             // every request by the client's cookie store, from the stored jar.
-            let mut req = self.http.get(&url).header("Accept", "application/json");
+            let mut req = self.http.request(method.clone(), &url).header("Accept", "application/json");
             if let Credential::Bearer(t) = &self.cred {
                 req = req.header("Authorization", format!("Bearer {}", t));
+            }
+            if let Some(b) = body {
+                req = req.header("Content-Type", "application/json").body(b.to_vec());
             }
             let res = req.send().await;
             let resp = match res {
@@ -1215,7 +1253,12 @@ impl PortalClient {
                 Err(e) => {
                     // A GET that never reached Portal can always be repeated; a
                     // 30 s timeout is the one case where it may have been read.
-                    if attempt >= MAX_ATTEMPTS || !(e.is_connect() || e.is_timeout()) {
+                    // A POST is repeated only when it never left this machine.
+                    let worth_repeating = match repeat {
+                        Repeat::Always => e.is_connect() || e.is_timeout(),
+                        Repeat::OnlyUnsent => e.is_connect(),
+                    };
+                    if attempt >= MAX_ATTEMPTS || !worth_repeating {
                         return Err(PortalErr::Http(e.to_string()));
                     }
                     let d = crate::netx::backoff(attempt);
@@ -1232,7 +1275,13 @@ impl PortalClient {
                 .and_then(|v| v.trim().parse::<u64>().ok());
             let data = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
             if status == 429 || status >= 500 {
-                if attempt >= MAX_ATTEMPTS {
+                // 429 was refused before Portal acted, so a POST may be
+                // repeated like a GET; a 5xx may have been acted on and may not.
+                let worth_repeating = match repeat {
+                    Repeat::Always => true,
+                    Repeat::OnlyUnsent => status == 429,
+                };
+                if !worth_repeating || attempt >= MAX_ATTEMPTS {
                     return Err(PortalErr::Status { status, body: crate::netx::trim_body(&data) });
                 }
                 let d = match retry_after {
