@@ -27,6 +27,14 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  # Pull requests build the packages too, so a packaging change is proven before
+  # it lands — but the release job below can only run for a push to main.
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "egui-ui/Cargo.toml"
+      - ".github/workflows/packager.yml"
+      - "build/icons/**"
   workflow_dispatch:
 
 permissions:
@@ -164,7 +172,8 @@ jobs:
 
   release:
     needs: [version, macos, linux, windows]
-    if: needs.version.outputs.release == 'true'
+    # Only a push to main releases. A pull request builds everything and stops.
+    if: needs.version.outputs.release == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
