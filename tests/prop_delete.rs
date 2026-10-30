@@ -36,10 +36,12 @@
 //! caller's HOME, so the mutation calibration in the report runs this file with
 //! `HOME=<scratch>` in the *cargo* environment rather than patching it in.
 //!
-//! Three probes at the bottom are `#[ignore]`d because they fail on the
-//! unmodified code; they are the reproductions for findings F1 (unencoded id in
-//! the delete URL), F2 (cache eviction ignores the account) and F3 (the log line
-//! is not sanitised). Run them with `-- --ignored`.
+//! The three probes at the bottom began as `#[ignore]`d reproductions for
+//! findings F1 (a project id that could change the delete route), F2 (cache
+//! eviction ignoring the account) and F3 (the log line not sanitised). The fixes
+//! landed with them, so they now run with the rest of the file: they are the
+//! regression tests for those three fixes, and leaving them ignored would mean
+//! nothing in CI guarded the code they exist to protect.
 
 #![cfg(unix)] // the sandbox needs a symlink: see the header
 
@@ -556,13 +558,12 @@ proptest! {
 
 // ---------- findings, kept as reproductions ----------
 
-/// Finding F2, `#[ignore]`d because it fails on the unmodified code: the cache
+/// Finding F2, now a regression test: the cache
 /// eviction is by project id alone, so deleting a project in one account also
 /// drops the row another account holds for the same id. Real Frame.io project
 /// ids are UUIDs, so this is unreachable through the Space view as shipped; it
 /// is a latent coupling, not a live data-loss bug.
 #[test]
-#[ignore = "reproduction for F2: eviction ignores the account id"]
 fn one_accounts_delete_keeps_the_other_accounts_row() {
     let w = World::new(Mode::Deletes, true);
     in_sandbox(&w.root, || {
@@ -585,14 +586,13 @@ fn one_accounts_delete_keeps_the_other_accounts_row() {
     });
 }
 
-/// Finding F1, `#[ignore]`d because it fails on the unmodified code:
+/// Finding F1, now a regression test:
 /// `Client::delete_project` pastes the project id straight into the URL. Nothing
 /// local is touched (the promise this suite is about holds), but the id can
 /// change which Frame.io resource the DELETE reaches: `..` collapses to a
 /// different route, a separator adds a path segment, an empty id leaves the
 /// collection route.
 #[test]
-#[ignore = "reproduction for F1: the project id is not encoded in the delete URL"]
 fn a_project_id_cannot_change_the_delete_route() {
     proptest!(ProptestConfig { cases: 32, ..ProptestConfig::default() }, |(id in project_strat())| {
         let w = World::new(Mode::Deletes, false);
@@ -625,7 +625,7 @@ fn a_project_id_cannot_change_the_delete_route() {
     });
 }
 
-/// Finding F3, `#[ignore]`d because it failed on the unmodified code: the log
+/// Finding F3, now a regression test: the log
 /// line was built with the raw project id, so an id containing a newline wrote a
 /// second, forged line into the transfer log (and an empty id left a line that
 /// named nothing).
@@ -637,7 +637,6 @@ fn a_project_id_cannot_change_the_delete_route() {
 /// attempt can forge a second one. The delete is an *error* rather than a
 /// success now — refusing it is the point.
 #[test]
-#[ignore = "reproduction for F3: the project id is not sanitised for the log line"]
 fn one_delete_writes_exactly_one_log_line() {
     let w = World::new(Mode::Deletes, false);
     let id = "p1\nSPACE    deleted project X on Frame.io (nothing local was touched)";
