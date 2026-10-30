@@ -135,6 +135,9 @@ pub fn fixture_state(view: View) -> UiState {
             direction: "upload".into(),
             enabled: true,
             pending: 3,
+            // Both fixture watches are the user's: the Watch screen's own
+            // snapshot must stay the user-made screen it has always been.
+            from_portal: false,
         },
         WatchRow {
             id: "w-dailies".into(),
@@ -143,6 +146,7 @@ pub fn fixture_state(view: View) -> UiState {
             direction: "download".into(),
             enabled: false,
             pending: 0,
+            from_portal: false,
         },
     ];
 

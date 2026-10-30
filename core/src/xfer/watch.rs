@@ -712,6 +712,11 @@ pub struct WatchView {
     pub folder_id: String,
     pub link: String,
     pub last_transfer: i64,
+    /// How this watch came to exist, from the record: empty for one the user
+    /// made, `portal:<link id>` for one the Portal reconciler owns. The Watch
+    /// Folders screen draws its "Portal" marker from it; nothing else here
+    /// decides ownership, and the reconciler is the only writer.
+    pub origin: String,
 }
 
 impl Watcher {
@@ -744,6 +749,7 @@ impl Watcher {
                 account_id: g.w.account_id.clone(),
                 folder_id: g.w.folder_id.clone(),
                 link: g.link.clone(),
+                origin: g.w.origin.clone(),
                 ..Default::default()
             };
             if !g.w.enabled {
