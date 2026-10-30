@@ -1717,6 +1717,60 @@ mod tests {
         );
     }
 
+    /// `show` is what the shell draws, and on this line a view asks the app for
+    /// things by name: the screen's two `Action`s have to become the two
+    /// `Request`s the shell knows the calls for.
+    fn app_screen(state: UiState) -> Harness<'static, UiState> {
+        Harness::builder()
+            .with_size(vec2(956.0, 780.0))
+            .build_state(
+                |ctx, state: &mut UiState| {
+                    crate::app::apply_style_once(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| show(ui, state));
+                },
+                state,
+            )
+    }
+
+    #[test]
+    fn refresh_asks_the_shell_for_a_walk() {
+        let mut harness = app_screen(state_with(three_projects()));
+
+        harness
+            .get_all_by_label("Refresh")
+            .next()
+            .expect("the head's Refresh")
+            .click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::RefreshSpace),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_confirmed_delete_asks_the_shell_for_the_delete() {
+        let mut harness = app_screen(state_with(three_projects()));
+
+        harness.get_by_label("Delete Nightfall on Frame.io").click();
+        harness.run();
+        harness.run();
+        harness.get_by_label(CONFIRM_DELETE).click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::DeleteProject {
+                account_id: "acct-1".into(),
+                project_id: "proj-nightfall".into(),
+                name: "Nightfall".into(),
+            }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
     #[test]
     fn delete_opens_a_confirmation_that_names_the_project_and_its_size() {
         let (mut harness, seen) = screen(state_with(three_projects()));
