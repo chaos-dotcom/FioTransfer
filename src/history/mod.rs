@@ -1,6 +1,8 @@
 //! Records every transfer in SQLite and in a human-readable monthly log under
 //! ~/Library/Logs/FioTransfer.
 
+#![allow(unsafe_code)] // formats local time with libc::localtime_r
+
 pub mod unfinished;
 pub mod watch;
 

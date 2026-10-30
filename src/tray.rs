@@ -15,6 +15,8 @@
 //! block — the app's handler posts a menu event into the window's event loop
 //! and returns.
 
+#![allow(unsafe_code)] // calls the menu bar shims in mac/tray_darwin.m
+
 use std::ffi::{c_char, c_int, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

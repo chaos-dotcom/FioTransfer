@@ -14,6 +14,8 @@
 //! the work into the app's runtime and return, which keeps the panel
 //! responsive while a link is inspected.
 
+#![allow(unsafe_code)] // calls the download panel shims in mac/quick_darwin.m
+
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

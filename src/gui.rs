@@ -6,6 +6,8 @@
 //! view, in a window with the same size, chrome and background. What changes is
 //! only what answers `window.go.main.App[method]`.
 
+#![allow(unsafe_code)] // calls the AppKit/menu shims in mac/
+
 use std::sync::Arc;
 
 use futures::future::BoxFuture;

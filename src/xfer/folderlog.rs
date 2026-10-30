@@ -1,6 +1,8 @@
 //! The transfer log written next to the media: in the download folder, or in
 //! the folder an upload was taken from.
 
+#![allow(unsafe_code)] // formats local time with libc::localtime_r
+
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

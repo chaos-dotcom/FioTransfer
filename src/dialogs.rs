@@ -13,6 +13,8 @@
 //! that is answered as cancelled rather than waiting for a main queue that
 //! never drains.
 
+#![allow(unsafe_code)] // calls the NSOpenPanel/NSAlert shims in mac/dialogs.m
+
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 extern "C" {

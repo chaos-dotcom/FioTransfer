@@ -12,6 +12,8 @@
 //! called it — the Go app used a goroutine for this, here a host must not block
 //! (it posts a window show and an event into the app's loop and returns).
 
+#![allow(unsafe_code)] // calls the Finder services shim in mac/services_darwin.m
+
 use std::ffi::{c_char, c_int, CStr};
 use std::sync::{Arc, Mutex};
 

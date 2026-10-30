@@ -1,5 +1,7 @@
 //! Is a path on a network volume?
 
+#![allow(unsafe_code)] // asks statfs whether a path is a network volume
+
 /// MNT_LOCAL in <sys/mount.h>.
 const MNT_LOCAL: u32 = 0x1000;
 

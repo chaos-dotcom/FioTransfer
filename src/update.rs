@@ -3,6 +3,8 @@
 //! A release must carry a "-macOS.zip" and a SHA256SUMS.txt (scripts/package.sh
 //! makes both).
 
+#![allow(unsafe_code)] // checks file permissions with libc::access and runs the swap script with pre_exec
+
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Write;

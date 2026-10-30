@@ -4,6 +4,8 @@
 //! the same state: `model.rs` holds what a screen needs to draw, and every view
 //! reads it. Nothing here talks to Frame.io; it is given a [`model::UiState`].
 
+#![forbid(unsafe_code)]
+
 pub mod app;
 pub mod fixture;
 pub mod model;

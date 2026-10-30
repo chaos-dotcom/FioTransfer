@@ -13,6 +13,8 @@
 //! cargo run -p fiotransfer-egui -- --snapshot /tmp/snapshot.json
 //! ```
 
+#![forbid(unsafe_code)]
+
 use fiotransfer_egui::app::apply_style_once;
 use fiotransfer_egui::model::{Snapshot, UiState};
 use fiotransfer_egui::{FioApp, MIN_HEIGHT, MIN_WIDTH, WINDOW_HEIGHT, WINDOW_WIDTH};

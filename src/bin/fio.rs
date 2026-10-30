@@ -8,6 +8,12 @@
 //!   fio up <path>... --account <id> --folder <id>
 //!   fio history [-n 20]
 
+#![deny(unsafe_code)]
+#![allow(unsafe_code)] // asks libc whether stdout is a terminal and whether SIGINT was ignored
+// `unsafe` is allowed only where this app has to call C: the AppKit shims in
+// `mac/` and the handful of `libc` calls listed below. Anywhere else it is a
+// build error, which is the point.
+
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

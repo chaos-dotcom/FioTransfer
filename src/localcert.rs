@@ -5,6 +5,8 @@
 //! accept the localhost certificate it signs. The CA is name-constrained to
 //! localhost, so even its private key can't mint certificates for other sites.
 
+#![allow(unsafe_code)] // reads the hostname with libc::gethostname for the local CA name
+
 use std::path::PathBuf;
 
 use rcgen::{

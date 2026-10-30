@@ -5,6 +5,8 @@
 //! `/usr/bin/open -g <app> --args --hidden`. Nothing here touches AppKit, so it
 //! works from any thread.
 
+#![allow(unsafe_code)] // reads strerror for LaunchAgent write errors
+
 use std::path::{Path, PathBuf};
 
 /// The LaunchAgent's label, and its file name in ~/Library/LaunchAgents.
