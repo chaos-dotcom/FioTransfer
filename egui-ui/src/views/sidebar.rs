@@ -10,8 +10,8 @@
 //! ```text
 //!   0.. 40   `.traffic`   the traffic-light spacer (the webview's window buttons sit there)
 //!  40.. 88   `.brand`     4 px top padding, 26 px mark + 10 px gap + "FioTransfer" (14 px), 18 px below
-//!  88..222   `.nav`       four 32 px items, 2 px apart, 10 px padding and 18 px icon
-//! 222..639   `.grow`      the flexible gap: everything the bottom blocks do not need
+//!  88..256   `.nav`       five 32 px items, 2 px apart, 10 px padding and 18 px icon
+//! 256..639   `.grow`      the flexible gap: everything the bottom blocks do not need
 //! 639..723   `.throughput` 1 px rule, 12 px top, three 17.4 px rows 5 px apart, 10 px bottom
 //! 723..768   `.account`  1 px rule, 12 px top, then the 32 px row (avatar, or the Sign in button)
 //! 768..780   the `.sidebar` bottom padding
@@ -28,7 +28,7 @@
 //! the two speeds are the sum of the per-job speeds by kind, as
 //! `renderSnapshot` computes `up`/`down` — not `snapshot.speed`.
 
-use crate::model::{fmt_speed, UiState, View};
+use crate::model::{Request, UiState, View, fmt_speed};
 use crate::theme;
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2,
@@ -115,7 +115,7 @@ pub struct Layout {
     /// The `.nav` column.
     pub nav: Rect,
     /// One rect per [`View::ALL`] entry, in that order.
-    pub nav_items: [Rect; 4],
+    pub nav_items: [Rect; 5],
     /// The flexible `.grow` between the nav and the bottom blocks.
     pub gap: Rect,
     /// The `.throughput` block, border included.
@@ -166,13 +166,13 @@ pub fn layout_with(rect: Rect, account_row_h: f32) -> Layout {
     );
 
     let nav_top = brand.bottom();
-    let nav_items: [Rect; 4] = std::array::from_fn(|i| {
+    let nav_items: [Rect; 5] = std::array::from_fn(|i| {
         Rect::from_min_size(
             pos2(x, nav_top + i as f32 * (NAV_H + NAV_GAP)),
             vec2(w, NAV_H),
         )
     });
-    let nav_bottom = nav_items[3].bottom();
+    let nav_bottom = nav_items[4].bottom();
     let nav = Rect::from_min_max(pos2(x, nav_top), pos2(x + w, nav_bottom));
 
     // The bottom blocks are anchored to the bottom of the panel.
@@ -298,7 +298,7 @@ fn brand(painter: &egui::Painter, l: &Layout) {
     );
 }
 
-/// `.nav`: four items, each with its SVG icon, its label and — Transfers and
+/// `.nav`: five items, each with its SVG icon, its label and — Transfers and
 /// Watch Folders only — the brand-coloured count badge.
 fn nav(ui: &mut egui::Ui, painter: &egui::Painter, l: &Layout, state: &mut UiState) {
     for (i, view) in View::ALL.iter().enumerate() {
@@ -535,12 +535,9 @@ fn account(ui: &mut egui::Ui, painter: &egui::Painter, l: &Layout, state: &mut U
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         if response.clicked() {
-            // The webview starts the Frame.io OAuth flow (`login()`); this front
-            // end has no OAuth yet, so say so instead of doing nothing.
-            state.push_toast(
-                "Sign in is not wired up in the egui front end yet",
-                crate::model::ToastKind::Info,
-            );
+            // `$$('#signin-btn, #cta-signin, #side-signin').onclick = login()`: the
+            // app runs the Frame.io OAuth flow and the shell says where it stands.
+            state.ask(Request::Login);
         }
 
         painter.rect_filled(row, theme::R_S, theme::CARD);
@@ -569,7 +566,8 @@ fn nav_badge(state: &UiState, view: View) -> Option<i64> {
     match view {
         View::Transfers => Some(state.active_jobs() as i64),
         View::Watch => Some(state.watches.iter().filter(|w| w.enabled).count() as i64),
-        View::History | View::Settings => None,
+        // Space, History and Settings carry no count in the design.
+        View::Space | View::History | View::Settings => None,
     }
 }
 
@@ -653,19 +651,22 @@ fn elide(painter: &egui::Painter, text: &str, font_id: &FontId, max_w: f32) -> S
     out
 }
 
-/// The four nav icons and the brand glyph, as the SVG paths in `index.html`
+/// The five nav icons and the brand glyph, as the SVG paths in `index.html`
 /// (`viewBox="0 0 20 20"`, drawn in a rect of the icon's size).
 #[derive(Clone, Copy)]
 enum Icon {
     Arrows,
     Eye,
     Clock,
+    /// The Space donut (`#view-space`'s nav item).
+    Pie,
     Sliders,
 }
 
 fn icon_for(view: View) -> Icon {
     match view {
         View::Transfers => Icon::Arrows,
+        View::Space => Icon::Pie,
         View::Watch => Icon::Eye,
         View::History => Icon::Clock,
         View::Settings => Icon::Sliders,
@@ -688,6 +689,14 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, st
             polyline(painter, &[p(13.5, 5.0), p(13.5, 15.0)], stroke);
             polyline(painter, &[p(13.5, 15.0), p(10.8, 12.3)], stroke);
             polyline(painter, &[p(13.5, 15.0), p(16.2, 12.3)], stroke);
+        }
+        // The Space mark, from `index.html`: `<circle r=6.6>`, `<circle r=2.4>`
+        // and two ticks, `M10 3.4v4.2M16.6 10h-4.2` — a donut seen end on.
+        Icon::Pie => {
+            painter.circle_stroke(p(10.0, 10.0), 6.6 * scale, stroke);
+            painter.circle_stroke(p(10.0, 10.0), 2.4 * scale, stroke);
+            polyline(painter, &[p(10.0, 3.4), p(10.0, 7.6)], stroke);
+            polyline(painter, &[p(16.6, 10.0), p(12.4, 10.0)], stroke);
         }
         // "M2.5 10s2.7-5 7.5-5 7.5 5 7.5 5-2.7 5-7.5 5-7.5-5-7.5-5z" + circle 2.2
         Icon::Eye => {
@@ -766,6 +775,7 @@ fn polyline(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
 mod tests {
     use super::*;
     use crate::model::{JobView, Snapshot, User, WatchRow};
+    use fiotransfer_core::xfer::Status;
     use egui_kittest::{Harness, kittest::Queryable as _};
 
     const PANEL_H: f32 = 780.0;
@@ -773,7 +783,7 @@ mod tests {
     fn job(
         kind: &str,
         title: &str,
-        status: &str,
+        status: Status,
         total: i64,
         done: i64,
         speed: f64,
@@ -782,7 +792,7 @@ mod tests {
             id: title.to_owned(),
             kind: kind.to_owned(),
             title: title.to_owned(),
-            status: status.to_owned(),
+            status,
             total,
             done,
             speed,
@@ -798,14 +808,15 @@ mod tests {
             view: View::Transfers,
             logged_in: true,
             user: Some(User {
+                id: "u-dana".into(),
                 name: "Dana Okonkwo".into(),
                 email: "dana@fiorecut.tv".into(),
             }),
             snapshot: Snapshot {
                 jobs: vec![
-                    job("upload", "A001_C012_0714XY.mov", "running", 412_000_000, 168_000_000, 24_500_000.0),
-                    job("download", "Dailies 2026-10-24", "running", 2_100_000_000, 640_000_000, 8_200_000.0),
-                    job("upload", "B-roll select.mov", "done", 90_000_000, 90_000_000, 0.0),
+                    job("upload", "A001_C012_0714XY.mov", Status::Running, 412_000_000, 168_000_000, 24_500_000.0),
+                    job("download", "Dailies 2026-10-24", Status::Running, 2_100_000_000, 640_000_000, 8_200_000.0),
+                    job("upload", "B-roll select.mov", Status::Done, 90_000_000, 90_000_000, 0.0),
                 ],
                 speed: 32_700_000.0,
                 active_streams: 6,
@@ -813,18 +824,32 @@ mod tests {
             },
             watches: vec![
                 WatchRow {
+                    id: "w-incoming".into(),
                     local: "~/Movies/Incoming".into(),
                     label: "Incoming".into(),
                     direction: "upload".into(),
                     enabled: true,
                     pending: 0,
+                    from_portal: false,
+                    duplex_id: None,
+                    lane: crate::model::Lane::None,
+                    account_id: "acct-fiorecut".into(),
+                    folder_id: "fld-incoming".into(),
+                    on_change: "overwrite".into(),
                 },
                 WatchRow {
+                    id: "w-archive".into(),
                     local: "~/Movies/Archive".into(),
                     label: "Archive".into(),
                     direction: "download".into(),
                     enabled: false,
                     pending: 3,
+                    from_portal: false,
+                    duplex_id: None,
+                    lane: crate::model::Lane::None,
+                    account_id: "acct-fiorecut".into(),
+                    folder_id: "fld-archive".into(),
+                    on_change: "overwrite".into(),
                 },
             ],
             ..Default::default()
@@ -890,7 +915,8 @@ mod tests {
         for pair in l.nav_items.windows(2) {
             assert_eq!(pair[1].top() - pair[0].top(), 32.0 + 2.0);
         }
-        assert_eq!(l.nav.bottom(), l.nav_items[3].bottom());
+        assert_eq!(l.nav.bottom(), l.nav_items[4].bottom());
+        assert_eq!(l.nav_items.len(), View::ALL.len(), "one item per screen");
 
         // The account row is the last 32 px above the 12 px bottom padding.
         assert_eq!(l.account.bottom(), PANEL_H - PAD_BOTTOM);
@@ -1004,6 +1030,8 @@ mod tests {
         // Two watches, one enabled (`list.filter((w) => w.enabled).length`).
         assert_eq!(nav_badge(&state, View::Watch), Some(1));
         assert_eq!(nav_badge(&state, View::History), None);
+        // Space carries no count: it is a measurement, not a queue.
+        assert_eq!(nav_badge(&state, View::Space), None);
         assert_eq!(nav_badge(&UiState::default(), View::Transfers), Some(0));
         assert_eq!(nav_badge(&UiState::default(), View::Watch), Some(0));
     }
@@ -1036,6 +1064,10 @@ mod tests {
         harness.run();
         assert_eq!(harness.state().view, View::Watch);
 
+        harness.get_by_label("Space").click();
+        harness.run();
+        assert_eq!(harness.state().view, View::Space);
+
         harness.get_by_label("Settings").click();
         harness.run();
         assert_eq!(harness.state().view, View::Settings);
@@ -1055,10 +1087,13 @@ mod tests {
     }
 
     #[test]
-    fn the_sign_in_button_says_it_is_not_wired_up() {
+    fn the_sign_in_button_asks_the_app_to_sign_in() {
         let mut harness = harness(UiState::default());
         harness.get_by_label("Sign in to Frame.io").click();
         harness.run();
-        assert!(!harness.state().toasts.is_empty());
+        // `login()` is one request to the shell, and no toast of its own: the app
+        // says where the sign-in stands.
+        assert_eq!(harness.state().requests, vec![Request::Login]);
+        assert!(harness.state().toasts.is_empty());
     }
 }

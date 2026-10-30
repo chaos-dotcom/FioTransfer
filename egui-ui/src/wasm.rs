@@ -27,6 +27,8 @@
 //!   frames drawn so far. `bench/wasm-shots.sh` waits for a few frames.
 //! * `document.body` carries `data-fio-error="<message>"` if startup failed, and
 //!   the same message is written to the console and into the page.
+#![forbid(unsafe_code)]
+
 #![cfg(target_arch = "wasm32")]
 
 use eframe::wasm_bindgen::prelude::*;
@@ -92,6 +94,7 @@ impl Options {
 fn view_from_param(value: &str) -> Option<View> {
     match value.to_ascii_lowercase().as_str() {
         "transfers" => Some(View::Transfers),
+        "space" => Some(View::Space),
         "watch" => Some(View::Watch),
         "history" => Some(View::History),
         "settings" => Some(View::Settings),

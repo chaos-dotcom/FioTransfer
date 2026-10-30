@@ -8,11 +8,21 @@
 //! "Change…", "Save log with media", "App log" + "Show in Finder"), then the
 //! `.about` line.
 //!
+//! Below them is a fifth section the webview never had: **Portal**, the service
+//! that publishes this project's links and names the `Live_Work` folder each one
+//! belongs to. It is four settings (`App::set_portal` writes them: the address,
+//! the local folder, the on/off flag and — to the keychain, never to
+//! settings.json — the bearer token), one status line from `App::portal_status`,
+//! and a "Reconcile now". Two credentials get in: a pasted access token, or
+//! Portal's own sign-in ("Sign in instead", `App::portal_sign_in`), whose session
+//! cookie is kept and whose password is not. It draws with the same rows as
+//! everything above it: no new colour, no new font, no new height.
+//!
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`]. `.settings
 //! { max-width: 680px }` is applied here because it is this screen's own measure.
 
-use crate::model::UiState;
+use crate::model::{PortalView, Request, Secret, UiState};
 use crate::theme;
 use egui::{
     Align, Checkbox, CollapsingHeader, Color32, ComboBox, CornerRadius, Frame, Layout, Margin,
@@ -42,15 +52,16 @@ const CHECK_ROW_CONTROL: f32 = 19.0;
 /// draws the round handle without clipping it.
 const SLIDER_CONTROL: f32 = 10.0;
 
-/// `#streams-range { min="1" max="64" }`, widened to 1–128 by the brief.
-const STREAMS_MIN: i64 = 1;
-const STREAMS_MAX: i64 = 128;
+/// `#streams-range { min="1" max="64" }`, widened to 1–128 by the brief. The
+/// core's `Settings` counts streams and segments in `i32`.
+const STREAMS_MIN: i32 = 1;
+const STREAMS_MAX: i32 = 128;
 /// `#segment option` values, widened to 8–512 MiB by the brief.
-const SEGMENT_SIZES: [i64; 7] = [8, 16, 32, 64, 128, 256, 512];
-const SEGMENT_MIN: i64 = 8;
-const SEGMENT_MAX: i64 = 512;
+const SEGMENT_SIZES: [i32; 7] = [8, 16, 32, 64, 128, 256, 512];
+const SEGMENT_MIN: i32 = 8;
+const SEGMENT_MAX: i32 = 512;
 /// The port the local OAuth callback listens on when settings say nothing.
-const DEFAULT_REDIRECT_PORT: i64 = 8765;
+const DEFAULT_REDIRECT_PORT: i32 = 8765;
 
 /// What the screen asks the shell to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,10 +76,10 @@ pub enum Action {
     CopyRedirect(String),
     /// "Change…" for the download folder (`PickDownloadDir`).
     ChooseDownloadFolder,
-    /// The streams slider moved; the shell may debounce and save.
-    Streams(i64),
-    /// "Chunk size" picked a value.
-    Segment(i64),
+    /// The streams slider moved; `settings.streams` already holds the value.
+    Streams(i32),
+    /// "Chunk size" picked a value; `settings.segment_mb` already holds it.
+    Segment(i32),
     /// "Save log with media": the value of `no_folder_logs` it writes.
     FolderLogs(bool),
     /// "Check for updates": the value of `no_update_check` it writes.
@@ -79,11 +90,78 @@ pub enum Action {
     UpdateClicked,
     /// "Show in Finder" on the App log row (`OpenLogs`).
     ShowLogs,
+
+    /// The Portal address, committed from its field on Enter or focus loss. It
+    /// has already passed [`portal_url_reason`]: a refused value never gets here.
+    SetPortalUrl(String),
+    /// The local folder Portal's markers are mirrored under.
+    SetPortalRoot(String),
+    /// "Save" next to the access token: the token, on its way to the keychain.
+    SavePortalToken(Secret),
+    /// "Forget" next to the access token.
+    ForgetPortalToken,
+    /// "Sign in" next to the email and the password: Portal's own login, with
+    /// the password on its way to the app as a [`Secret`].
+    SignInPortal { email: String, password: Secret },
+    /// "Sign in" next to the one-time code: the six digits that finish the
+    /// sign-in the password started.
+    SignInPortalTotp { code: Secret },
+    /// "Sign out" of the stored Portal session.
+    SignOutPortal,
+    /// The "Enabled" toggle.
+    SetPortalEnabled(bool),
+    /// "Reconcile now".
+    ReconcileNow,
 }
 
-/// The screen, for a shell that does not wire the actions yet.
+/// The screen, wired to the app: whatever [`show_with_actions`] reports is
+/// handed to the shell as a [`Request`].
 pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
-    let _ = show_with_actions(ui, state);
+    if let Some(action) = show_with_actions(ui, state) {
+        ask(state, action);
+    }
+}
+
+/// Hands one [`Action`] to the app, in the app's terms.
+///
+/// A setting is written into `state.settings` by the row that draws it, so the
+/// request only says "save this": the app reads the same struct the screen just
+/// wrote. `Update` and `Check now` are one button, and the update state says
+/// which of the two it is.
+fn ask(state: &mut UiState, action: Action) {
+    match action {
+        Action::SignIn => state.ask(Request::Login),
+        Action::SignOut => state.ask(Request::Logout),
+        Action::SaveClientId(client_id) => {
+            state.settings.client_id = client_id;
+            state.ask(Request::SaveSettings);
+        }
+        Action::CopyRedirect(uri) => state.ask(Request::CopyText(uri)),
+        Action::ChooseDownloadFolder => state.ask(Request::PickDownloadDir),
+        Action::Streams(_) | Action::Segment(_) | Action::FolderLogs(_) | Action::UpdateCheck(_) => {
+            state.ask(Request::SaveSettings)
+        }
+        Action::OpenAtLogin(on) => state.ask(Request::SetOpenAtLogin(on)),
+        Action::UpdateClicked => {
+            if state.update.available {
+                state.ask(Request::InstallUpdate);
+            } else {
+                state.ask(Request::CheckUpdate);
+            }
+        }
+        Action::ShowLogs => state.ask(Request::OpenLogs),
+        Action::SetPortalUrl(url) => state.ask(Request::SetPortalUrl(url)),
+        Action::SetPortalRoot(root) => state.ask(Request::SetPortalRoot(root)),
+        Action::SavePortalToken(token) => state.ask(Request::SetPortalToken(token)),
+        Action::ForgetPortalToken => state.ask(Request::ForgetPortalToken),
+        Action::SignInPortal { email, password } => {
+            state.ask(Request::SignInPortal { email, password })
+        }
+        Action::SignInPortalTotp { code } => state.ask(Request::SignInPortalTotp { code }),
+        Action::SignOutPortal => state.ask(Request::SignOutPortal),
+        Action::SetPortalEnabled(on) => state.ask(Request::SetPortalEnabled(on)),
+        Action::ReconcileNow => state.ask(Request::PortalReconcile),
+    }
 }
 
 /// The screen, reporting at most one [`Action`] per frame.
@@ -154,6 +232,33 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
         });
         ui.add_space(SECTION_GAP);
 
+        // ---------- Portal ----------
+        section_title(ui, "Portal");
+        ui.add_space(CARD_GAP);
+        card(ui, |ui| {
+            portal_url_line(ui, state, &mut action);
+            rule(ui);
+            portal_token_line(ui, state, &mut action);
+            rule(ui);
+            portal_signin_line(ui, state, &mut action);
+            // While Portal waits for a one-time code the row above is only half
+            // the sign-in; this row is the other half, and it is drawn only
+            // then.
+            if state.portal.status.needs_code {
+                rule(ui);
+                portal_totp_line(ui, state, &mut action);
+            }
+            rule(ui);
+            portal_root_line(ui, state, &mut action);
+            rule(ui);
+            portal_enabled_line(ui, state, &mut action);
+            rule(ui);
+            portal_status_line(ui, state);
+            rule(ui);
+            portal_reconcile_line(ui, state, &mut action);
+        });
+        ui.add_space(SECTION_GAP);
+
         // `.about`: `FioTransfer <version>`, 12 px in `--text-4`.
         if !state.version.trim().is_empty() {
             ui.label(
@@ -170,17 +275,17 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
 
 /// A stored value clamped to the slider's range, so an out-of-range setting is
 /// shown at the nearest end instead of being dropped.
-pub fn clamped_streams(streams: i64) -> i64 {
+pub fn clamped_streams(streams: i32) -> i32 {
     streams.clamp(STREAMS_MIN, STREAMS_MAX)
 }
 
 /// A stored segment size clamped to the sizes the combo offers.
-pub fn clamped_segment(segment_mb: i64) -> i64 {
+pub fn clamped_segment(segment_mb: i32) -> i32 {
     segment_mb.clamp(SEGMENT_MIN, SEGMENT_MAX)
 }
 
 /// The redirect URI the setup steps ask the user to register.
-pub fn redirect_uri(port: i64) -> String {
+pub fn redirect_uri(port: i32) -> String {
     let port = if (1..=65535).contains(&port) {
         port
     } else {
@@ -691,6 +796,611 @@ pub fn short_path(path: &str, home: &str) -> String {
     }
 }
 
+// ---------- Portal ----------
+
+/// The address field's placeholder: what an address looks like, not a default.
+const PORTAL_URL_HINT: &str = "https://portal.example.com";
+/// The folder field's placeholder: `Settings::PORTAL_ROOT_DIR` under `HOME`, in
+/// the words the field can take back (`Settings::portal_root_path` expands it).
+const PORTAL_ROOT_HINT: &str = "~/Live_Work";
+/// The token field's placeholder. The field never shows the stored token, so an
+/// empty field says which of the two states it is in instead.
+const TOKEN_STORED: &str = "stored in your keychain";
+const TOKEN_MISSING: &str = "not set";
+/// The sign-in row's two placeholders: what an admin address looks like, and a
+/// password field that says nothing about the password it is waiting for.
+const PORTAL_EMAIL_HINT: &str = "admin@example.com";
+const PORTAL_PASSWORD_HINT: &str = "your Portal password";
+/// A one-time code is six digits (RFC 6238, a 30 s step): Portal's own login
+/// asks for exactly that, so the field takes exactly that.
+const TOTP_DIGITS: usize = 6;
+/// The code field's placeholder, which is the whole instruction it needs.
+const PORTAL_CODE_HINT: &str = "6 digits";
+/// What the code row says under its field: which code, and the promise that it
+/// is not kept.
+const PORTAL_CODE_NOTE: &str =
+    "Six digits from your authenticator app, to finish this sign-in. The code is not stored.";
+/// What the sign-in row says under its fields: the one promise the row makes.
+const PASSWORD_NOTE: &str =
+    "The password is not stored: only Portal's session cookie is, in your keychain.";
+/// The same line while the POST is out.
+const SIGNING_IN: &str = "Signing in…";
+/// What the address field says when it refuses a value.
+const PORTAL_URL_REASON: &str = "The Portal address has to start with http:// or https://";
+
+/// Why this Portal address cannot be used, or `None` when it can.
+///
+/// `App::set_portal` refuses the same two things — no `http://` / `https://`, or
+/// a scheme with nothing after it — but this decides before the write, so a
+/// refused address is never the one in `settings.json`. An empty address is
+/// allowed: it is how Portal is switched off.
+pub fn portal_url_reason(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let rest = match url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+        Some(rest) => rest,
+        None => return Some(PORTAL_URL_REASON.to_string()),
+    };
+    if rest.trim_matches('/').is_empty() {
+        return Some("The Portal address has no host after the scheme".to_string());
+    }
+    if rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("The Portal address has a space or a control character in it".to_string());
+    }
+    None
+}
+
+/// Why this local folder cannot be used, or `None` when it can.
+///
+/// Empty means "the default", which is `~/Live_Work`. The disk root is refused
+/// here because `Settings::normalize` would silently replace it: a setting that
+/// cannot be saved is better refused out loud.
+pub fn portal_root_reason(root: &str) -> Option<String> {
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    if root == "/" {
+        return Some("The whole disk is not a Portal folder".to_string());
+    }
+    if !root.starts_with('/') && !root.starts_with('~') {
+        return Some("Enter an absolute path, or one starting with ~".to_string());
+    }
+    if root.chars().any(|c| c.is_control()) {
+        return Some("The folder has a control character in it".to_string());
+    }
+    None
+}
+
+/// `~/Live_Work` with the home expanded: the absolute path Portal's folders are
+/// actually created under.
+///
+/// The same expansion as `Settings::portal_root_path`, in strings: the browser
+/// capture has no core `Settings` to ask, and the row has to show the resolved
+/// path either way.
+pub fn resolved_portal_root(root: &str, home: &str) -> String {
+    let home = home.trim().trim_end_matches('/');
+    let root = root.trim();
+    let root = if root.is_empty() { format!("{home}/Live_Work") } else { root.to_string() };
+    match root.strip_prefix('~') {
+        Some(rest) if rest.is_empty() => home.to_string(),
+        Some(rest) => match rest.strip_prefix('/') {
+            Some(rest) => format!("{home}/{rest}"),
+            // `~someone/x` is not this user's home: taken as given.
+            None => root,
+        },
+        None => root,
+    }
+}
+
+/// One number with its word: `1 link`, `4 links`.
+fn counted(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// How long ago the last reconcile ran, in the words a status line can carry.
+///
+/// `at` and `now` are unix milliseconds. A clock that went backwards (or a
+/// report stamped a moment in the future) is "just now", not a negative age.
+pub fn portal_when(at: i64, now: i64) -> String {
+    if at <= 0 {
+        return "never".to_string();
+    }
+    let secs = ((now - at).max(0)) / 1000;
+    let ago = |n: i64, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one} ago")
+        } else {
+            format!("{n} {many} ago")
+        }
+    };
+    match secs {
+        0..=4 => "just now".to_string(),
+        5..=59 => "under a minute ago".to_string(),
+        60..=3599 => ago(secs / 60, "min", "min"),
+        3600..=86_399 => ago(secs / 3600, "h", "h"),
+        _ => ago(secs / 86_400, "day", "days"),
+    }
+}
+
+/// The status line: one sentence, and whether it is bad news.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalLine {
+    pub text: String,
+    /// The last reconcile failed, so the line is drawn in the error colour and
+    /// says so: it must never read as a success.
+    pub failed: bool,
+}
+
+/// What the status line says, from the last status the app gave.
+///
+/// The order matters: "not set up" and "no token" are the reasons a reconcile
+/// cannot run at all, so they come before the numbers; and a failed run says
+/// "Failed" with its reason and no numbers, because a report that failed has
+/// none to show.
+pub fn portal_line(status: &PortalView) -> PortalLine {
+    let line = |text: String, failed: bool| PortalLine { text, failed };
+    let url = status.url.trim();
+    if url.is_empty() {
+        return if status.signed_in {
+            line("No Portal address yet: add one above.".to_string(), true)
+        } else {
+            line("Not set up: no Portal address and no token yet.".to_string(), false)
+        };
+    }
+    if !status.signed_in {
+        return line(
+            "Not signed in yet: save an access token above, or sign in below.".to_string(),
+            true,
+        );
+    }
+    if !status.error.trim().is_empty() {
+        let when = portal_when(status.last_at, status.now_ms);
+        return line(format!("Failed {when}: {}", status.error.trim()), true);
+    }
+    if status.running {
+        return line("Reconciling…".to_string(), false);
+    }
+    if status.last_at <= 0 {
+        // Nothing has run yet, so say what to press and whether the background
+        // poller is even on — a signed-in card that stays silent looks broken.
+        return line(
+            if status.enabled {
+                "Configured. Nothing has run yet: press Reconcile now.".to_string()
+            } else {
+                "Configured. Press Reconcile now, or switch it on to check every 30 s.".to_string()
+            },
+            false,
+        );
+    }
+    let mut text = format!(
+        "{} · {}, {} kept in step, {} removed",
+        portal_when(status.last_at, status.now_ms),
+        counted(status.links_seen, "link", "links"),
+        counted(status.ensured, "folder", "folders"),
+        status.removed
+    );
+    if status.skipped > 0 {
+        text.push_str(&format!(", {}", counted(status.skipped, "skipped", "skipped")));
+    }
+    line(text, false)
+}
+
+/// `.input` as the Client ID field draws it: the surface fill, 10 px either
+/// side, the full width it is given.
+fn portal_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::Response {
+    let width = ui.available_width();
+    ui.scope(|ui| {
+        ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+        ui.add(
+            TextEdit::singleline(text)
+                .hint_text(hint)
+                .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                .desired_width(width),
+        )
+    })
+    .inner
+}
+
+/// `.help`: 12 px, `--text-3`, one line, the whole words on hover.
+fn help_line(ui: &mut egui::Ui, text: &str) {
+    ui.add(theme::truncating(
+        RichText::new(text)
+            .font(theme::detail())
+            .line_height(Some(HELP_LINE))
+            .color(theme::TEXT_3),
+    ))
+    .on_hover_text(text);
+}
+
+/// The same line, for something the user has to read and fix.
+fn reason_line(ui: &mut egui::Ui, text: &str) {
+    ui.add(theme::truncating(
+        RichText::new(text)
+            .font(theme::detail())
+            .line_height(Some(HELP_LINE))
+            .color(theme::ERROR_TEXT),
+    ))
+    .on_hover_text(text);
+}
+
+/// "Server URL": a field committed on Enter or on focus loss, with the reason
+/// under it when the value is refused.
+fn portal_url_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let mut text = state.portal.url_draft.clone().unwrap_or_else(|| state.settings.portal_url.clone());
+    line(ui, |ui| {
+        let label = field_label(ui, "Server URL");
+        ui.add_space(theme::space::M);
+        // `label for=` as the webview has it: the field is named by the words
+        // above it, for a screen reader and for this screen's own tests.
+        let response = portal_field(ui, &mut text, PORTAL_URL_HINT).labelled_by(label.id);
+        if response.changed() {
+            // Typing is not a commit: the setting waits for Enter or for the
+            // field to lose focus.
+            state.portal.url_draft = Some(text.clone());
+            state.portal.url_error = None;
+        }
+        if response.lost_focus() {
+            match portal_url_reason(&text) {
+                None => {
+                    let url = text.trim().trim_end_matches('/').to_string();
+                    state.settings.portal_url = url.clone();
+                    state.portal.url_draft = None;
+                    state.portal.url_error = None;
+                    *action = Some(Action::SetPortalUrl(url));
+                }
+                Some(reason) => {
+                    // Not saved: the field keeps what was typed so it can be
+                    // fixed, and the setting keeps the value already there.
+                    state.portal.url_draft = Some(text.clone());
+                    state.portal.url_error = Some(reason);
+                }
+            }
+        }
+        ui.add_space(theme::space::XXS);
+        match state.portal.url_error.clone() {
+            Some(reason) => reason_line(ui, &reason),
+            None => help_line(ui, "Leave the address empty to switch Portal off."),
+        }
+    });
+}
+
+/// "Access token": a password field, "Save" and "Forget".
+///
+/// The field is emptied by the shell once the token is stored, so nothing on
+/// screen ever holds the token: what is drawn is the mask egui puts over
+/// whatever is being typed.
+fn portal_token_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let stored = state.portal.status.signed_in;
+    let typed = !state.portal.token_draft.trim().is_empty();
+    line(ui, |ui| {
+        let label = field_label(ui, "Access token");
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            // Right to left, so "Save" sits on the card's edge and the field
+            // takes what is left, exactly as the Client ID row does.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let save = ui
+                    .add_enabled(
+                        typed,
+                        egui::Button::new(RichText::new("Save").font(theme::body()))
+                            .min_size(vec2(0.0, theme::size::CONTROL_H)),
+                    )
+                    .clicked();
+                let forget = ui
+                    .add_enabled(
+                        stored,
+                        egui::Button::new(RichText::new("Forget").font(theme::body()))
+                            .min_size(vec2(0.0, theme::size::CONTROL_H)),
+                    )
+                    .clicked();
+                let field_width = (ui.available_width() - 2.0 * theme::space::L).max(60.0);
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+                    ui.add(
+                        TextEdit::singleline(&mut state.portal.token_draft)
+                            .password(true)
+                            .hint_text(if stored { TOKEN_STORED } else { TOKEN_MISSING })
+                            .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                            .desired_width(field_width),
+                    )
+                    .labelled_by(label.id);
+                });
+                if save {
+                    let token = state.portal.token_draft.trim().to_string();
+                    if !token.is_empty() {
+                        *action = Some(Action::SavePortalToken(Secret::new(token)));
+                    }
+                }
+                if forget {
+                    *action = Some(Action::ForgetPortalToken);
+                }
+            });
+        });
+        ui.add_space(theme::space::XXS);
+        if stored {
+            help_line(ui, "A token is stored in your keychain, never in settings.json.");
+        } else {
+            help_line(ui, "No token is stored yet. Paste one and press Save.");
+        }
+    });
+}
+
+/// "Sign in instead": Portal's own login, under the access token.
+///
+/// A bearer token is one way in and this is the other one: the admin's email,
+/// the password, and Portal answers with a session cookie. The password is
+/// masked, and it is kept nowhere — the note under the row says so and the
+/// shell empties the draft the moment the answer lands, whichever way it went.
+///
+/// A stored session names its admin ("Signed in as …") and offers "Sign out"
+/// instead of the two fields; opening the fields again would only ask for a
+/// password beside the session that already works.
+fn portal_signin_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    // Portal's own name for the session comes first: it is Portal's answer, not
+    // the address anybody typed, and it is empty for a bearer token.
+    let signed_in_as = state.portal.status.email.trim().to_string();
+    if !signed_in_as.is_empty() {
+        // The label on the left, "Sign out" on the card's edge, and who it is
+        // underneath — the shape the "Enabled" row has.
+        let words = format!("Signed in as {signed_in_as}");
+        line(ui, |ui| {
+            ui.horizontal(|ui| {
+                field_label(ui, "Sign in instead");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if secondary_button_enabled(ui, "Sign out", true) {
+                        *action = Some(Action::SignOutPortal);
+                    }
+                });
+            });
+            ui.add_space(theme::space::XXS);
+            help_line(ui, &words);
+        });
+        return;
+    }
+
+    // The field starts on the address the last sign-in saved. What is typed is
+    // what gets posted, so a field somebody emptied stays empty.
+    let mut email = if state.portal.email_draft.is_empty() {
+        state.settings.portal_email.clone()
+    } else {
+        state.portal.email_draft.clone()
+    };
+    let signing_in = state.portal.signing_in;
+    let ready = !email.trim().is_empty()
+        && !state.portal.password_draft.is_empty()
+        && !signing_in;
+    line(ui, |ui| {
+        let label = field_label(ui, "Sign in instead");
+        ui.add_space(theme::space::M);
+        let field = portal_field(ui, &mut email, PORTAL_EMAIL_HINT).labelled_by(label.id);
+        if field.changed() {
+            // An email is not a secret, and a typo is worth keeping to be fixed.
+            state.portal.email_draft = email.clone();
+            state.portal.signin_error = None;
+        }
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            // Right to left, as the token row has it: "Sign in" on the card's
+            // edge, the masked field taking what is left.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let pressed = primary_button(ui, "Sign in", ready);
+                let field_width = (ui.available_width() - theme::space::XXXL).max(60.0);
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+                    // Named by its hint, the way the composer's passphrase field
+                    // is: one row, one name above it, and the field says what it
+                    // wants inside itself.
+                    ui.add(
+                        TextEdit::singleline(&mut state.portal.password_draft)
+                            .password(true)
+                            .hint_text(PORTAL_PASSWORD_HINT)
+                            .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                            .desired_width(field_width),
+                    );
+                });
+                if pressed {
+                    let email = email.trim().to_string();
+                    let password = state.portal.password_draft.clone();
+                    if !email.is_empty() && !password.is_empty() {
+                        *action = Some(Action::SignInPortal {
+                            email,
+                            password: Secret::new(password),
+                        });
+                    }
+                }
+            });
+        });
+        ui.add_space(theme::space::XXS);
+        match state.portal.signin_error.clone() {
+            // The app's own sentence, where the note was: a refused sign-in has
+            // something to say and the note does not.
+            Some(reason) => reason_line(ui, &reason),
+            None if signing_in => help_line(ui, SIGNING_IN),
+            None => help_line(ui, PASSWORD_NOTE),
+        }
+    });
+}
+
+/// "One-time code": the six digits that finish a sign-in Portal asked a second
+/// factor for.
+///
+/// The row is drawn only while the app reports `needs_code`, which is one
+/// password step away from the fields above it: Portal took the email and the
+/// password, and the same session is waiting for this. It goes away — and the
+/// digits with it — the moment the code is answered, either way.
+///
+/// The digits are not masked: six of them, read back against the phone that
+/// shows them, is exactly what the row is for. They are still a [`Secret`] on
+/// their way to the app, and the draft is emptied as soon as the answer lands.
+fn portal_totp_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let signing_in = state.portal.signing_in;
+    let ready = state.portal.code_draft.trim().len() == TOTP_DIGITS && !signing_in;
+    line(ui, |ui| {
+        let label = field_label(ui, "One-time code");
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            // Right to left, as the two rows above have it: "Sign in" on the
+            // card's edge, the field taking what is left.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let pressed = primary_button(ui, "Sign in", ready);
+                let field_width = (ui.available_width() - theme::space::XXXL).max(60.0);
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+                    let field = ui.add(
+                        TextEdit::singleline(&mut state.portal.code_draft)
+                            .hint_text(PORTAL_CODE_HINT)
+                            .char_limit(TOTP_DIGITS)
+                            .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                            .desired_width(field_width),
+                    );
+                    field.labelled_by(label.id);
+                });
+                if pressed {
+                    let code = state.portal.code_draft.trim().to_string();
+                    if code.len() == TOTP_DIGITS {
+                        *action = Some(Action::SignInPortalTotp { code: Secret::new(code) });
+                    }
+                }
+            });
+        });
+        // A code is six digits: anything else typed or pasted — a space, a dash,
+        // a letter from a copied "123 456" — is dropped rather than sent.
+        let digits: String = state.portal.code_draft.chars().filter(|c| c.is_ascii_digit()).collect();
+        state.portal.code_draft = digits;
+        ui.add_space(theme::space::XXS);
+        match state.portal.code_error.clone() {
+            // Portal's own sentence: a wrong code and a sign-in that must start
+            // again do not read the same.
+            Some(reason) => reason_line(ui, &reason),
+            None if signing_in => help_line(ui, SIGNING_IN),
+            None => help_line(ui, PORTAL_CODE_NOTE),
+        }
+    });
+}
+
+/// "Local folder": the folder the marker names go under, with the absolute path
+/// it resolves to beneath it.
+fn portal_root_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let mut text = state.portal.root_draft.clone().unwrap_or_else(|| state.settings.portal_root.clone());
+    let home = state.home.clone();
+    line(ui, |ui| {
+        let label = field_label(ui, "Local folder");
+        ui.add_space(theme::space::M);
+        let response = portal_field(ui, &mut text, PORTAL_ROOT_HINT).labelled_by(label.id);
+        if response.changed() {
+            state.portal.root_draft = Some(text.clone());
+            state.portal.root_error = None;
+        }
+        if response.lost_focus() {
+            match portal_root_reason(&text) {
+                None => {
+                    let root = text.trim().to_string();
+                    state.settings.portal_root = root.clone();
+                    state.portal.root_draft = None;
+                    state.portal.root_error = None;
+                    *action = Some(Action::SetPortalRoot(root));
+                }
+                Some(reason) => {
+                    state.portal.root_draft = Some(text.clone());
+                    state.portal.root_error = Some(reason);
+                }
+            }
+        }
+        ui.add_space(theme::space::XXS);
+        match state.portal.root_error.clone() {
+            Some(reason) => reason_line(ui, &reason),
+            None => {
+                // The resolved path, so nobody has to guess where the folders go.
+                let resolved = resolved_portal_root(
+                    state.portal.root_draft.as_deref().unwrap_or(&state.settings.portal_root),
+                    &home,
+                );
+                help_line(ui, &format!("Folders are created under {resolved}"));
+            }
+        }
+    });
+}
+
+/// "Enabled": the label on the left, the box on the right, and what the state
+/// means underneath — off is a promise that nothing is contacted.
+fn portal_enabled_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let mut enabled = state.settings.portal_enabled;
+    let every = state.settings.portal_every_secs;
+    line_with(ui, CHECK_ROW_CONTROL, |ui| {
+        ui.horizontal(|ui| {
+            let label = field_label(ui, "Enabled");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().interact_size.y = CHECK_ROW_CONTROL;
+                let boxed = ui.add(Checkbox::without_text(&mut enabled)).labelled_by(label.id);
+                if boxed.changed() {
+                    *action = Some(Action::SetPortalEnabled(enabled));
+                }
+            });
+        });
+        ui.add_space(theme::space::XXS);
+        if enabled {
+            let every = if every >= 5 { every } else { 30 };
+            help_line(ui, &format!("Checked every {every} s in the background."));
+        } else {
+            help_line(ui, "Nothing is contacted while this is off.");
+        }
+    });
+    state.settings.portal_enabled = enabled;
+}
+
+/// The status line: the last reconcile, at a glance.
+fn portal_status_line(ui: &mut egui::Ui, state: &mut UiState) {
+    let words = portal_line(&state.portal.status);
+    line(ui, |ui| {
+        field_label(ui, "Status");
+        ui.add_space(theme::space::XXS);
+        let colour = if words.failed { theme::ERROR_TEXT } else { theme::TEXT_2 };
+        ui.add(theme::wrapping(
+            RichText::new(&words.text)
+                .font(theme::body())
+                .line_height(Some(HELP_LINE))
+                .color(colour),
+        ))
+        .on_hover_text(&words.text);
+    });
+}
+
+/// "Reconcile now": the button, and why it cannot be pressed when it cannot.
+fn portal_reconcile_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let status = &state.portal.status;
+    let ready = status.configured();
+    let reason = if status.url.trim().is_empty() {
+        "Add the Portal address first."
+    } else if !status.signed_in {
+        "Add the access token first."
+    } else {
+        "Keeps one watch folder per live link, now."
+    };
+    line(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - 150.0).max(80.0));
+                ui.spacing_mut().interact_size.y = LABEL_LINE;
+                field_label(ui, "Reconcile");
+                ui.add_space(theme::space::XXS);
+                help_line(ui, reason);
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if secondary_button_enabled(ui, "Reconcile now", ready) {
+                    *action = Some(Action::ReconcileNow);
+                }
+            });
+        });
+    });
+}
+
 // ---------- the pieces of the layout ----------
 
 /// `.set-title`: 14 px, 600, `--text`.
@@ -850,7 +1560,7 @@ mod tests {
     use super::*;
     use crate::model::{Settings, UpdateState, User};
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT as _, Queryable};
 
     fn state(settings: Settings, logged_in: bool) -> UiState {
         UiState {
@@ -874,6 +1584,7 @@ mod tests {
             no_folder_logs: false,
             no_update_check: false,
             last_folder_label: String::new(),
+            ..Settings::default()
         }
     }
 
@@ -891,8 +1602,8 @@ mod tests {
 
     /// The toggle boxes in draw order, which is the order of the rows: "Open at
     /// login" and "Check for updates" (App), then "Save log with media"
-    /// (Storage). Each box's text label is drawn to its left, the way
-    /// `.set-line` puts a `label` beside a `.check` input.
+    /// (Storage), then Portal's "Enabled". Each box's text label is drawn to its
+    /// left, the way `.set-line` puts a `label` beside a `.check` input.
     fn toggle_boxes<'a>(harness: &'a Harness<'a, UiState>) -> Vec<egui_kittest::Node<'a>> {
         harness
             .get_all_by_role(egui::accesskit::Role::CheckBox)
@@ -910,7 +1621,9 @@ mod tests {
         harness.get_by_label("Not set up");
         harness.get_by_label("Sign in with Adobe");
         harness.get_by_label("Adobe Client ID");
-        harness.get_by_label("Save");
+        // Two "Save" buttons now (the Client ID's and the Portal token's): the
+        // first is this row's.
+        harness.get_all_by_label("Save").next().expect("a Save button");
         harness.get_by_label("Setup");
         harness.get_by_label("Copy");
         harness.get_by_label("Parallel streams");
@@ -1044,6 +1757,7 @@ mod tests {
         settings.client_id = "abc123".to_string();
         let mut ui_state = state(settings, true);
         ui_state.user = Some(User {
+            id: "user-1".to_string(),
             name: "Ada Lovelace".to_string(),
             email: "ada@example.com".to_string(),
         });
@@ -1071,12 +1785,14 @@ mod tests {
         assert_eq!(sign_in_words(&ui_state), "Signed in");
 
         ui_state.user = Some(User {
+            id: String::new(),
             name: "  ".to_string(),
             email: "ada@example.com".to_string(),
         });
         assert_eq!(sign_in_words(&ui_state), "Signed in · ada@example.com");
 
         ui_state.user = Some(User {
+            id: String::new(),
             name: "Ada".to_string(),
             email: String::new(),
         });
@@ -1089,7 +1805,7 @@ mod tests {
         assert!(!harness.state().open_at_login);
         assert!(!harness.state().settings.no_update_check);
         assert!(!harness.state().settings.no_folder_logs);
-        assert_eq!(toggle_boxes(&harness).len(), 3, "three toggle rows");
+        assert_eq!(toggle_boxes(&harness).len(), 4, "four toggle rows: the three above, and Portal's");
 
         // Open at login.
         {
@@ -1225,8 +1941,145 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_folder_and_log_shows_an_em_dash_for_each() {
+    fn saving_the_client_id_writes_the_field_and_asks_the_app_to_save() {
         let mut ui_state = state(Settings::default(), true);
+        ui_state.settings.client_id = "  abc123  ".to_string();
+        let mut harness = screen_harness(ui_state);
+
+        harness.get_all_by_label("Save").next().expect("the Client ID's Save").click();
+        harness.run();
+
+        assert_eq!(harness.state().settings.client_id, "abc123");
+        assert!(
+            harness.state().requests.contains(&Request::SaveSettings),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn copy_and_change_ask_the_app() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+
+        harness.get_by_label("Copy").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::CopyText(redirect_uri(8765))),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        harness.get_by_label("Change…").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::PickDownloadDir),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        harness.get_by_label("Show in Finder").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::OpenLogs),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn sign_out_and_sign_in_ask_the_app() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+        harness.get_by_label("Sign out").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::Logout),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // Signed out with a client ID: the sign-in button is live.
+        let mut settings = Settings::default();
+        settings.client_id = "abc123".to_string();
+        let mut harness = screen_harness(state(settings, false));
+        harness.get_by_label("Sign in with Adobe").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::Login),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn check_now_checks_and_update_installs() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+
+        harness.get_by_label("Check now").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::CheckUpdate),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // An available release turns the same button into "Update".
+        harness.state_mut().update.available = true;
+        harness.state_mut().update.latest = "9.9.9".to_string();
+        harness.run();
+        harness.get_by_label("Update").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::InstallUpdate),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_toggles_ask_the_app_for_what_they_wrote() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+
+        // "Open at login" is its own call, not a settings save.
+        {
+            let boxes = toggle_boxes(&harness);
+            if let Some(boxed) = boxes.first() {
+                boxed.click();
+            }
+        }
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SetOpenAtLogin(true)),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // "Check for updates" writes `no_update_check` and saves it.
+        harness.state_mut().requests.clear();
+        {
+            let boxes = toggle_boxes(&harness);
+            if let Some(boxed) = boxes.get(1) {
+                boxed.click();
+            }
+        }
+        harness.run();
+        assert!(harness.state().settings.no_update_check);
+        assert!(
+            harness.state().requests.contains(&Request::SaveSettings),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn an_empty_folder_and_log_shows_an_em_dash_for_each() {
+        // The core's `Settings::default()` fills in `~/Downloads`; an unset
+        // folder is the empty string, which is what an em dash stands for.
+        let mut settings = Settings::default();
+        settings.download_dir = String::new();
+        let mut ui_state = state(settings, true);
         ui_state.log_dir = String::new();
         let harness = screen_harness(ui_state);
 
@@ -1239,6 +2092,721 @@ mod tests {
         );
     }
 
+    // ---------- the Portal section ----------
+
+    /// The moment the Portal cases are drawn at, so "2 min ago" is a number and
+    /// not a race with the clock.
+    const NOW: i64 = 1_793_266_860_000;
+
+    /// The screen with a Portal that is set up: an address, a token in the
+    /// keychain, the default folder, the poller on, and a reconcile that ran two
+    /// minutes before `NOW` over two links.
+    fn portal_state() -> UiState {
+        let mut ui_state = state(configured(), true);
+        ui_state.settings.portal_url = "https://portal.example.com".to_string();
+        ui_state.settings.portal_root = "/Users/chaos/Live_Work".to_string();
+        ui_state.settings.portal_enabled = true;
+        ui_state.portal.status = PortalView {
+            enabled: true,
+            signed_in: true,
+            needs_code: false,
+            // A bearer token names no admin: the sign-in row is the signed-out
+            // one, and "Signed in as …" belongs to `session_state`.
+            email: String::new(),
+            url: "https://portal.example.com".to_string(),
+            root: "/Users/chaos/Live_Work".to_string(),
+            running: false,
+            last_at: NOW - 120_000,
+            links_seen: 2,
+            ensured: 3,
+            removed: 1,
+            skipped: 0,
+            error: String::new(),
+            now_ms: NOW,
+        };
+        ui_state
+    }
+
+    /// The whole node tree's words: every label and every value kittest can
+    /// reach, which is everything the screen renders as text.
+    fn every_word(harness: &Harness<'_, UiState>) -> Vec<String> {
+        use egui_kittest::kittest::NodeT as _;
+        let mut words: Vec<String> = Vec::new();
+        for node in harness.root().children_recursive() {
+            let node = node.accesskit_node();
+            if let Some(label) = node.label() {
+                words.push(label);
+            }
+            if let Some(value) = node.value() {
+                words.push(value);
+            }
+        }
+        words
+    }
+
+    #[test]
+    fn the_portal_section_is_the_last_card_and_names_its_five_rows() {
+        let harness = screen_harness(portal_state());
+
+        harness.get_by_label("Portal");
+        harness.get_by_label("Server URL");
+        harness.get_by_label("Access token");
+        harness.get_by_label("Local folder");
+        harness.get_by_label("Enabled");
+        harness.get_by_label("Status");
+        harness.get_by_label("Reconcile");
+        harness.get_by_label("Reconcile now");
+        // The address and the folder are what the settings hold, and the folder
+        // says where the folders really go.
+        assert!(every_word(&harness).contains(&"https://portal.example.com".to_string()));
+        harness.get_by_label("Folders are created under /Users/chaos/Live_Work");
+    }
+
+    #[test]
+    fn the_portal_folder_shows_the_resolved_absolute_path() {
+        // A `~` in the setting is expanded the way `Settings::portal_root_path`
+        // expands it, so the row never shows a path nobody can check.
+        assert_eq!(resolved_portal_root("~/Live_Work", "/Users/chaos"), "/Users/chaos/Live_Work");
+        assert_eq!(resolved_portal_root("/Volumes/Raid/Live", "/Users/chaos"), "/Volumes/Raid/Live");
+        // Empty means the default, which is `~/Live_Work`.
+        assert_eq!(resolved_portal_root("", "/Users/chaos"), "/Users/chaos/Live_Work");
+        assert_eq!(resolved_portal_root("~", "/Users/chaos"), "/Users/chaos");
+        assert_eq!(resolved_portal_root("~ada/Live", "/Users/chaos"), "~ada/Live", "another user's home is taken as given");
+        assert_eq!(resolved_portal_root("/Users/chaos/", "/Users/chaos/"), "/Users/chaos/");
+
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_root = "~/Live_Work".to_string();
+        let harness = screen_harness(ui_state);
+        harness.get_by_label("Folders are created under /Users/chaos/Live_Work");
+    }
+
+    #[test]
+    fn a_bad_portal_url_is_refused_and_the_old_value_kept() {
+        let mut harness = screen_harness(portal_state());
+
+        // Type a scheme-less address over the one in the field, then commit it
+        // the way the field commits: Enter, which is also a lost focus.
+        harness.get_by_label("Server URL").focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by_label("Server URL").type_text("portal.example.com");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        harness.get_by_label(PORTAL_URL_REASON);
+        assert_eq!(
+            harness.state().settings.portal_url,
+            "https://portal.example.com",
+            "a refused address is never the one in the settings"
+        );
+        assert!(
+            !harness.state().requests.contains(&Request::SetPortalUrl("portal.example.com".to_string())),
+            "nothing was asked for: {:?}",
+            harness.state().requests
+        );
+        assert!(
+            !harness.state().requests.iter().any(|r| matches!(r, Request::SetPortalUrl(_))),
+            "no Portal URL was written: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn a_good_portal_url_is_committed_and_asks_the_app() {
+        let mut harness = screen_harness(state(configured(), true));
+        assert!(harness.state().settings.portal_url.is_empty());
+
+        harness.get_by_label("Server URL").focus();
+        harness.run();
+        harness.get_by_label("Server URL").type_text("https://portal.example.com/");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::SetPortalUrl("https://portal.example.com".to_string())),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        assert_eq!(harness.state().settings.portal_url, "https://portal.example.com");
+        assert_eq!(harness.state().portal.url_draft, None, "the field shows the setting again");
+        assert!(harness.query_by_label(PORTAL_URL_REASON).is_none());
+    }
+
+    #[test]
+    fn the_portal_url_scheme_rule_is_the_apps_and_a_host_is_required() {
+        assert_eq!(portal_url_reason(""), None, "empty is how Portal is switched off");
+        assert_eq!(portal_url_reason("  https://portal.example.com  "), None);
+        assert_eq!(portal_url_reason("http://192.168.1.9:8080"), None);
+        for bad in ["portal.example.com", "ftp://portal.example.com", "file:///etc/passwd", "//portal.example.com"] {
+            assert_eq!(portal_url_reason(bad).as_deref(), Some(PORTAL_URL_REASON), "{bad}");
+        }
+        assert!(portal_url_reason("https://").is_some(), "a scheme with no host is not an address");
+        assert!(portal_url_reason("https:///").is_some());
+        assert!(portal_url_reason("https://portal example.com").is_some(), "a space is not an address");
+    }
+
+    #[test]
+    fn the_portal_folder_rule_keeps_the_disk_root_out() {
+        assert_eq!(portal_root_reason(""), None, "empty means the default");
+        assert_eq!(portal_root_reason("~/Live_Work"), None);
+        assert_eq!(portal_root_reason("/Volumes/Raid/Live_Work"), None);
+        assert!(portal_root_reason("/").is_some(), "the whole disk is not a mirror root");
+        assert!(portal_root_reason("Live_Work").is_some(), "a relative path is not a root");
+        assert!(portal_root_reason("/tmp/a\nb").is_some());
+    }
+
+    #[test]
+    fn the_portal_toggle_asks_the_app_for_what_it_wrote() {
+        let mut harness = screen_harness(state(configured(), true));
+        assert!(!harness.state().settings.portal_enabled);
+
+        // The four toggles in draw order: Open at login, Check for updates, Save
+        // log with media, and Portal's own.
+        let boxes = toggle_boxes(&harness);
+        assert_eq!(boxes.len(), 4, "the Portal section adds the fourth toggle");
+        if let Some(boxed) = boxes.get(3) {
+            boxed.click();
+        }
+        harness.run();
+
+        assert!(harness.state().settings.portal_enabled);
+        assert!(
+            harness.state().requests.contains(&Request::SetPortalEnabled(true)),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // And back off again.
+        harness.state_mut().requests.clear();
+        let boxes = toggle_boxes(&harness);
+        if let Some(boxed) = boxes.get(3) {
+            boxed.click();
+        }
+        harness.run();
+        assert!(!harness.state().settings.portal_enabled);
+        assert!(
+            harness.state().requests.contains(&Request::SetPortalEnabled(false)),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn nothing_is_contacted_while_portal_is_off() {
+        let harness = screen_harness(state(configured(), true));
+        harness.get_by_label("Nothing is contacted while this is off.");
+
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_enabled = true;
+        let harness = screen_harness(ui_state);
+        harness.get_by_label("Checked every 30 s in the background.");
+    }
+
+    #[test]
+    fn reconcile_now_waits_for_an_address_and_a_token() {
+        // Neither: the button is there, dead, and says which one is missing.
+        let harness = screen_harness(state(configured(), true));
+        let button = harness.get_by_label("Reconcile now");
+        assert!(button.accesskit_node().is_disabled(), "no address and no token");
+        harness.get_by_label("Add the Portal address first.");
+
+        // An address but no token: the token is what is missing.
+        let mut ui_state = state(configured(), true);
+        ui_state.settings.portal_url = "https://portal.example.com".to_string();
+        ui_state.portal.status.url = "https://portal.example.com".to_string();
+        let harness = screen_harness(ui_state);
+        assert!(harness.get_by_label("Reconcile now").accesskit_node().is_disabled());
+        harness.get_by_label("Add the access token first.");
+
+        // Both: the button is live.
+        let harness = screen_harness(portal_state());
+        let button = harness.get_by_label("Reconcile now");
+        assert!(!button.accesskit_node().is_disabled(), "an address and a token are both set");
+    }
+
+    #[test]
+    fn reconcile_now_asks_the_app() {
+        let mut harness = screen_harness(portal_state());
+        harness.get_by_label("Reconcile now").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::PortalReconcile),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_status_line_reads_a_finished_reconcile_as_its_numbers() {
+        let words = portal_line(&portal_state().portal.status);
+        assert_eq!(words.text, "2 min ago · 2 links, 3 folders kept in step, 1 removed");
+        assert!(!words.failed);
+
+        let harness = screen_harness(portal_state());
+        harness.get_by_label("2 min ago · 2 links, 3 folders kept in step, 1 removed");
+    }
+
+    #[test]
+    fn the_status_line_reads_a_failure_as_a_failure() {
+        let mut ui_state = portal_state();
+        ui_state.portal.status.error = "can't reach Portal: connection refused".to_string();
+        // A failed report has no numbers, and the line must not invent any.
+        ui_state.portal.status.links_seen = 0;
+        ui_state.portal.status.ensured = 0;
+        ui_state.portal.status.removed = 0;
+        let words = portal_line(&ui_state.portal.status);
+        assert!(words.failed, "a failed reconcile is drawn as bad news");
+        assert_eq!(words.text, "Failed 2 min ago: can't reach Portal: connection refused");
+        assert!(!words.text.contains("links"), "a failed run claims no folders: {}", words.text);
+
+        let harness = screen_harness(ui_state);
+        harness.get_by_label("Failed 2 min ago: can't reach Portal: connection refused");
+        assert!(
+            harness.query_by_label("2 min ago · 2 links, 3 folders kept in step, 1 removed").is_none(),
+            "the old numbers are gone"
+        );
+    }
+
+    #[test]
+    fn the_status_line_says_what_is_missing_before_it_says_anything_else() {
+        let mut status = PortalView::default();
+        // Nothing at all: not set up, and it is not an error.
+        let words = portal_line(&status);
+        assert_eq!(words.text, "Not set up: no Portal address and no token yet.");
+        assert!(!words.failed);
+
+        // A token but no address, and the other way round: each names what is
+        // missing, and both are reasons nothing can be reconciled.
+        status.signed_in = true;
+        assert_eq!(portal_line(&status).text, "No Portal address yet: add one above.");
+        assert!(portal_line(&status).failed);
+
+        status.signed_in = false;
+        status.url = "https://portal.example.com".to_string();
+        assert_eq!(
+            portal_line(&status).text,
+            "Not signed in yet: save an access token above, or sign in below."
+        );
+        assert!(portal_line(&status).failed);
+
+        // Configured, and never run: no numbers to claim yet.
+        status.signed_in = true;
+        let words = portal_line(&status);
+        assert_eq!(words.text, "Configured. Press Reconcile now, or switch it on to check every 30 s.");
+        assert!(!words.failed);
+
+        // A reconcile in flight says so.
+        status.running = true;
+        assert_eq!(portal_line(&status).text, "Reconciling…");
+
+        // One link, one folder, nothing removed: singular words, and skipped
+        // links named when there are any.
+        let done = PortalView {
+            running: false,
+            last_at: NOW - 1000,
+            links_seen: 1,
+            ensured: 1,
+            removed: 0,
+            skipped: 2,
+            now_ms: NOW,
+            ..status
+        };
+        assert_eq!(
+            portal_line(&done).text,
+            "just now · 1 link, 1 folder kept in step, 0 removed, 2 skipped"
+        );
+    }
+
+    #[test]
+    fn the_relative_time_is_readable_at_a_glance() {
+        assert_eq!(portal_when(0, NOW), "never");
+        assert_eq!(portal_when(NOW - 900, NOW), "just now");
+        assert_eq!(portal_when(NOW - 30_000, NOW), "under a minute ago");
+        assert_eq!(portal_when(NOW - 60_000, NOW), "1 min ago");
+        assert_eq!(portal_when(NOW - 120_000, NOW), "2 min ago");
+        assert_eq!(portal_when(NOW - 3_600_000, NOW), "1 h ago");
+        assert_eq!(portal_when(NOW - 5 * 3_600_000, NOW), "5 h ago");
+        assert_eq!(portal_when(NOW - 86_400_000, NOW), "1 day ago");
+        assert_eq!(portal_when(NOW - 3 * 86_400_000, NOW), "3 days ago");
+        assert_eq!(portal_when(NOW + 60_000, NOW), "just now", "a clock that went backwards is not a negative age");
+    }
+
+    #[test]
+    fn the_token_is_never_rendered_and_never_a_setting() {
+        let mut harness = screen_harness(portal_state());
+        let token = "sekret-token-9f2c1a";
+
+        // Type it into the field: what is drawn is the mask, not the token.
+        harness.get_by_label("Access token").focus();
+        harness.run();
+        harness.get_by_label("Access token").type_text(token);
+        harness.run();
+
+        for word in every_word(&harness) {
+            assert!(!word.contains(token), "a rendered label carries the token: {word:?}");
+        }
+
+        // Saving it asks for the keychain, and the token is nowhere in the
+        // settings that get written to settings.json.
+        harness.get_all_by_label("Save").last().expect("the token's Save").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::SetPortalToken(Secret::new(token))),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        let saved = serde_json::to_string(&harness.state().settings).expect("the settings serialise");
+        assert!(!saved.contains(token), "the token reached the settings: {saved}");
+        // ... and it is not in the request's own Debug either, so a failure
+        // message cannot print it.
+        let printed = format!("{:?}", harness.state().requests);
+        assert!(!printed.contains(token), "a request printed the token: {printed}");
+    }
+
+    #[test]
+    fn forget_asks_the_app_and_save_does_nothing_with_an_empty_field() {
+        let mut harness = screen_harness(portal_state());
+        harness.get_by_label("Forget").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::ForgetPortalToken),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // No token typed: Save is dead, so an empty field cannot overwrite the
+        // token that is already stored.
+        harness.state_mut().requests.clear();
+        let save = harness.get_all_by_label("Save").last().expect("the token's Save");
+        assert!(save.accesskit_node().is_disabled(), "nothing typed, nothing to save");
+        save.click();
+        harness.run();
+        assert!(
+            !harness.state().requests.iter().any(|r| matches!(r, Request::SetPortalToken(_))),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn a_stored_token_says_so_and_an_empty_slot_says_not_set() {
+        // The placeholder is the field's hint: "stored in your keychain" when one
+        // is set, "not set" when not. Neither is ever the token.
+        assert_eq!(TOKEN_STORED, "stored in your keychain");
+        assert_eq!(TOKEN_MISSING, "not set");
+        // `hint_text` is painted, not an accesskit node, so the row says it in
+        // its help line too, which is what a screen reader and these tests read.
+        let harness = screen_harness(portal_state());
+        harness.get_by_label("A token is stored in your keychain, never in settings.json.");
+
+        let harness = screen_harness(state(configured(), true));
+        harness.get_by_label("No token is stored yet. Paste one and press Save.");
+    }
+
+    /// The screen with a Portal session stored: the same set-up as
+    /// `portal_state`, but the credential is Portal's own sign-in, which names
+    /// the admin it belongs to.
+    fn session_state() -> UiState {
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        ui_state.portal.status.email = "ops@nightfall.tv".to_string();
+        ui_state
+    }
+
+    #[test]
+    fn a_signed_out_screen_offers_the_email_and_the_password() {
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        let harness = screen_harness(ui_state);
+
+        // The row is named, and the address the last sign-in used is already in
+        // its field.
+        harness.get_by_label("Sign in instead");
+        assert!(
+            every_word(&harness).contains(&"ops@nightfall.tv".to_string()),
+            "the field is prefilled from settings.portal_email"
+        );
+        // Two masked fields now: the access token's, and this row's password.
+        assert_eq!(
+            harness.get_all_by_role(egui::accesskit::Role::PasswordInput).count(),
+            2,
+            "the token field and the password field"
+        );
+        // The promise the row makes, in the same `.help` line as the rows above.
+        harness.get_by_label(PASSWORD_NOTE);
+        assert!(
+            harness.query_by_label("Signed in as ops@nightfall.tv").is_none(),
+            "nobody is signed in yet"
+        );
+
+        // Nothing typed in the password yet, so "Sign in" waits.
+        let button = harness.get_by_label("Sign in");
+        assert!(button.accesskit_node().is_disabled(), "an empty password is not a sign-in");
+    }
+
+    #[test]
+    fn the_password_is_masked_never_rendered_and_never_printed() {
+        let password = "s3kret-P0rtal-pass";
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        let mut harness = screen_harness(ui_state);
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::PasswordInput)
+            .last()
+            .expect("the sign-in password field")
+            .focus();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::PasswordInput)
+            .last()
+            .expect("the sign-in password field")
+            .type_text(password);
+        harness.run();
+
+        // What is drawn is the mask: no rendered word carries the password.
+        for word in every_word(&harness) {
+            assert!(!word.contains(password), "a rendered label carries the password: {word:?}");
+        }
+        // And it is not a setting, so it never reaches settings.json.
+        let saved = serde_json::to_string(&harness.state().settings).expect("the settings serialise");
+        assert!(!saved.contains(password), "the password reached the settings: {saved}");
+
+        // Both fields filled: "Sign in" posts the address and a `Secret`.
+        let button = harness.get_by_label("Sign in");
+        assert!(!button.accesskit_node().is_disabled(), "an address and a password");
+        button.click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SignInPortal {
+                email: "ops@nightfall.tv".to_string(),
+                password: Secret::new(password),
+            }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        // A `{:?}` of the request prints the address and the mask, never the
+        // password, so no toast or log line can leak it.
+        let printed = format!("{:?}", harness.state().requests);
+        assert!(!printed.contains(password), "a request printed the password: {printed}");
+        assert!(printed.contains("ops@nightfall.tv"), "the address is not a secret: {printed}");
+    }
+
+    #[test]
+    fn a_sign_in_in_flight_waits_rather_than_posting_twice() {
+        let mut ui_state = portal_state();
+        ui_state.portal.email_draft = "ops@nightfall.tv".to_string();
+        ui_state.portal.password_draft = "s3kret".to_string();
+        ui_state.portal.signing_in = true;
+        let harness = screen_harness(ui_state);
+
+        let button = harness.get_by_label("Sign in");
+        assert!(button.accesskit_node().is_disabled(), "one sign-in at a time");
+        harness.get_by_label(SIGNING_IN);
+        assert!(
+            harness.query_by_label(PASSWORD_NOTE).is_none(),
+            "while it is out, the row says what it is doing"
+        );
+    }
+
+    #[test]
+    fn a_refused_sign_in_says_why_under_the_fields() {
+        let mut ui_state = portal_state();
+        ui_state.portal.email_draft = "ops@nightfall.tv".to_string();
+        ui_state.portal.signin_error =
+            Some("Portal refused the sign-in (401): Invalid email or password".to_string());
+        let harness = screen_harness(ui_state);
+
+        // The app's sentence, where the note was, and the address it is about
+        // still in the field.
+        harness.get_by_label("Portal refused the sign-in (401): Invalid email or password");
+        assert!(harness.query_by_label(PASSWORD_NOTE).is_none(), "the reason takes the note's place");
+        assert!(every_word(&harness).contains(&"ops@nightfall.tv".to_string()));
+        assert_eq!(
+            harness.get_all_by_role(egui::accesskit::Role::PasswordInput).count(),
+            2,
+            "the fields are still there to retry with"
+        );
+    }
+
+    /// The screen the moment after a password step Portal answered with
+    /// `totp_required`: nothing is signed in, and the code row is what finishes
+    /// the sign-in.
+    fn needs_code_state() -> UiState {
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        ui_state.portal.status.needs_code = true;
+        ui_state.portal.signin_error =
+            Some("Portal wants a one-time code to finish this sign-in: type the six digits from your authenticator app".to_string());
+        ui_state
+    }
+
+    #[test]
+    fn a_sign_in_that_wants_a_code_asks_for_six_digits() {
+        let harness = screen_harness(needs_code_state());
+
+        // The row, named, and the note under it: which code, and that it is not
+        // kept. The password row is still there — Portal's pending step expires,
+        // and a fresh password sign-in is how a user gets past that.
+        harness.get_by_label("One-time code");
+        harness.get_by_label(PORTAL_CODE_NOTE);
+        // Nothing typed yet: the row's "Sign in" waits. (The password row has one
+        // too, and both are disabled with nothing typed.)
+        let buttons = harness.get_all_by_label("Sign in");
+        assert!(
+            buttons.into_iter().all(|b| b.accesskit_node().is_disabled()),
+            "neither sign-in can be pressed with nothing typed"
+        );
+        // Nothing signed in, and no "Signed in as …" to be seen.
+        assert!(harness.query_by_label("Signed in as ops@nightfall.tv").is_none());
+    }
+
+    #[test]
+    fn the_six_digits_are_sent_as_a_secret_and_never_stored() {
+        let mut ui_state = needs_code_state();
+        ui_state.portal.code_draft = "135790".to_string();
+        let mut harness = screen_harness(ui_state);
+
+        // The row's own button — the Portal card draws it after the password
+        // row's, and it is the enabled one.
+        let button = harness
+            .get_all_by_label("Sign in")
+            .max_by_key(|b| b.rect().top() as i32)
+            .expect("the code row's Sign in");
+        assert!(!button.accesskit_node().is_disabled(), "six digits are a code");
+        button.click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SignInPortalTotp { code: Secret::new("135790") }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        // A `{:?}` of the request prints the mask, never the code: no toast, no
+        // log line and no panic message can carry it.
+        let printed = format!("{:?}", harness.state().requests);
+        assert!(!printed.contains("135790"), "a request printed the code: {printed}");
+        // And it is not a setting.
+        let saved = serde_json::to_string(&harness.state().settings).expect("the settings serialise");
+        assert!(!saved.contains("135790"), "the code reached the settings: {saved}");
+    }
+
+    #[test]
+    fn a_code_row_takes_six_digits_and_a_refusal_reads_under_it() {
+        let mut ui_state = needs_code_state();
+        // What the shell leaves after Portal refuses a code: the row, the
+        // sentence, and an empty field to type the next six digits into.
+        ui_state.portal.signin_error = None;
+        ui_state.portal.code_error =
+            Some("Portal refused the one-time code (401): Invalid code".to_string());
+        let harness = screen_harness(ui_state);
+
+        harness.get_by_label("Portal refused the one-time code (401): Invalid code");
+        assert!(harness.query_by_label(PORTAL_CODE_NOTE).is_none(), "the reason takes the note's place");
+        harness.get_by_label("One-time code");
+    }
+
+    #[test]
+    fn a_code_row_is_not_drawn_when_portal_is_not_asking() {
+        // A signed-in session, and a plain bearer token: neither is waiting for a
+        // code, so neither screen has the row.
+        for ui_state in [portal_state(), session_state()] {
+            let harness = screen_harness(ui_state);
+            assert!(
+                harness.query_by_label("One-time code").is_none(),
+                "no code was asked for, so no row"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_session_says_who_it_is_and_offers_sign_out() {
+        let mut harness = screen_harness(session_state());
+
+        harness.get_by_label("Signed in as ops@nightfall.tv");
+        // A session names its admin, so the two fields are not drawn: only the
+        // access token's masked field is left.
+        assert_eq!(
+            harness.get_all_by_role(egui::accesskit::Role::PasswordInput).count(),
+            1,
+            "a stored session does not ask for a password"
+        );
+        assert!(harness.query_by_label("Sign in").is_none(), "nothing to sign in to");
+        // The Frame.io row has a "Sign out" too: this one is the Portal card's,
+        // which is drawn last.
+        harness.get_all_by_label("Sign out").last().expect("the Portal sign-out").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SignOutPortal),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn a_signed_in_session_counts_as_configured() {
+        // The reconcile button asks for a credential, and a session is one: the
+        // status that precedes it is the same either way.
+        let view = session_state().portal.status;
+        assert!(view.configured(), "an address and a session");
+        let harness = screen_harness(session_state());
+        assert!(!harness.get_by_label("Reconcile now").accesskit_node().is_disabled());
+    }
+
+    /// The Portal card is drawn by the same pieces as the cards above it: the
+    /// labels start on the card's own left padding, the fields are the same
+    /// height, and no new colour or font is named. This is the check that the
+    /// section did not drift from the visual language.
+    #[test]
+    fn the_portal_card_is_laid_out_like_the_cards_above_it() {
+        let harness = screen_harness(portal_state());
+
+        let title = harness.get_by_label("Portal").rect();
+        let above = harness.get_by_label("Storage").rect();
+        assert!((title.left() - above.left()).abs() < 0.5, "the section title sits where the others do");
+
+        let url_label = harness.get_by_label("Server URL").rect();
+        let client_label = harness.get_by_label("Adobe Client ID").rect();
+        assert!((url_label.left() - client_label.left()).abs() < 0.5, "the same card padding");
+
+        // Fields: the Portal address, the folder, the token and the sign-in
+        // email are the height of the Client ID field (`.input`, 32 px), not a
+        // new one.
+        let fields: Vec<f32> = harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .map(|node| node.rect().height())
+            .collect();
+        assert!(fields.len() >= 4, "the Client ID field and the three Portal ones: {}", fields.len());
+        let client = fields[0];
+        assert!(client > 0.0);
+        for height in &fields[1..] {
+            assert!((height - client).abs() < 1.0, "a field is {height} px, the Client ID's is {client}");
+        }
+        // The two masked ones, the access token's and the sign-in password's.
+        let masked: Vec<f32> = harness
+            .get_all_by_role(egui::accesskit::Role::PasswordInput)
+            .map(|node| node.rect().height())
+            .collect();
+        assert_eq!(masked.len(), 2, "the token field and the password field");
+        for height in masked {
+            assert!((height - client).abs() < 1.0, "a masked field is {height} px, the Client ID's is {client}");
+        }
+    }
+
+
+    #[test]
+    fn the_portal_section_draws_with_populated_status() {
+        let mut harness = screen_harness(portal_state());
+        harness.snapshot("settings_portal");
+    }
+
     #[test]
     fn a_very_long_path_is_truncated_not_wrapped() {
         let long = format!("/Users/chaos/{}", "deep-folder/".repeat(60));
@@ -1248,4 +2816,20 @@ mod tests {
         // The label carries the whole path, shortened to `~` by `shortPath`.
         harness.get_by_label(short_path(&long, "/Users/chaos").as_str());
     }
+    #[test]
+    fn a_configured_card_says_what_to_press_and_whether_the_poller_is_on() {
+        let mut status = PortalView::default();
+        status.url = "https://portal.example.com".to_string();
+        status.signed_in = true;
+        status.root = "/tmp/Live_Work".to_string();
+        status.enabled = false;
+        assert_eq!(
+            portal_line(&status).text,
+            "Configured. Press Reconcile now, or switch it on to check every 30 s."
+        );
+        status.enabled = true;
+        assert_eq!(portal_line(&status).text, "Configured. Nothing has run yet: press Reconcile now.");
+        assert!(!portal_line(&status).failed);
+    }
+
 }

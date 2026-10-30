@@ -1,16 +1,21 @@
 //! Headless snapshots of the shell, one PNG per screen.
 //!
 //! `cargo test -p fiotransfer-egui --test snapshots` renders the egui front end
-//! at 1180x780 (the window the webview gets, see `lib.rs`) for each of the four
-//! screens and writes `/tmp/egui-shots/{transfers,watch,history,settings}.png`.
-//! Those files are the artefact that gets compared against the webview's own
-//! screenshots of `frontend/dist`.
+//! at 1180x780 (the window the webview gets, see `lib.rs`) for each of the five
+//! screens and writes
+//! `/tmp/egui-shots/{transfers,space,watch,history,settings}.png` — plus
+//! `space-empty.png`, the Space screen with no projects, which is the state the
+//! fixture's other five never take.
+//! Those files are the artefact: they are what the webview front end's own
+//! screenshots were compared against while both existed (see the README's
+//! pixel table). The webview is retired, so this is now the app's own render of
+//! the same five screens.
 //!
 //! The renderer is wgpu through `egui_kittest` (the crate's `wgpu` feature), so
 //! no window is needed. The fixture (`src/fixture.rs`, shared with the wasm
 //! capture) is the state a running app would hand the shell: a running upload, a
-//! finished download, two watch folders, three history rows, signed in, and one
-//! toast per kind.
+//! finished download, two watch folders, three history rows, three projects on
+//! Frame.io, signed in, and one toast per kind.
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +40,7 @@ fn ensure_shots_dir() -> Result<PathBuf, String> {
 fn shot_path(view: View) -> PathBuf {
     let name = match view {
         View::Transfers => "transfers",
+        View::Space => "space",
         View::Watch => "watch",
         View::History => "history",
         View::Settings => "settings",
@@ -86,9 +92,9 @@ fn write_png(dir: &Path, view: View) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// The artefact: four PNGs, one per screen, at the webview's window size.
+/// The artefact: five PNGs, one per screen, at the webview's window size.
 #[test]
-fn the_four_screens_render_to_png() {
+fn the_five_screens_render_to_png() {
     let dir = ensure_shots_dir().expect("create /tmp/egui-shots");
     for view in View::ALL {
         let path = write_png(&dir, view).unwrap_or_else(|e| panic!("{} screen: {e}", view.label()));
@@ -105,6 +111,35 @@ fn the_four_screens_render_to_png() {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         assert!(size > 0, "{} is empty", path.display());
     }
+}
+
+/// The Space screen with nothing to show: no projects, and no walk running.
+///
+/// The other five screens only appear empty inside
+/// `an_empty_state_draws_without_panicking`; this one is written out as a PNG
+/// because the empty state is half of what the screen has to say (the other
+/// half is the populated chart above).
+#[test]
+fn the_empty_space_screen_renders_to_png() {
+    let dir = ensure_shots_dir().expect("create /tmp/egui-shots");
+    let state = fiotransfer_egui::fixture::fixture_state_empty_space();
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(WINDOW_WIDTH, WINDOW_HEIGHT))
+        .with_pixels_per_point(1.0)
+        .build_state(|ctx, app: &mut FioApp| app.draw(ctx), FioApp::new(state));
+    harness.run_steps(2);
+    // The empty state is on screen, and the way out of it is too: the head's
+    // Refresh and the one in the middle of the empty block.
+    harness.get_by_label(fiotransfer_egui::views::space::EMPTY_TITLE);
+    assert_eq!(harness.get_all_by_label("Refresh").count(), 2);
+
+    let image = harness.render().expect("render");
+    assert_eq!((image.width(), image.height()), (WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32));
+    let path = dir.join("space-empty.png");
+    image.save(&path).expect("write space-empty.png");
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    assert!(size > 2_000, "{} is only {size} bytes", path.display());
 }
 
 /// The shell draws the sidebar, the screen it is told to, and the toasts; and a
@@ -133,7 +168,7 @@ fn the_shell_draws_a_screen_and_its_toasts() {
     assert_eq!(toast_max_width(WINDOW_WIDTH), 400.0);
 }
 
-/// The shell draws each of the four screens when it is told to.
+/// The shell draws each of the five screens when it is told to.
 #[test]
 fn every_view_id_draws_its_own_screen() {
     for view in View::ALL {
@@ -193,7 +228,7 @@ fn long_strings_do_not_panic() {
     assert_eq!(image.width(), WINDOW_WIDTH as u32);
 }
 
-/// `page_head` is the strip all four screens open with: 64 px tall, the title on
+/// `page_head` is the strip every screen opens with: 64 px tall, the title on
 /// the left, the screen's buttons on the right, and it never overflows the width
 /// it is given.
 #[test]
@@ -213,7 +248,7 @@ fn the_page_head_is_the_stylesheet_height() {
 
 /// `show_screen` draws whatever `state.view` names, for every variant.
 #[test]
-fn show_screen_covers_all_four_views() {
+fn show_screen_covers_every_view() {
     for view in View::ALL {
         let mut state = UiState::default();
         state.view = view;
@@ -232,11 +267,18 @@ fn a_tall_screen_scrolls_instead_of_widening() {
     let mut state = fixture_state(View::Watch);
     state.watches = (0..60)
         .map(|i| WatchRow {
+            id: format!("w-reel-{i:03}"),
             local: format!("/Users/editor/Renders/Reel_{i:03}"),
             label: format!("Shows / Nightfall / Ep 04 / Renders/Reel_{i:03}"),
             direction: "upload".into(),
             enabled: i % 3 != 0,
             pending: i % 5,
+            from_portal: false,
+            duplex_id: None,
+            lane: fiotransfer_egui::model::Lane::None,
+            account_id: "acct-nightfall".into(),
+            folder_id: format!("fld-reel-{i:03}"),
+            on_change: "overwrite".into(),
         })
         .collect();
     let mut harness = Harness::builder()

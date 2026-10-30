@@ -1,21 +1,16 @@
 [workspace]
-members = ["egui-ui"]
+members = ["core", "egui-ui", "sys"]
 resolver = "2"
 
 [package]
 name = "fiotransfer"
-version = "0.1.0"
+version = "1.6.1"
 edition = "2021"
-build = "build.rs"
-description = "Fast uploads to and downloads from Frame.io (Rust port of FioTransfer)"
+description = "FioTransfer's command line and benchmarks, over fiotransfer-core"
 
 [lib]
 name = "fiotransfer"
 path = "src/lib.rs"
-
-[[bin]]
-name = "FioTransfer"
-path = "src/main.rs"
 
 [[bin]]
 name = "fio"
@@ -25,39 +20,21 @@ path = "src/bin/fio.rs"
 name = "fio-bench"
 path = "src/bin/bench.rs"
 
+# The app itself is `egui-ui` (`fiotransfer-egui`); this package ships no window
+# and no bundle. See `[package.metadata.packager]` there for the one entry the
+# release workflow packages.
 [dependencies]
+fiotransfer-core = { path = "core" }
+fiotransfer-sys = { path = "sys" }
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
-futures = "0.3.34"
+reqwest = { version = "0.13.5", default-features = true, features = ["json", "stream"] }
+bytes = "1.12.1"
+url = "2.5.8"
+sha2 = "0.11.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-reqwest = { version = "0.13.5", default-features = true, features = ["json", "stream"] }
-rusqlite = { version = "0.41.1", features = ["bundled"] }
-rand = "0.10.3"
-sha2 = "0.11.1"
-base64 = "0.23.1"
-url = "2.5.8"
-percent-encoding = "2.3.2"
-rcgen = { version = "0.14.10", features = ["pem", "x509-parser"] }
-rustls = "0.23.46"
-rustls-pemfile = "2.2.0"
-tokio-rustls = "0.26.6"
-security-framework = "3.7.0"
-objc2 = "0.6.5"
-objc2-app-kit = "0.3.2"
-objc2-foundation = "0.3.2"
-objc2-web-kit = "0.3.2"
-wry = "0.57.1"
-tao = "0.37.2"
-libc = "0.2"
-async-trait = "0.1.92"
-once_cell = "1"
-x509-parser = "0.18.1"
-time = { version = "0.3.55", features = ["formatting", "parsing"] }
-bytes = "1.12.1"
-
-[build-dependencies]
-cc = "1.10.0"
+futures = "0.3.34"
 
 [profile.release]
 opt-level = 3
@@ -68,25 +45,16 @@ strip = "symbols"
 
 [dev-dependencies]
 proptest = "1.12.0"
+# Only a test names an errno (login.rs); everything else that touches libc
+# goes through `fiotransfer-sys`.
+libc = "0.2"
 tempfile = "3.27.0"
-
-# Unsigned packaging through cargo-packager (0.11 reads this table; `--config`
-# with a file path is broken in that release, so the config lives here).
-#   cargo packager --formats app        (macOS app bundle; also: dmg)
-[package.metadata.packager]
-product-name = "FioTransfer"
-version = "1.0.0"
-identifier = "com.farbhaus.fiotransfer"
-out-dir = "dist"
-binaries-dir = "target/release"
-formats = ["app"]
-icons = ["build/icons/icon.icns", "build/icons/icon_1024.png", "build/icons/icon_512.png"]
-before-packaging-command = "cargo build --release -p fiotransfer --bin FioTransfer"
-resources = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
-
-[[package.metadata.packager.binaries]]
-path = "FioTransfer"
-main = true
-
-[package.metadata.packager.macos]
-minimum-system-version = "13.0"
+# The window `tests/portal_e2e.rs` presses: the app crate itself, and the two
+# crates `egui-ui/Cargo.toml` already tests with. Not a new harness — the same
+# `egui` / `egui_kittest` pair `egui-ui/tests/snapshots.rs` draws with. They are
+# here rather than in `egui-ui` because only this package may move `HOME`
+# (`std::env::set_var` is `unsafe` in edition 2024, which `egui-ui` forbids);
+# see the head of that test for the whole reason.
+egui = "0.33.3"
+egui_kittest = "0.33.3"
+fiotransfer-egui = { path = "egui-ui" }

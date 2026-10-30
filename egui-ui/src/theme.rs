@@ -1,7 +1,9 @@
 //! The design tokens, taken from the webview front end.
 //!
 //! Every colour, radius, size and type size in this module is read off
-//! `frontend/dist/style.css`. A constant is named after the custom property it
+//! `tests/design/style.css` (the frozen copy of the webview front end's
+//! stylesheet, `frontend/dist/style.css`, which the retirement of that front end
+//! removed from the tree). A constant is named after the custom property it
 //! comes from (`--text-2` → [`TEXT_2`]), and the tests at the bottom of the file
 //! re-read the stylesheet and fail if any value here has drifted from the
 //! design, so the two front ends cannot silently diverge.
@@ -950,13 +952,13 @@ mod tests {
 
     // -- reading the stylesheet ---------------------------------------------
 
-    /// `frontend/dist/style.css`, the webview front end's design, read at test
-    /// time so a change to the design fails here rather than in a screenshot.
+    /// `tests/design/style.css`, the webview front end's design — frozen, since
+    /// the webview and its `frontend/dist` are retired — read at test time so a
+    /// change to a token fails here rather than in a screenshot.
     fn stylesheet() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("frontend")
-            .join("dist")
+            .join("tests")
+            .join("design")
             .join("style.css");
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read the stylesheet {}: {e}", path.display()))

@@ -1,13 +1,17 @@
 # A browser capture of the egui front end
 
-The native egui window and the webview front end cannot be compared fairly: the
-native window has its own chrome, its own rasteriser and its own pixel ratio.
-This directory builds the **same** `FioApp` for the browser, draws it on a
-1180x780 `<canvas>`, and has one headless Chromium capture all four screens — the
-same Chromium, the same size, the same device pixel ratio, and (with WebGL) the
-same kind of rasteriser as the webview gets.
+The native egui window and the WKWebView front end it replaced could not be
+compared fairly: the native window has its own chrome, its own rasteriser and its
+own pixel ratio. This directory builds the **same** `FioApp` for the browser,
+draws it on a 1180x780 `<canvas>`, and has one headless Chromium capture all four
+screens — the same Chromium, the same size, the same device pixel ratio, and
+(with WebGL) the same kind of rasteriser the webview had.
 
-It is a measurement apparatus, not a shipping target.
+It is a measurement apparatus, not a shipping target. The webview front end it
+was measured against is retired (the egui app is the app now), so the capture is
+a browser view of the same screens rather than a comparison; the browser build
+carries its own copy of the five data shapes (`src/model_browser.rs`) because the
+engine does not build for wasm32.
 
 ```console
 $ egui-ui/bench/wasm-shots.sh

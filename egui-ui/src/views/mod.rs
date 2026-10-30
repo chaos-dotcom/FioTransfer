@@ -3,5 +3,6 @@
 pub mod history;
 pub mod settings;
 pub mod sidebar;
+pub mod space;
 pub mod transfers;
 pub mod watch;

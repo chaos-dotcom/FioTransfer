@@ -1,9 +1,10 @@
 //! Property tests for the JS bridge: `window.go.main.App[<method>](...)`.
 //!
-//! The contract is the list of calls `frontend/dist/app.js` makes. Each one is
-//! dispatched by `App::dispatch` (`src/app.rs`); the frontend gets either a
-//! value or a message, never "no such method", never a panic and never a hang,
-//! whatever the arguments are. The argument vectors are drawn from the shapes a
+//! The contract is the list of calls the webview front end made
+//! (`tests/contract/app.js`, kept from `frontend/dist/app.js`). Each one is
+//! dispatched by `App::dispatch` (`src/app.rs`, the root shell over
+//! `fiotransfer-core`); the caller gets either a value or a message, never "no
+//! such method", never a panic and never a hang, whatever the arguments are. The argument vectors are drawn from the shapes a
 //! JS caller can produce: `undefined` (which `ipc.postMessage` sends as `null`),
 //! a number where a string is expected, an object where an array is expected, an
 //! empty string, a huge number, a nested object.
@@ -15,8 +16,8 @@
 //! another test thread.
 //!
 //! Panels (`PickFiles`, `PickFolder`, `ExportHistory`, the clipboard) answer as
-//! cancelled before the event loop runs (`mac/dialogs.m`), so they are safe to
-//! call. `Login`, `Reveal`, `OpenURL` and `OpenLogs` are not called: they would
+//! cancelled: the app has no host installed here, and every platform call takes
+//! `fiotransfer_core::host::Host`'s default, so they are safe to call. `Login`, `Reveal`, `OpenURL` and `OpenLogs` are not called: they would
 //! open a browser, a Finder window or a sign-in server for real. Their names are
 //! still checked against the dispatch table.
 
@@ -28,7 +29,7 @@ use std::time::Duration;
 
 use fiotransfer::app::App;
 use fiotransfer::config::{Crumb, Settings};
-use fiotransfer::gui::{assets, BridgeHost};
+use fiotransfer::app::BridgeHost;
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 
@@ -101,9 +102,11 @@ fn is_missing_method(e: &str) -> bool {
 
 // ---------- the contract, read from the frontend ----------
 
-/// Every `call('Name', ...)` in the embedded app.js.
+/// Every `call('Name', ...)` in the webview front end, frozen at
+/// `tests/contract/app.js` (it used to be embedded from `frontend/dist`, which
+/// the egui app no longer has or serves).
 fn appjs_methods() -> BTreeSet<String> {
-    let js = String::from_utf8_lossy(assets::APP_JS).into_owned();
+    let js = include_str!("contract/app.js").to_string();
     let mut out = BTreeSet::new();
     let mut rest = js.as_str();
     while let Some(i) = rest.find("call('") {
@@ -183,6 +186,30 @@ fn args_strategy() -> impl Strategy<Value = Vec<Value>> {
 
 // ---------- the method table ----------
 
+
+/// Fields that lawfully differ between two identical calls: `checked_at` is a
+/// timestamp, stamped when a release check actually runs (with a released
+/// version it does). Everything else must match exactly.
+fn settled(v: serde_json::Value) -> serde_json::Value {
+    fn walk(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(t) = m.get_mut("checked_at") {
+                    *t = serde_json::Value::from(0);
+                }
+                for (_, x) in m.iter_mut() {
+                    walk(x);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let mut v = v;
+    walk(&mut v);
+    v
+}
+
 #[test]
 fn every_appjs_call_has_a_dispatch_arm() {
     let js = appjs_methods();
@@ -261,7 +288,7 @@ proptest! {
         padded.extend(std::iter::repeat(Value::Null).take(pad));
         let a = call(&rt, &sandbox.app(), method, args.clone());
         let b = call(&rt, &sandbox.app(), method, padded.clone());
-        prop_assert_eq!(a, b, "{} answered differently for {:?} and {:?}", method, args, padded);
+        prop_assert_eq!(a.map(settled), b.map(settled), "{} answered differently for {:?} and {:?}", method, args, padded);
     }
 
 }
@@ -277,7 +304,7 @@ fn nulls_in_every_position_decode_like_missing_ones() {
         for k in 0..=6usize {
             let empty = call(&rt, &sandbox.app(), method, vec![]);
             let filled = call(&rt, &sandbox.app(), method, vec![Value::Null; k]);
-            assert_eq!(empty, filled, "{} answered differently for no args and {} nulls", method, k);
+            assert_eq!(empty.map(settled), filled.map(settled), "{} answered differently for no args and {} nulls", method, k);
         }
     }
 }
