@@ -166,6 +166,10 @@ pub async fn dispatch(app: Arc<App>, method: &str, args: Vec<Value>) -> Result<V
             ok(Value::Null)
         }
         "TakeServiceRequests" => ok(app.take_service_requests()),
+        // ---- portal ----
+        "PortalStatus" => ok(app.portal_status()),
+        "PortalReconcile" => ok(app.portal_reconcile().await),
+        "SetPortal" => ok(app.set_portal(&s(&args, 0), &s(&args, 1), &s(&args, 2), b(&args, 3))?),
         // ---- space ----
         "Space" => ok(app.space()),
         "SpaceWalking" => ok(app.space_walking()),

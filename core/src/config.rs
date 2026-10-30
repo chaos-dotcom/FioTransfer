@@ -40,7 +40,41 @@ pub struct Settings {
     pub last_folder_label: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_folder_path: Vec<Crumb>,
+
+    // ---- Portal ----
+    // Every field is `#[serde(default)]`: a settings.json written before Portal
+    // existed has none of them, and this struct has no field-level defaults, so
+    // without it the whole file would be rejected and every setting lost.
+    //
+    // The bearer token is NOT here: it is a secret, and `portal` keeps it in the
+    // Keychain the way `auth` keeps the Adobe session.
+    /// Portal's base URL, e.g. https://portal.example.com. Empty: not set up.
+    #[serde(default)]
+    pub portal_url: String,
+    /// Where the project folders live on this Mac. The folder name comes from
+    /// the link's turbosort marker; Portal's own destination paths are not used.
+    #[serde(default = "default_portal_root")]
+    pub portal_root: String,
+    /// Reconcile watch folders from Portal in the background (off by default).
+    #[serde(default)]
+    pub portal_enabled: bool,
+    /// What a mirrored watch does with a local file that changed: overwrite or
+    /// keep its earlier copy on Frame.io.
+    #[serde(default = "default_portal_on_change")]
+    pub portal_on_change: String,
+    /// Seconds between Portal reconciles.
+    #[serde(default = "default_portal_every")]
+    pub portal_every_secs: i64,
 }
+
+/// Default for `Settings::portal_root`: ~/Live_Work.
+pub const PORTAL_ROOT_DIR: &str = "Live_Work";
+/// Default for `Settings::portal_every_secs`.
+pub const PORTAL_EVERY_SECS: i64 = 30;
+/// The shortest interval a poller may be asked for.
+pub const PORTAL_MIN_EVERY_SECS: i64 = 5;
+/// Default for `Settings::portal_on_change` (the watch row's own default too).
+pub const PORTAL_ON_CHANGE: &str = crate::history::watch::ON_CHANGE_OVERWRITE;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -57,6 +91,11 @@ impl Default for Settings {
             last_folder_id: String::new(),
             last_folder_label: String::new(),
             last_folder_path: Vec::new(),
+            portal_url: String::new(),
+            portal_root: default_portal_root(),
+            portal_enabled: false,
+            portal_on_change: PORTAL_ON_CHANGE.to_string(),
+            portal_every_secs: PORTAL_EVERY_SECS,
         }
     }
 }
@@ -64,6 +103,32 @@ impl Default for Settings {
 impl Settings {
     pub fn folder_logs(&self) -> bool {
         !self.no_folder_logs
+    }
+
+    /// The local root Portal's project folders are mirrored under, with a
+    /// leading `~` expanded: `~/Live_Work` by default.
+    pub fn portal_root_path(&self) -> PathBuf {
+        let root = if self.portal_root.trim().is_empty() { default_portal_root() } else { self.portal_root.clone() };
+        expand_home(root.trim())
+    }
+
+    /// What a mirrored watch does with a file that changed: `overwrite` unless
+    /// the setting is one of the watch's own rules.
+    pub fn portal_change_rule(&self) -> String {
+        match self.portal_on_change.as_str() {
+            crate::history::watch::ON_CHANGE_KEEP => crate::history::watch::ON_CHANGE_KEEP.to_string(),
+            _ => crate::history::watch::ON_CHANGE_OVERWRITE.to_string(),
+        }
+    }
+
+    /// Seconds between reconciles, clamped to what the poller can honour.
+    pub fn portal_interval(&self) -> std::time::Duration {
+        let secs = if self.portal_every_secs < PORTAL_MIN_EVERY_SECS {
+            PORTAL_EVERY_SECS
+        } else {
+            self.portal_every_secs.min(86_400)
+        };
+        std::time::Duration::from_secs(secs as u64)
     }
 
     fn normalize(&mut self) {
@@ -86,6 +151,49 @@ impl Settings {
         if self.download_dir.is_empty() {
             self.download_dir = d.download_dir;
         }
+        // Portal: an empty root means "not configured", and the filesystem root
+        // is never a mirror. The URL is stored without a trailing slash so it
+        // joins to a path with exactly one.
+        self.portal_url = self.portal_url.trim().trim_end_matches('/').to_string();
+        if self.portal_root.trim().is_empty() || self.portal_root.trim() == "/" {
+            self.portal_root = d.portal_root;
+        }
+        if self.portal_on_change != crate::history::watch::ON_CHANGE_KEEP {
+            self.portal_on_change = PORTAL_ON_CHANGE.to_string();
+        }
+        if self.portal_every_secs < PORTAL_MIN_EVERY_SECS {
+            self.portal_every_secs = PORTAL_EVERY_SECS;
+        }
+        if self.portal_every_secs > 86_400 {
+            self.portal_every_secs = 86_400;
+        }
+    }
+}
+
+/// `overwrite` unless a settings file says otherwise.
+fn default_portal_on_change() -> String {
+    PORTAL_ON_CHANGE.to_string()
+}
+
+/// The poll interval a settings file gets when it does not say.
+fn default_portal_every() -> i64 {
+    PORTAL_EVERY_SECS
+}
+
+/// ~/Live_Work, the folder Portal's markers point into.
+pub fn default_portal_root() -> String {
+    home_dir().join(PORTAL_ROOT_DIR).to_string_lossy().into_owned()
+}
+
+/// `~` and `~/x` are the user's home; anything else is taken as given.
+fn expand_home(p: &str) -> PathBuf {
+    match p.strip_prefix('~') {
+        Some(rest) if rest.is_empty() => home_dir(),
+        Some(rest) => match rest.strip_prefix('/') {
+            Some(r) => home_dir().join(r),
+            None => PathBuf::from(p),
+        },
+        None => PathBuf::from(p),
     }
 }
 

@@ -209,6 +209,8 @@ core/src/host.rs       what a front end must supply: panels, clipboard, window, 
 core/src/history/      SQLite history, watch rows, unfinished uploads, monthly log
 core/src/share/        Frame.io shares and review links, Smash, WeTransfer, Dropbox,
                        Google Drive, Portal
+core/src/portal/        the Portal client and the watch-folder reconciler its
+                       .turbosort markers drive (mirrored watch folders)
 core/src/xfer/         the transfer engine: manager, upload, download, watch folders
 core/src/update.rs     GitHub releases, checksums, bundle swap, relaunch
 core/src/app.rs        the object every front end drives (every app.js call, as Rust)

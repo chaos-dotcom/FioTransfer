@@ -18,6 +18,6 @@
 pub mod app;
 
 pub use fiotransfer_core::{
-    api, auth, config, history, host, limiter, localcert, login, netx, notify, secret, services,
-    share, update, xfer, App, Host, VERSION,
+    api, auth, config, history, host, limiter, localcert, login, netx, notify, portal, secret,
+    services, share, update, xfer, App, Host, VERSION,
 };

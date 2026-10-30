@@ -22,6 +22,7 @@ use crate::auth::AuthManager;
 use crate::config::{self, Crumb, Settings};
 use crate::host::Host;
 use crate::history;
+use crate::portal;
 use crate::services::ServiceRequest;
 use crate::share;
 use crate::update::{self, Release};
@@ -107,6 +108,13 @@ pub struct App {
     /// re-walking every project.
     space: Mutex<Option<(Instant, Vec<SpaceProject>)>>,
     space_walking: AtomicBool,
+    /// The last Portal reconcile, for the status line.
+    portal_last: Mutex<Option<portal::agent::Report>>,
+    portal_running: AtomicBool,
+    /// Whether a Portal token is stored. Cached because the status line is
+    /// drawn every frame and reading the Keychain is neither free nor silent.
+    /// It is refreshed when a token is stored and at every reconcile.
+    portal_signed_in: AtomicBool,
     upd: Mutex<UpdaterState>,
     updating: AtomicBool,
 }
@@ -139,6 +147,9 @@ impl App {
             started: Mutex::new(None),
             space: Mutex::new(None),
             space_walking: AtomicBool::new(false),
+            portal_last: Mutex::new(None),
+            portal_running: AtomicBool::new(false),
+            portal_signed_in: AtomicBool::new(false),
             upd: Mutex::new(UpdaterState {
                 st: UpdateStatus { current: crate::VERSION.to_string(), state: "idle".into(), ..Default::default() },
                 rel: None,
@@ -162,6 +173,11 @@ impl App {
 
     pub fn hist(&self) -> Option<Arc<history::Store>> {
         self.hist.lock().unwrap().clone()
+    }
+
+    /// The running watcher, if the app has started one.
+    pub fn wat(&self) -> Option<Arc<xfer::watch::Watcher>> {
+        self.wat.lock().unwrap().clone()
     }
 
     /// Hands this app its platform. Called once, before `start`; without a host
@@ -259,6 +275,9 @@ impl App {
         crate::services::start(Arc::clone(self) as Arc<dyn crate::services::ServiceHost>);
         self.init_updates();
         self.start_services();
+        // Portal's poller: idle until Portal is switched on in the settings.
+        self.portal_signed_in.store(portal::signed_in(), Ordering::Relaxed);
+        portal::agent::spawn(Arc::clone(self));
     }
 
     fn viewer(&self) -> Option<(String, String)> {
@@ -599,6 +618,12 @@ impl App {
             cur.download_dir = s.download_dir.clone();
             cur.no_folder_logs = s.no_folder_logs;
             cur.no_update_check = s.no_update_check;
+            // Portal: the non-secret settings only (the token is never here).
+            cur.portal_url = s.portal_url.trim().trim_end_matches('/').to_string();
+            cur.portal_root = s.portal_root.clone();
+            cur.portal_enabled = s.portal_enabled;
+            cur.portal_on_change = s.portal_on_change.clone();
+            cur.portal_every_secs = s.portal_every_secs;
         })
         .map_err(|e| e.to_string())?;
         *self.settings.lock().unwrap() = saved.clone();
@@ -1066,6 +1091,76 @@ impl App {
 
     pub fn take_service_requests(&self) -> Vec<ServiceRequest> {
         crate::services::take()
+    }
+
+    // ---------- Portal ----------
+
+    /// Whether Portal is on, whether a token is stored, and how the last
+    /// reconcile went. No network: the numbers are the last run's.
+    pub fn portal_status(&self) -> portal::agent::PortalStatus {
+        let s = self.settings();
+        let last = self.portal_last.lock().unwrap().clone().unwrap_or_default();
+        portal::agent::PortalStatus {
+            enabled: s.portal_enabled,
+            signed_in: self.portal_signed_in.load(Ordering::Relaxed),
+            url: s.portal_url.clone(),
+            root: s.portal_root_path().to_string_lossy().into_owned(),
+            running: self.portal_running.load(Ordering::Relaxed),
+            last_at: last.at,
+            links_seen: last.links_seen,
+            ensured: last.ensured,
+            removed: last.removed,
+            skipped: last.skipped.len(),
+            error: last.error,
+        }
+    }
+
+    /// Reconciles the watch folders with Portal now. One at a time: a call while
+    /// one is running answers so and changes nothing.
+    pub async fn portal_reconcile(self: &Arc<Self>) -> portal::agent::Report {
+        if self.portal_running.swap(true, Ordering::SeqCst) {
+            return portal::agent::Report {
+                at: xfer::now_ms(),
+                error: "a Portal reconcile is already running".to_string(),
+                ..Default::default()
+            };
+        }
+        let rep = portal::agent::reconcile(self).await;
+        self.portal_signed_in.store(portal::signed_in(), Ordering::Relaxed);
+        *self.portal_last.lock().unwrap() = Some(rep.clone());
+        self.portal_running.store(false, Ordering::SeqCst);
+        self.emit("portal", serde_json::to_value(&rep).unwrap_or(Value::Null));
+        if rep.ensured + rep.removed > 0 {
+            // The watch list the front end is drawing is out of date.
+            self.state_changed();
+        }
+        rep
+    }
+
+    /// Stores Portal's address, its bearer token and the local root, and turns
+    /// the poller on or off. An empty token keeps the one already stored: the
+    /// field is masked in the UI, so an untouched field comes back empty.
+    pub fn set_portal(&self, url: &str, token: &str, root: &str, enabled: bool) -> Result<portal::agent::PortalStatus, String> {
+        let url = url.trim().trim_end_matches('/').to_string();
+        if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err("the Portal URL has to start with http:// or https://".to_string());
+        }
+        let tok = token.trim();
+        if !tok.is_empty() {
+            portal::set_token(tok)?;
+            self.portal_signed_in.store(true, Ordering::Relaxed);
+        }
+        let root = root.trim().to_string();
+        let saved = config::update(|s| {
+            s.portal_url = url.clone();
+            if !root.is_empty() {
+                s.portal_root = root.clone();
+            }
+            s.portal_enabled = enabled;
+        })
+        .map_err(|e| e.to_string())?;
+        *self.settings.lock().unwrap() = saved;
+        Ok(self.portal_status())
     }
 
     // ---------- Shutdown ----------

@@ -106,6 +106,10 @@ impl Store {
         add_column(&conn, "watches", "direction", "TEXT NOT NULL DEFAULT 'upload'");
         add_column(&conn, "watches", "ignore_remote", "INTEGER NOT NULL DEFAULT 0");
         add_column(&conn, "watches", "on_change", "TEXT NOT NULL DEFAULT 'overwrite'");
+        // `origin` ('' for a watch the user made, `portal:<link id>` for one the
+        // Portal reconciler owns) — the older default keeps every existing watch
+        // a local one, which is what the reconciler treats as untouchable.
+        add_column(&conn, "watches", "origin", "TEXT");
         Ok(Store { db: Mutex::new(conn), log_dir: log_dir.to_path_buf(), log_mu: Mutex::new(()) })
     }
 

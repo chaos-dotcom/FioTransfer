@@ -7,7 +7,7 @@ use std::collections::HashMap;
 pub(crate) const WATCH_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS watches(
   id TEXT PRIMARY KEY, local_path TEXT, account_id TEXT, folder_id TEXT, dest_label TEXT,
-  enabled INTEGER, created_at INTEGER);
+  enabled INTEGER, created_at INTEGER, origin TEXT);
 CREATE TABLE IF NOT EXISTS watch_files(
   watch_id TEXT, rel_path TEXT, size INTEGER, mtime INTEGER, state TEXT, attempts INTEGER,
   error TEXT, remote_id TEXT, updated_at INTEGER, PRIMARY KEY(watch_id, rel_path));
@@ -42,6 +42,11 @@ pub struct Watch {
     pub ignore_remote: bool,
     /// ON_CHANGE_OVERWRITE or ON_CHANGE_KEEP.
     pub on_change: String,
+    /// How this watch came to exist. Empty for one the user made; `portal:<link
+    /// id>` for one the Portal reconciler owns, which is the only kind it may
+    /// update or remove. A watch the user made is never touched by Portal,
+    /// whatever folder it points at.
+    pub origin: String,
 }
 
 impl Watch {
@@ -128,8 +133,8 @@ impl Store {
     pub fn add_watch(&self, w: &Watch) -> Result<(), String> {
         let conn = self.db();
         conn.execute(
-            "INSERT INTO watches(id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote, on_change)
-VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO watches(id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote, on_change, origin)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             rusqlite::params![
                 w.id,
                 w.local_path,
@@ -141,6 +146,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?)",
                 w.direction,
                 w.ignore_remote,
                 w.on_change,
+                w.origin,
             ],
         )
         .map(|_| ())
@@ -151,7 +157,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?)",
         let conn = self.db();
         let mut stmt = conn
             .prepare(
-                "SELECT id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote, on_change
+                "SELECT id, local_path, account_id, folder_id, dest_label, enabled, created_at, direction, ignore_remote, on_change, origin
 FROM watches ORDER BY created_at",
             )
             .map_err(|e| e.to_string())?;
@@ -169,6 +175,7 @@ FROM watches ORDER BY created_at",
                 direction: r.get::<_, Option<String>>(7).map_err(|e| e.to_string())?.unwrap_or_default(),
                 ignore_remote: r.get::<_, Option<bool>>(8).map_err(|e| e.to_string())?.unwrap_or(false),
                 on_change: r.get::<_, Option<String>>(9).map_err(|e| e.to_string())?.unwrap_or_default(),
+                origin: r.get::<_, Option<String>>(10).map_err(|e| e.to_string())?.unwrap_or_default(),
             });
         }
         Ok(out)
@@ -177,7 +184,7 @@ FROM watches ORDER BY created_at",
     pub fn update_watch(&self, w: &Watch) -> Result<(), String> {
         let conn = self.db();
         conn.execute(
-            "UPDATE watches SET local_path=?, account_id=?, folder_id=?, dest_label=?, direction=?, ignore_remote=?, on_change=? WHERE id=?",
+            "UPDATE watches SET local_path=?, account_id=?, folder_id=?, dest_label=?, direction=?, ignore_remote=?, on_change=?, origin=? WHERE id=?",
             rusqlite::params![
                 w.local_path,
                 w.account_id,
@@ -186,6 +193,7 @@ FROM watches ORDER BY created_at",
                 w.direction,
                 w.ignore_remote,
                 w.on_change,
+                w.origin,
                 w.id,
             ],
         )

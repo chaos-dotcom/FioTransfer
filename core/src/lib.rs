@@ -27,6 +27,7 @@ pub mod login;
 pub mod netx;
 pub mod osopen;
 pub mod notify;
+pub mod portal;
 pub mod secret;
 
 pub mod history;

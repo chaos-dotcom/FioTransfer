@@ -335,6 +335,9 @@ impl Watcher {
             direction: dir.to_string(),
             on_change: on_change.to_string(),
             ignore_remote: false,
+            // A watch the user makes belongs to the user; the Portal reconciler
+            // stamps its own watches with `set_origin`.
+            origin: String::new(),
         };
         x.ignore_remote = x.downloads() && !include_existing;
         if let Err(e) = self.m.hist.add_watch(&x) {
@@ -352,6 +355,22 @@ impl Watcher {
         self.maybe_list(&s);
         self.spawn_scan(&s);
         Ok(())
+    }
+
+    /// Records how a watch came to exist: `""` for one the user made,
+    /// `portal:<link id>` for one the Portal reconciler owns.
+    ///
+    /// Only the reconciler calls this. A watch with a non-empty origin is one it
+    /// may later update or remove; a watch without one is never its business.
+    pub fn set_origin(&self, id: &str, origin: &str) {
+        let w = {
+            let ws = self.mu.lock().unwrap();
+            let Some(s) = ws.get(id) else { return };
+            let mut g = s.lock();
+            g.w.origin = origin.to_string();
+            g.w.clone()
+        };
+        let _ = self.m.hist.update_watch(&w);
     }
 
     /// set_enabled pauses or resumes a watch.
