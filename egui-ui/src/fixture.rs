@@ -140,6 +140,9 @@ pub fn fixture_state(view: View) -> UiState {
             from_portal: false,
             duplex_id: None,
             lane: Lane::None,
+            account_id: "acct-nightfall".into(),
+            folder_id: "fld-ep04-renders".into(),
+            on_change: "overwrite".into(),
         },
         WatchRow {
             id: "w-dailies".into(),
@@ -151,6 +154,9 @@ pub fn fixture_state(view: View) -> UiState {
             from_portal: false,
             duplex_id: None,
             lane: Lane::None,
+            account_id: "acct-nightfall".into(),
+            folder_id: "fld-ep04-dailies".into(),
+            on_change: "overwrite".into(),
         },
     ];
 
@@ -218,6 +224,9 @@ pub fn fixture_state(view: View) -> UiState {
         },
         history,
         watches,
+        // No dialog is open in a picture of the screen; `watch_editor.png` opens
+        // one on top of exactly this state.
+        watch_editor: None,
         // What the last reading found: two projects the walk added up (one of
         // them not whole — a permission error part way), and one Frame.io sized
         // itself, so its row shows a dash where a file count would be.

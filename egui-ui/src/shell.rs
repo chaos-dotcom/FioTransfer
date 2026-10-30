@@ -39,7 +39,6 @@ use serde_json::Value;
 
 use fiotransfer_core::app::{App, State, UpdateStatus};
 use fiotransfer_core::history;
-use fiotransfer_core::history::watch::{DIR_UPLOAD, ON_CHANGE_OVERWRITE};
 use fiotransfer_core::host::Host;
 use fiotransfer_core::portal::agent::PortalStatus;
 use fiotransfer_core::xfer::{DownloadOptions, LinkInfo};
@@ -101,8 +100,8 @@ pub enum Done {
     Update(Box<UpdateStatus>),
     /// A folder chosen for downloads; `None` when the panel was cancelled.
     DownloadDir(Option<String>),
-    /// A folder chosen to watch, remembered for the `AddWatch` that follows;
-    /// `None` forgets the one that was remembered.
+    /// A folder chosen for the watch editor's local-folder field; `None` when the
+    /// panel was cancelled.
     WatchFolder(Option<String>),
     /// `App::portal_sign_in`'s answer: the new status, or the sentence to show
     /// under the field. The password is not part of either.
@@ -139,9 +138,6 @@ pub struct Shell {
     link_seq: u64,
     /// The same for `Login`, whose first attempt is cancelled by the second.
     login_seq: u64,
-    /// The folder `PickWatchFolder` answered, waiting for the `AddWatch` that
-    /// needs a destination.
-    watch_folder: Option<String>,
     /// The expanded job whose files are in `UiState::files`, and when they were
     /// read.
     files_for: Option<String>,
@@ -201,7 +197,6 @@ impl Shell {
             hist_kind: String::new(),
             link_seq: 0,
             login_seq: 0,
-            watch_folder: None,
             files_for: None,
             files_at: None,
             space_asked: false,
@@ -327,6 +322,8 @@ impl Shell {
                     let _ = tx.send(Update::Done(Done::Changed));
                 });
             }
+            // The watch editor's "Choose…": a folder panel, and the answer goes
+            // into the dialog's local-folder field (`Done::WatchFolder`).
             Request::PickWatchFolder => {
                 self.panel(|app, tx| {
                     let folder = app.pick_watch_folder();
@@ -565,30 +562,45 @@ impl Shell {
 
             // ---- watch folders ----
             Request::Watches => self.read_watches(ui),
-            Request::AddWatch => {
-                // The folder `PickWatchFolder` answered, if the Watch screen asked
-                // for one first; otherwise this is the whole flow.
-                let remembered = self.watch_folder.clone();
-                self.panel(move |app, tx| {
-                    let Some(folder) = remembered.or_else(|| app.pick_watch_folder()) else {
-                        // Cancelled: no watch, no toast (the webview's `if (!p) return`).
-                        return;
-                    };
-                    let settings = app.settings();
-                    let added = app.add_watch(
+            // The editor's Save, in create mode: every value is the dialog's, and
+            // nothing is read from the settings behind it. `add_watch` walks the
+            // folder for its baseline, so it runs off the draw thread.
+            Request::AddWatch { local, acct, folder, label, dir, on_change, include_existing } => {
+                self.spawn_blocking(move |app, tx| {
+                    match app.add_watch(
+                        &local,
+                        &acct,
                         &folder,
-                        &settings.last_account_id,
-                        &settings.last_folder_id,
-                        &settings.last_folder_label,
-                        DIR_UPLOAD,
-                        ON_CHANGE_OVERWRITE,
-                        false,
-                    );
-                    match added {
+                        &label,
+                        &dir,
+                        &on_change,
+                        include_existing,
+                    ) {
+                        // No toast on success: the list the shell reads next
+                        // shows the new folder, which is the answer.
                         Ok(()) => {
-                            // The folder has been watched: forget it, so the next
-                            // `AddWatch` asks for its own.
-                            let _ = tx.send(Update::Done(Done::WatchFolder(None)));
+                            let _ = tx.send(Update::Done(Done::Changed));
+                        }
+                        Err(err) => toast(&tx, err, ToastKind::Err),
+                    }
+                });
+            }
+            // The editor's Save, in edit mode. A refusal — a path that is not a
+            // folder, a folder another watch already holds — is the app's own
+            // sentence, and the dialog has already closed by the time it lands.
+            Request::UpdateWatch { id, local, acct, folder, label, dir, on_change, include_existing } => {
+                self.spawn_blocking(move |app, tx| {
+                    match app.update_watch(
+                        &id,
+                        &local,
+                        &acct,
+                        &folder,
+                        &label,
+                        &dir,
+                        &on_change,
+                        include_existing,
+                    ) {
+                        Ok(()) => {
                             let _ = tx.send(Update::Done(Done::Changed));
                         }
                         Err(err) => toast(&tx, err, ToastKind::Err),
@@ -715,8 +727,15 @@ impl Shell {
                 self.save_settings(ui);
             }
             Done::DownloadDir(None) => {}
-            Done::WatchFolder(Some(dir)) => self.watch_folder = Some(dir),
-            Done::WatchFolder(None) => self.watch_folder = None,
+            // The editor's "Choose…" answer lands in the field it was asked for.
+            // A dialog that closed while the panel was up keeps nothing, and a
+            // cancelled panel changes nothing.
+            Done::WatchFolder(Some(dir)) => {
+                if let Some(editor) = &mut ui.watch_editor {
+                    editor.local = dir;
+                }
+            }
+            Done::WatchFolder(None) => {}
             Done::SignedIn(result) => {
                 ui.portal.signing_in = false;
                 // The password goes either way: a refused one is not worth
@@ -1339,10 +1358,20 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_a_screen_adds_uploads_with_the_apps_default_rule() {
-        // The two strings `add_watch` is called with, as `core` validates them.
-        assert!(fiotransfer_core::history::watch::valid_direction(DIR_UPLOAD));
-        assert!(fiotransfer_core::history::watch::valid_on_change(ON_CHANGE_OVERWRITE));
+    fn a_watch_the_editor_saves_is_spelled_the_way_core_validates_it() {
+        // The editor's own words, checked against the two validators `add_watch`
+        // and `update_watch` run: a typo here would be a dialog that never saves.
+        use crate::model::{
+            DIRECTION_DOWNLOAD, DIRECTION_MIRROR, DIRECTION_UPLOAD, ON_CHANGE_KEEP,
+            ON_CHANGE_OVERWRITE,
+        };
+        use fiotransfer_core::history::watch::{valid_direction, valid_on_change};
+        for dir in [DIRECTION_UPLOAD, DIRECTION_DOWNLOAD, DIRECTION_MIRROR] {
+            assert!(valid_direction(dir), "{dir}");
+        }
+        for rule in [ON_CHANGE_OVERWRITE, ON_CHANGE_KEEP] {
+            assert!(valid_on_change(rule), "{rule}");
+        }
     }
 
     #[test]

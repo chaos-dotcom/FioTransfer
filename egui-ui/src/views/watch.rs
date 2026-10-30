@@ -14,14 +14,25 @@
 //! which one is missing. A watch the user made is still one row of its own,
 //! drawn exactly as it was.
 //!
+//! The pencil opens the **watch folder editor** (`.modal-box` over the list): the
+//! local folder — typed, or chosen from the folder panel — the Frame.io
+//! destination's account and folder ids, a label, the direction, the rule for a
+//! file that changes, and the checkbox for files already there. "Add" opens the
+//! same dialog in create mode. A watch Portal owns opens it read-only, with the
+//! sentence that says where to change it and no Save: the next reconcile would
+//! write over anything an edit here kept.
+//!
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`].
 
-use crate::model::{watch_blocks, Lane, Request, ToastKind, UiState, WatchRow};
+use crate::model::{
+    watch_blocks, Lane, Request, UiState, WatchEditor, WatchRow, DIRECTION_DOWNLOAD,
+    DIRECTION_MIRROR, DIRECTION_UPLOAD, ON_CHANGE_KEEP, ON_CHANGE_OVERWRITE,
+};
 use crate::theme;
 use egui::{
-    Align, Color32, CornerRadius, Layout, Painter, Rect, RichText, Sense, Shape, Stroke, StrokeKind,
-    WidgetInfo, WidgetType, pos2, vec2,
+    Align, Checkbox, Color32, CornerRadius, Id, Label, Layout, Margin, Painter, Rect, RichText,
+    Sense, Shape, Stroke, StrokeKind, TextEdit, WidgetInfo, WidgetType, pos2, vec2,
 };
 
 /// The sidebar's width: the stylesheet's media queries are about the *window*,
@@ -90,12 +101,18 @@ fn lane_label(lane: Lane) -> &'static str {
 /// into `call('PickWatchFolder')`, `call('SetWatchEnabled', …)` and so on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// "Add": pick a folder, then choose its Frame.io destination.
+    /// "Add": open the editor for a watch that does not exist yet.
     AddWatch,
     /// The pause/resume button; `index` points into `state.watches`.
     SetEnabled { index: usize, enabled: bool },
-    /// Open the watch folder editor (`.w-edit`).
+    /// Open the watch folder editor for this row (`.w-edit`), with the values the
+    /// row is showing. On a watch Portal owns it opens read-only.
     Edit(usize),
+    /// The editor's "Choose…": a folder panel for the local folder.
+    ChooseFolder,
+    /// The editor's Save: one watch's fields, as they were left in the dialog.
+    /// [`ask`] turns it into `UpdateWatch` or `AddWatch`.
+    SaveWatch(WatchEditor),
     /// Remove the watch folder (`.w-remove`).
     Remove(usize),
     /// Remove a job's lanes together: one Remove on a Smart In/Out Tray, which
@@ -120,7 +137,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
 /// the id is that row's and no other.
 fn ask(state: &mut UiState, action: Action) {
     match action {
-        Action::AddWatch => state.ask(Request::AddWatch),
         Action::SetEnabled { index, enabled } => {
             if let Some(id) = state.watches.get(index).map(|watch| watch.id.clone()) {
                 state.ask(Request::SetWatchEnabled { id, on: enabled });
@@ -149,13 +165,28 @@ fn ask(state: &mut UiState, action: Action) {
                 state.ask(Request::Reveal(local));
             }
         }
-        // The webview's watch editor (`.w-edit`, the folder + destination
-        // picker) was not ported to this window. The pencil stays where the
-        // webview draws it, and says so instead of pretending to open a dialog.
-        Action::Edit(_) => state.push_toast(
-            "The watch folder editor is not built in this window yet",
-            ToastKind::Info,
-        ),
+        // The pencil opens the editor with the values the row is drawing, so what
+        // the dialog shows is what the app has — not a stale copy of it.
+        Action::Edit(index) => {
+            let editor = state.watches.get(index).map(WatchEditor::editing);
+            if let Some(editor) = editor {
+                state.watch_editor = Some(editor);
+            }
+        }
+        // "Add" opens the same dialog with nothing in it but the destination the
+        // app remembers; the folder is chosen inside it.
+        Action::AddWatch => {
+            let editor = WatchEditor::creating(&state.settings);
+            state.watch_editor = Some(editor);
+        }
+        Action::ChooseFolder => state.ask(Request::PickWatchFolder),
+        // Save is the only thing that asks the app for anything; the dialog is
+        // closed first, so a refusal is a toast over the list rather than over a
+        // form the user can no longer fix.
+        Action::SaveWatch(editor) => {
+            state.watch_editor = None;
+            state.ask(editor.request());
+        }
     }
 }
 
@@ -178,6 +209,8 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
 
     if state.watches.is_empty() {
         empty_state(ui, "No watch folders");
+        // An empty list can still have a dialog open: that is what Add is for.
+        editor(ui, state, &mut action);
         return action;
     }
 
@@ -197,6 +230,11 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
             }
         }
     }
+
+    // The editor goes last and on top, as the Space screen's confirmation does:
+    // `egui::Modal` puts it in the foreground layer and keeps clicks off the rows
+    // underneath.
+    editor(ui, state, &mut action);
 
     action
 }
@@ -579,6 +617,363 @@ fn actions_cell(
     });
 }
 
+// ---------- the watch folder editor ----------
+
+/// The dialog's words. They are quoted in the tests, so none of them can be
+/// softened without a test noticing.
+pub const EDITOR_TITLE_EDIT: &str = "Edit watch folder";
+pub const EDITOR_TITLE_NEW: &str = "Add a watch folder";
+/// What a watch Portal owns says, where the Save would be.
+pub const EDITOR_PORTAL: &str = "Kept in step by Portal — change it in Portal";
+pub const EDITOR_SAVE: &str = "Save";
+pub const EDITOR_CANCEL: &str = "Cancel";
+/// The read-only dialog has nothing to cancel, so it says what it does instead.
+pub const EDITOR_CLOSE: &str = "Close";
+pub const EDITOR_CHOOSE: &str = "Choose…";
+pub const EDITOR_LABEL_FOLDER: &str = "Local folder";
+pub const EDITOR_LABEL_ACCOUNT: &str = "Account id";
+pub const EDITOR_LABEL_FOLDER_ID: &str = "Folder id";
+pub const EDITOR_LABEL_NAME: &str = "Label";
+pub const EDITOR_LABEL_DIRECTION: &str = "Direction";
+pub const EDITOR_LABEL_ON_CHANGE: &str = "On change";
+pub const EDITOR_INCLUDE: &str = "Include files already there";
+/// What the checkbox means, under it: the core reads it on every save, and only a
+/// side that is new has anything already there to include.
+pub const EDITOR_INCLUDE_HELP: &str =
+    "Ticked, what is already in the folder is transferred too. Unticked, only what \
+     appears after the save is.";
+
+/// The modal's id, so egui keeps its place and the backdrop across frames.
+const EDITOR_ID: &str = "fiotransfer-egui.watch.editor";
+/// `.edit-row`'s label column is 80 px, as the Space screen's dialog has it.
+const EDITOR_LABEL_W: f32 = 80.0;
+/// Room kept for "Choose…" on the local-folder row, as `.set-line` keeps 100 px
+/// for "Change…".
+const EDITOR_CHOOSE_W: f32 = 100.0;
+
+/// The two segmented controls, in the order the stylesheet's `.segmented` has
+/// them: the core's value first, then the words on screen.
+const DIRECTIONS: [(&str, &str); 3] = [
+    (DIRECTION_UPLOAD, "Upload"),
+    (DIRECTION_DOWNLOAD, "Download"),
+    (DIRECTION_MIRROR, "Mirror"),
+];
+const ON_CHANGES: [(&str, &str); 2] = [(ON_CHANGE_OVERWRITE, "Overwrite"), (ON_CHANGE_KEEP, "Keep")];
+
+/// What the dialog decided this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    None,
+    Cancel,
+    Save,
+    Choose,
+}
+
+/// Draws the editor when one is open, and reports what it decided.
+///
+/// Cancel and Save both close it here, so the dialog the next frame draws is the
+/// one the shell asked for — never a form still open over a list that has moved
+/// on under it.
+fn editor(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let Some(editor) = state.watch_editor.as_mut() else {
+        return;
+    };
+    let ctx = ui.ctx().clone();
+    match editor_dialog(&ctx, editor) {
+        Decision::None => {}
+        Decision::Cancel => state.watch_editor = None,
+        Decision::Choose => *action = Some(Action::ChooseFolder),
+        Decision::Save => {
+            if let Some(editor) = state.watch_editor.take() {
+                *action = Some(Action::SaveWatch(editor));
+            }
+        }
+    }
+}
+
+/// `.modal-box`: the folder, the Frame.io destination, the two rules, and the
+/// checkbox for files already there.
+///
+/// Cancel is the default in the same three ways the Space screen's confirmation
+/// makes it one: it takes the keyboard focus when the dialog opens, Enter takes
+/// it, and so do Escape and a click on the backdrop. Save is the only control
+/// that asks the app for anything, and it is off — with the reason under the
+/// fields — until every field it needs is usable. A watch Portal owns has no
+/// Save at all: its values are shown, off, and the sentence says where to change
+/// them.
+fn editor_dialog(ctx: &egui::Context, editor: &mut WatchEditor) -> Decision {
+    let mut decision = Decision::None;
+    let mut cancel_clicked = false;
+    let mut save_clicked = false;
+    let mut choose_clicked = false;
+
+    let width = (ctx.content_rect().width() * 0.92).min(theme::size::MODAL_W);
+    let read_only = editor.read_only;
+    let reason = editor.reason();
+    let title = if editor.id.is_some() { EDITOR_TITLE_EDIT } else { EDITOR_TITLE_NEW };
+    let hint = editor.label_or_folder();
+
+    let modal = egui::Modal::new(Id::new(EDITOR_ID))
+        .frame(theme::modal_frame())
+        .backdrop_color(theme::SCRIM_MODAL)
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+
+            // `.modal-head { padding: 14px 12px 10px 18px }`: the title, and the
+            // close cross — the same dismissal as Cancel, said in one glyph.
+            let _ = egui::Frame::new()
+                .inner_margin(Margin { left: 18, right: 12, top: 14, bottom: 10 })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = theme::space::M;
+                        ui.add(Label::new(
+                            RichText::new(title)
+                                .font(theme::section())
+                                .color(theme::TEXT)
+                                .strong(),
+                        ));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            // The cross is the same dismissal as Cancel, and it is
+                            // drawn only when there is something to discard: a
+                            // read-only dialog has one way out, the Close in its
+                            // foot, rather than two buttons that do the same thing.
+                            if !read_only && icon_button(ui, Glyph::Close, EDITOR_CLOSE) {
+                                cancel_clicked = true;
+                            }
+                        });
+                    });
+                });
+
+            // `.edit-body { padding: 4px 18px 14px; gap: 10px }`
+            let _ = egui::Frame::new()
+                .inner_margin(Margin { left: 18, right: 18, top: 4, bottom: 14 })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = theme::space::L;
+
+                    if read_only {
+                        // `.space-warn-box`: the one sentence this dialog exists
+                        // to say on a watch Portal owns.
+                        note_box(ui, EDITOR_PORTAL);
+                    }
+
+                    ui.add_enabled_ui(!read_only, |ui| {
+                        editor_row(ui, EDITOR_LABEL_FOLDER, |ui, id| {
+                            let field_w = (ui.available_width()
+                                - EDITOR_CHOOSE_W
+                                - theme::space::M)
+                                .max(120.0);
+                            let field_hint = "Choose the folder to watch";
+                            editor_field(ui, &mut editor.local, field_hint, field_w)
+                                .labelled_by(id);
+                            if subtle_button(ui, EDITOR_CHOOSE).clicked() {
+                                choose_clicked = true;
+                            }
+                        });
+                        editor_row(ui, EDITOR_LABEL_ACCOUNT, |ui, id| {
+                            let width = ui.available_width();
+                            editor_field(ui, &mut editor.account_id, "Paste the account id", width)
+                                .labelled_by(id);
+                        });
+                        editor_row(ui, EDITOR_LABEL_FOLDER_ID, |ui, id| {
+                            let width = ui.available_width();
+                            editor_field(ui, &mut editor.folder_id, "Paste the folder id", width)
+                                .labelled_by(id);
+                        });
+                        // The label defaults to the folder's own name, which is
+                        // what the field's hint shows while it is empty.
+                        editor_row(ui, EDITOR_LABEL_NAME, |ui, id| {
+                            let width = ui.available_width();
+                            let hint = hint.clone();
+                            editor_field(ui, &mut editor.label, &hint, width).labelled_by(id);
+                        });
+                        editor_row(ui, EDITOR_LABEL_DIRECTION, |ui, _id| {
+                            segmented(ui, &DIRECTIONS, &mut editor.direction);
+                        });
+                        editor_row(ui, EDITOR_LABEL_ON_CHANGE, |ui, _id| {
+                            segmented(ui, &ON_CHANGES, &mut editor.on_change);
+                        });
+
+                        let boxed = ui.add(Checkbox::new(
+                            &mut editor.include_existing,
+                            RichText::new(EDITOR_INCLUDE)
+                                .font(theme::body())
+                                .color(theme::TEXT_2),
+                        ));
+                        boxed.on_hover_text(EDITOR_INCLUDE_HELP);
+                        ui.add_space(theme::space::S);
+                        ui.add(
+                            Label::new(
+                                RichText::new(EDITOR_INCLUDE_HELP)
+                                    .font(theme::detail())
+                                    .color(theme::TEXT_3),
+                            )
+                            .wrap(),
+                        );
+                    });
+
+                    // Why Save is off, in the app's own words for it: under the
+                    // fields, where the one thing to fix is.
+                    if let Some(reason) = reason {
+                        ui.add_space(theme::space::M);
+                        ui.add(Label::new(
+                            RichText::new(reason).font(theme::detail()).color(theme::ERROR_TEXT),
+                        ));
+                    }
+                });
+
+            // `.modal-foot { border-top: 1px solid var(--border); padding: 12px 14px }`,
+            // with the buttons at the right: Cancel, then the one that writes.
+            let foot = egui::Frame::new()
+                .inner_margin(Margin { left: 14, right: 14, top: 12, bottom: 12 })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = theme::space::M;
+                        let save = if read_only {
+                            None
+                        } else {
+                            Some(primary_button_enabled(ui, EDITOR_SAVE, reason.is_none()))
+                        };
+                        let cancel = subtle_button(
+                            ui,
+                            if read_only { EDITOR_CLOSE } else { EDITOR_CANCEL },
+                        );
+                        // Cancel is focused the moment the dialog opens, as
+                        // `openSpaceConfirm` focused `#sc-cancel`.
+                        if ui.memory(|memory| memory.focused().is_none()) {
+                            cancel.request_focus();
+                        }
+                        // Enter takes the focused button — Cancel — unless Save
+                        // is the one that has it. Escape is `should_close`.
+                        let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        if enter && !save.as_ref().is_some_and(egui::Response::has_focus) {
+                            cancel_clicked = true;
+                        }
+                        save_clicked |= save.is_some_and(|button| button.clicked());
+                        cancel_clicked |= cancel.clicked();
+                    });
+                });
+            // The foot's 1 px rule sits on its top edge.
+            ui.painter().hline(
+                foot.response.rect.x_range(),
+                foot.response.rect.top(),
+                theme::hairline(theme::BORDER),
+            );
+        });
+
+    if cancel_clicked || modal.should_close() {
+        decision = Decision::Cancel;
+    }
+    if choose_clicked {
+        decision = Decision::Choose;
+    }
+    if save_clicked {
+        decision = Decision::Save;
+    }
+    decision
+}
+
+/// `.edit-row`: an 80 px dim label, then the control, which takes the rest of the
+/// width. The label is a real widget so the field it names can be `labelled_by`
+/// it — for a screen reader, and for this screen's own tests.
+fn editor_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, Id)) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = theme::space::XL;
+        let label = ui.allocate_ui_with_layout(
+            vec2(EDITOR_LABEL_W, theme::size::CONTROL_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.add(Label::new(
+                    RichText::new(label).font(theme::detail()).color(theme::TEXT_3),
+                ))
+            },
+        );
+        add(ui, label.inner.id);
+    });
+}
+
+/// `.input`: the surface fill, 10 px either side, the width it is given.
+fn editor_field(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+        ui.add(
+            TextEdit::singleline(text)
+                .hint_text(hint)
+                .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                .desired_width(width.max(60.0)),
+        )
+    })
+    .inner
+}
+
+/// `.segmented`: a `--surface` tray with the active button in `--raised`.
+fn segmented(ui: &mut egui::Ui, options: &[(&str, &str)], value: &mut String) {
+    theme::segmented_frame().show(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = theme::space::XXS;
+        ui.spacing_mut().interact_size.y = theme::size::CONTROL_SM_H;
+        ui.spacing_mut().button_padding = vec2(theme::space::XL, theme::space::XS);
+        for (key, label) in options {
+            let active = value == key;
+            let colour = if active { theme::TEXT } else { theme::TEXT_2 };
+            let button = egui::Button::new(RichText::new(*label).font(theme::body()).color(colour))
+                .fill(if active { theme::RAISED } else { Color32::TRANSPARENT })
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(4))
+                .min_size(vec2(0.0, theme::size::CONTROL_SM_H));
+            if ui.add(button).clicked() && !active {
+                *value = (*key).to_string();
+            }
+        }
+    });
+}
+
+/// `.space-warn-box`: a `--surface` box with a border, for the one sentence a
+/// dialog exists to say.
+fn note_box(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(theme::SURFACE)
+        .stroke(theme::stroke_border_2())
+        .corner_radius(theme::R_S)
+        .inner_margin(Margin { left: 12, right: 12, top: 10, bottom: 10 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                Label::new(RichText::new(text).font(theme::note()).color(theme::TEXT_2)).wrap(),
+            );
+        });
+}
+
+/// `.btn.subtle`: no fill, no border, `--text-2` until it is under the pointer.
+fn subtle_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        {
+            let widgets = &mut ui.style_mut().visuals.widgets;
+            widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+            widgets.hovered.weak_bg_fill = theme::HOVER;
+            widgets.active.weak_bg_fill = theme::HOVER;
+            widgets.inactive.bg_stroke = Stroke::NONE;
+            widgets.hovered.bg_stroke = Stroke::NONE;
+            widgets.active.bg_stroke = Stroke::NONE;
+            widgets.inactive.fg_stroke = theme::hairline(theme::TEXT_2);
+            widgets.hovered.fg_stroke = theme::hairline(theme::TEXT);
+            widgets.active.fg_stroke = theme::hairline(theme::TEXT);
+        }
+        ui.add(
+            egui::Button::new(RichText::new(text).font(theme::body()))
+                .min_size(vec2(0.0, theme::size::CONTROL_H)),
+        )
+    })
+    .inner
+}
+
 // ---------- the pieces of the table ----------
 
 /// One full-width strip: the hover wash, the row padding, the 1 px bottom
@@ -733,6 +1128,8 @@ enum Glyph {
     Pencil,
     Reveal,
     Trash,
+    /// `.icon-btn`'s close cross, as the Space screen's dialog has it.
+    Close,
 }
 
 impl Glyph {
@@ -837,6 +1234,17 @@ fn paint(painter: &Painter, rect: Rect, glyph: Glyph, colour: Color32, size: f32
                 stroke,
             );
         }
+        Glyph::Close => {
+            let arm = s * 0.55;
+            painter.line_segment(
+                [pos2(c.x - arm, c.y - arm), pos2(c.x + arm, c.y + arm)],
+                stroke,
+            );
+            painter.line_segment(
+                [pos2(c.x + arm, c.y - arm), pos2(c.x - arm, c.y + arm)],
+                stroke,
+            );
+        }
         Glyph::Trash => {
             let body = Rect::from_center_size(
                 pos2(c.x, c.y + s * 0.12),
@@ -904,32 +1312,44 @@ pub fn short_path(path: &str, home: &str) -> String {
 /// The fill goes on the widget states rather than on the button, so `:hover`
 /// still brightens to `--brand-hover`.
 fn primary_button(ui: &mut egui::Ui, text: &str) -> bool {
-    let mut clicked = false;
+    primary_button_enabled(ui, text, true).clicked()
+}
+
+/// The same button, off: `.btn:disabled` is the same `--brand` fill at 40 %
+/// alpha, with no interaction at all.
+///
+/// egui asks `noninteractive` for a widget that is off, so the fill, the stroke
+/// and the words are set there too rather than being left to the default grey.
+fn primary_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
     ui.scope(|ui| {
         {
             let widgets = &mut ui.style_mut().visuals.widgets;
             widgets.inactive.weak_bg_fill = theme::BRAND;
             widgets.hovered.weak_bg_fill = theme::BRAND_HOVER;
             widgets.active.weak_bg_fill = theme::BRAND_HOVER;
+            widgets.noninteractive.weak_bg_fill = theme::BRAND.gamma_multiply(0.4);
             widgets.inactive.bg_stroke = Stroke::NONE;
             widgets.hovered.bg_stroke = Stroke::NONE;
             widgets.active.bg_stroke = Stroke::NONE;
+            widgets.noninteractive.bg_stroke = Stroke::NONE;
             widgets.inactive.fg_stroke = theme::hairline(theme::WHITE);
             widgets.hovered.fg_stroke = theme::hairline(theme::WHITE);
             widgets.active.fg_stroke = theme::hairline(theme::WHITE);
+            widgets.noninteractive.fg_stroke = theme::hairline(theme::WHITE.gamma_multiply(0.4));
         }
-        clicked = ui
-            .add(
-                egui::Button::new(
-                    RichText::new(text)
-                        .font(theme::body())
-                        .color(theme::WHITE),
-                )
-                .min_size(vec2(0.0, theme::size::CONTROL_H)),
+        if !enabled {
+            ui.disable();
+        }
+        ui.add(
+            egui::Button::new(
+                RichText::new(text)
+                    .font(theme::body())
+                    .color(if enabled { theme::WHITE } else { theme::WHITE.gamma_multiply(0.4) }),
             )
-            .clicked();
-    });
-    clicked
+            .min_size(vec2(0.0, theme::size::CONTROL_H)),
+        )
+    })
+    .inner
 }
 
 /// `.empty`: 72 px of air, a 44 px icon tile, then the title.
@@ -959,7 +1379,7 @@ fn empty_state(ui: &mut egui::Ui, heading: &str) {
 mod tests {
     use super::*;
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT as _, Queryable};
 
     fn watch(local: &str, label: &str, direction: &str, enabled: bool, pending: i64) -> WatchRow {
         WatchRow {
@@ -974,6 +1394,11 @@ mod tests {
             from_portal: false,
             duplex_id: None,
             lane: Lane::None,
+            // The two ids and the rule, as the app's `WatchView` carries them:
+            // the editor opens on these, so a test can tell them from a default.
+            account_id: "acct-fixture".to_string(),
+            folder_id: format!("fld:{local}"),
+            on_change: "overwrite".to_string(),
         }
     }
 
@@ -1175,26 +1600,208 @@ mod tests {
         );
     }
 
-    #[test]
-    fn add_asks_the_app_for_a_watch() {
-        let mut harness = screen_harness(state_with(Vec::new()));
+    // ---------- the watch folder editor ----------
 
-        harness.get_by_label("Add").click();
+    /// A draft with the two Frame.io ids in it: everything a save needs but the
+    /// folder, which is what the tests about the folder vary.
+    fn draft(local: &str) -> WatchEditor {
+        WatchEditor {
+            id: Some("id:/Users/chaos/Movies/Rushes".to_string()),
+            local: local.to_string(),
+            account_id: "acct-1".to_string(),
+            folder_id: "fld-1".to_string(),
+            label: "Rushes 2026".to_string(),
+            direction: DIRECTION_UPLOAD.to_string(),
+            on_change: ON_CHANGE_OVERWRITE.to_string(),
+            include_existing: false,
+            read_only: false,
+        }
+    }
+
+    fn state_with_editor(watches: Vec<WatchRow>, editor: WatchEditor) -> UiState {
+        let mut state = state_with(watches);
+        state.watch_editor = Some(editor);
+        state
+    }
+
+    #[test]
+    fn the_pencil_opens_the_editor_with_the_rows_values() {
+        let mut harness = screen_harness(state_with(vec![watch(
+            "/Users/chaos/Movies/Rushes",
+            "Rushes 2026",
+            "upload",
+            true,
+            3,
+        )]));
+
+        harness.get_by_label("Edit").click();
         harness.run();
 
+        // The dialog, and every row it has, in the words it says them in.
+        harness.get_by_label(EDITOR_TITLE_EDIT);
+        for label in [
+            EDITOR_LABEL_FOLDER,
+            EDITOR_LABEL_ACCOUNT,
+            EDITOR_LABEL_FOLDER_ID,
+            EDITOR_LABEL_NAME,
+            EDITOR_LABEL_DIRECTION,
+            EDITOR_LABEL_ON_CHANGE,
+        ] {
+            harness.get_by_label(label);
+        }
+        harness.get_by_label(EDITOR_INCLUDE);
+
+        // The fields are the row's own values, drawn in the fields themselves —
+        // not the app's last destination, and not a blank form.
+        assert_eq!(
+            harness.get_by_label(EDITOR_LABEL_FOLDER).value().as_deref(),
+            Some("/Users/chaos/Movies/Rushes")
+        );
+        assert_eq!(harness.get_by_label(EDITOR_LABEL_ACCOUNT).value().as_deref(), Some("acct-fixture"));
+        assert_eq!(
+            harness.get_by_label(EDITOR_LABEL_FOLDER_ID).value().as_deref(),
+            Some("fld:/Users/chaos/Movies/Rushes")
+        );
+        assert_eq!(harness.get_by_label(EDITOR_LABEL_NAME).value().as_deref(), Some("Rushes 2026"));
+
+        // Opening a dialog asks the app for nothing.
         assert!(
-            harness.state().requests.contains(&Request::AddWatch),
+            harness.state().requests.is_empty(),
             "requests: {:?}",
             harness.state().requests
         );
     }
 
     #[test]
-    fn the_pencil_says_the_editor_is_not_built() {
+    fn the_editor_saves_exactly_the_values_it_shows() {
         let mut harness = screen_harness(state_with(vec![watch(
             "/Users/chaos/Movies/Rushes",
             "Rushes 2026",
             "upload",
+            true,
+            3,
+        )]));
+        harness.get_by_label("Edit").click();
+        harness.run();
+
+        // Retype the label the way a person does: focus the field, select what is
+        // there, type over it.
+        harness.get_by_label(EDITOR_LABEL_NAME).focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by_label(EDITOR_LABEL_NAME).type_text("Rushes v2");
+        harness.run();
+        assert_eq!(harness.get_by_label(EDITOR_LABEL_NAME).value().as_deref(), Some("Rushes v2"));
+
+        // Keep the files that changed rather than overwriting them, so the second
+        // segmented control is shown to save what was picked too.
+        harness.get_by_label("Keep").click();
+        harness.run();
+
+        harness.get_by_label(EDITOR_SAVE).click();
+        harness.run();
+
+        let expected = Request::UpdateWatch {
+            id: "id:/Users/chaos/Movies/Rushes".to_string(),
+            local: "/Users/chaos/Movies/Rushes".to_string(),
+            acct: "acct-fixture".to_string(),
+            folder: "fld:/Users/chaos/Movies/Rushes".to_string(),
+            label: "Rushes v2".to_string(),
+            dir: DIRECTION_UPLOAD.to_string(),
+            on_change: ON_CHANGE_KEEP.to_string(),
+            include_existing: false,
+        };
+        assert!(
+            harness.state().requests.contains(&expected),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        // One request, the save, and the dialog is closed.
+        assert_eq!(harness.state().requests.len(), 1, "{:?}", harness.state().requests);
+        assert!(harness.state().watch_editor.is_none());
+        assert!(harness.query_by_label(EDITOR_TITLE_EDIT).is_none());
+    }
+
+    #[test]
+    fn cancel_and_escape_close_the_editor_and_ask_for_nothing() {
+        let mut harness = screen_harness(state_with(vec![watch(
+            "/Users/chaos/Movies/Rushes",
+            "Rushes 2026",
+            "upload",
+            true,
+            3,
+        )]));
+
+        harness.get_by_label("Edit").click();
+        harness.run();
+        harness.get_by_label(EDITOR_CANCEL).click();
+        harness.run();
+        assert!(harness.state().watch_editor.is_none(), "Cancel closes the dialog");
+        assert!(
+            harness.state().requests.is_empty(),
+            "nothing is saved: {:?}",
+            harness.state().requests
+        );
+
+        harness.get_by_label("Edit").click();
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().watch_editor.is_none(), "Escape closes the dialog");
+        assert!(
+            harness.state().requests.is_empty(),
+            "nothing is saved: {:?}",
+            harness.state().requests
+        );
+        assert!(harness.query_by_label(EDITOR_TITLE_EDIT).is_none());
+        // The row is on screen, unchanged, with its pencil still there.
+        harness.get_by_label("Edit");
+    }
+
+    #[test]
+    fn save_is_off_with_its_reason_while_the_folder_is_empty() {
+        let mut harness = screen_harness(state_with_editor(
+            vec![watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3)],
+            WatchEditor { local: String::new(), ..draft("") },
+        ));
+        harness.run();
+
+        let save = harness.get_by_label(EDITOR_SAVE);
+        assert!(
+            save.accesskit_node().is_disabled(),
+            "Save is off until there is a folder to watch"
+        );
+        harness.get_by_label("Choose the folder to watch first.");
+
+        // A path that is not absolute is not a folder either, and the sentence
+        // changes to say what is wrong with it.
+        harness.get_by_label(EDITOR_LABEL_FOLDER).focus();
+        harness.run();
+        harness.get_by_label(EDITOR_LABEL_FOLDER).type_text("Movies/Rushes");
+        harness.run();
+        harness.get_by_label("The folder has to be an absolute path, starting at /.");
+        assert!(harness.get_by_label(EDITOR_SAVE).accesskit_node().is_disabled());
+
+        // Select it and type the absolute path: Save comes on.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by_label(EDITOR_LABEL_FOLDER).type_text("/Users/chaos/Movies/Rushes");
+        harness.run();
+        assert!(
+            !harness.get_by_label(EDITOR_SAVE).accesskit_node().is_disabled(),
+            "an absolute folder and both ids are enough to save"
+        );
+        assert!(
+            harness.query_by_label("Choose the folder to watch first.").is_none(),
+            "no reason is shown when there is nothing to fix"
+        );
+    }
+
+    #[test]
+    fn a_watch_portal_owns_is_read_only_and_can_never_be_saved() {
+        let mut harness = screen_harness(state_with(vec![portal_watch(
+            "/Users/chaos/Live_Work/Ep 04",
+            "Shows / Nightfall / Ep 04",
+            "mirror",
             true,
             0,
         )]));
@@ -1202,21 +1809,118 @@ mod tests {
         harness.get_by_label("Edit").click();
         harness.run();
 
-        // Nothing is asked of the app: there is no editor to open yet.
+        // The sentence, and no Save to press: the reconciler would write over
+        // whatever an edit here kept.
+        harness.get_by_label(EDITOR_PORTAL);
+        assert!(
+            harness.query_by_label(EDITOR_SAVE).is_none(),
+            "a Portal watch has no Save"
+        );
+        // The values are still there to read.
+        assert_eq!(
+            harness.get_by_label(EDITOR_LABEL_FOLDER).value().as_deref(),
+            Some("/Users/chaos/Live_Work/Ep 04")
+        );
+
+        harness.get_by_label(EDITOR_CLOSE).click();
+        harness.run();
+        assert!(harness.state().watch_editor.is_none());
         assert!(
             harness.state().requests.is_empty(),
+            "a Portal row never asks for an update: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn add_opens_the_same_editor_for_a_new_watch() {
+        let mut state = state_with(Vec::new());
+        state.settings.last_account_id = "acct-9".to_string();
+        state.settings.last_folder_id = "fld-9".to_string();
+        state.settings.last_folder_label = "Shows / Nightfall".to_string();
+        let mut harness = screen_harness(state);
+
+        harness.get_by_label("Add").click();
+        harness.run();
+
+        // Create mode: the title says so, the folder is the one thing still to
+        // fill in, and the destination starts at the one the app remembers.
+        harness.get_by_label(EDITOR_TITLE_NEW);
+        assert_eq!(harness.get_by_label(EDITOR_LABEL_FOLDER).value().as_deref(), Some(""));
+        assert_eq!(harness.get_by_label(EDITOR_LABEL_ACCOUNT).value().as_deref(), Some("acct-9"));
+        assert_eq!(
+            harness.get_by_label(EDITOR_LABEL_NAME).value().as_deref(),
+            Some("Shows / Nightfall")
+        );
+        assert!(harness.state().watch_editor.as_ref().unwrap().id.is_none());
+        assert!(
+            harness.state().requests.is_empty(),
+            "nothing is asked for until Save: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn a_save_in_create_mode_asks_for_a_new_watch() {
+        let editor = WatchEditor {
+            id: None,
+            local: "/Users/chaos/Movies/New".to_string(),
+            account_id: "acct-9".to_string(),
+            folder_id: "fld-9".to_string(),
+            label: String::new(),
+            ..draft("")
+        };
+        let mut harness = screen_harness(state_with_editor(Vec::new(), editor));
+        harness.run();
+
+        harness.get_by_label(EDITOR_SAVE).click();
+        harness.run();
+
+        // The label was left empty, so it is the folder's own name — the default
+        // the field's hint shows.
+        let expected = Request::AddWatch {
+            local: "/Users/chaos/Movies/New".to_string(),
+            acct: "acct-9".to_string(),
+            folder: "fld-9".to_string(),
+            label: "New".to_string(),
+            dir: DIRECTION_UPLOAD.to_string(),
+            on_change: ON_CHANGE_OVERWRITE.to_string(),
+            include_existing: false,
+        };
+        assert!(
+            harness.state().requests.contains(&expected),
             "requests: {:?}",
             harness.state().requests
         );
-        assert!(
-            harness
-                .state()
-                .toasts
-                .iter()
-                .any(|toast| toast.text.contains("not built in this window")),
-            "toasts: {:?}",
-            harness.state().toasts
-        );
+    }
+
+
+    /// The whole screen with the editor open over it: the dialog, its six rows,
+    /// and the list it was opened from underneath.
+    #[test]
+    fn the_watch_editor_renders_to_png() {
+        let mut harness = screen_harness(state_with(vec![
+            watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3),
+            portal_watch("/Users/chaos/Live_Work/Ep 04", "Shows / Nightfall / Ep 04", "mirror", true, 0),
+        ]));
+        if let Some(pencil) = harness.get_all_by_label("Edit").next() {
+            pencil.click();
+        }
+        // Three frames: the click's, then the two a modal `Area` measures itself
+        // in before it is drawn. (Rendering after two has the whole dialog
+        // clipped away — in the tree, but not in the picture.)
+        harness.run_steps(4);
+        harness.get_by_label(EDITOR_TITLE_EDIT);
+        harness.get_by_label(EDITOR_SAVE);
+        // The render is the artefact: read it back, so a dialog that is in the
+        // tree but not on the screen cannot pass for a picture of one.
+        let image = harness.render().expect("render");
+        let panel = image
+            .pixels()
+            .filter(|pixel| (pixel[0], pixel[1], pixel[2]) == (0x12, 0x14, 0x1e))
+            .count();
+        assert!(panel > 100_000, "the dialog's panel is not on the screen: {panel} px");
+        harness.snapshot("watch_editor");
     }
 
     #[test]

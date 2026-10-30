@@ -833,6 +833,9 @@ mod tests {
                     from_portal: false,
                     duplex_id: None,
                     lane: crate::model::Lane::None,
+                    account_id: "acct-fiorecut".into(),
+                    folder_id: "fld-incoming".into(),
+                    on_change: "overwrite".into(),
                 },
                 WatchRow {
                     id: "w-archive".into(),
@@ -844,6 +847,9 @@ mod tests {
                     from_portal: false,
                     duplex_id: None,
                     lane: crate::model::Lane::None,
+                    account_id: "acct-fiorecut".into(),
+                    folder_id: "fld-archive".into(),
+                    on_change: "overwrite".into(),
                 },
             ],
             ..Default::default()
