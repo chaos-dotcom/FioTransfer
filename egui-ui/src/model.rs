@@ -124,10 +124,33 @@ pub enum Request {
 
     /// Ask for the watch list again (`Watches`).
     Watches,
-    /// Pick a folder, then a destination, and watch it (`AddWatch`).
-    AddWatch,
+    /// Watch `local`, moving files to or from the Frame.io folder `folder` in
+    /// account `acct` (`AddWatch`). This is the editor's Save in create mode: the
+    /// folder is one the user typed or chose, the two ids are pasted, and every
+    /// field is the dialog's own — no settings are read behind its back.
+    AddWatch {
+        local: String,
+        acct: String,
+        folder: String,
+        label: String,
+        dir: String,
+        on_change: String,
+        include_existing: bool,
+    },
     SetWatchEnabled { id: String, on: bool },
     RemoveWatch(String),
+    /// Change a watch's folder, destination, direction and rule for changed
+    /// files (`UpdateWatch`). The editor's Save in edit mode.
+    UpdateWatch {
+        id: String,
+        local: String,
+        acct: String,
+        folder: String,
+        label: String,
+        dir: String,
+        on_change: String,
+        include_existing: bool,
+    },
     RequeueCanceled(String),
 
     /// Walk every account, workspace and project again (`RefreshSpace`).
@@ -181,6 +204,10 @@ pub struct UiState {
     pub snapshot: Snapshot,
     pub history: Vec<HistoryRow>,
     pub watches: Vec<WatchRow>,
+    /// The watch folder editor, while it is open: the draft a pencil or Add
+    /// opened, or `None` when no dialog is up. The screen owns it, so nothing
+    /// the app reads on a tick can close a dialog under the user's hands.
+    pub watch_editor: Option<WatchEditor>,
     /// What the last Frame.io storage reading found, one row per project.
     pub space: Vec<SpaceRow>,
     /// One row per account: how much it uses against its limit, for the Space
@@ -635,6 +662,15 @@ pub struct WatchRow {
     pub duplex_id: Option<String>,
     /// Which sync lane of [`WatchRow::duplex_id`] this watch drives.
     pub lane: Lane,
+    /// The Frame.io account the record names. The row draws the label, not the
+    /// id; the editor opens with it, because `add_watch` and `update_watch` take
+    /// it on every call.
+    pub account_id: String,
+    /// The Frame.io folder the record names, for the same reason.
+    pub folder_id: String,
+    /// `overwrite` or `keep`: what happens to a local file that changes after it
+    /// has been uploaded. Read by the core on every call, so the editor shows it.
+    pub on_change: String,
 }
 
 impl WatchRow {
@@ -658,6 +694,9 @@ impl WatchRow {
             from_portal: fiotransfer_core::portal::agent::link_of(&w.origin).is_some(),
             duplex_id,
             lane,
+            account_id: w.account_id.clone(),
+            folder_id: w.folder_id.clone(),
+            on_change: w.on_change.clone(),
         }
     }
 }
@@ -741,6 +780,163 @@ pub fn in_block_order(rows: Vec<WatchRow>) -> Vec<WatchRow> {
     // the rest rather than dropped.
     out.extend(rest.into_iter().flatten());
     out
+}
+
+// ---------- the watch folder editor ----------
+
+/// The three directions the core understands (`valid_direction` in
+/// `fiotransfer_core::history::watch`), spelled as its records spell them.
+pub const DIRECTION_UPLOAD: &str = "upload";
+pub const DIRECTION_DOWNLOAD: &str = "download";
+pub const DIRECTION_MIRROR: &str = "mirror";
+/// The two rules for a local file that changes after it was uploaded
+/// (`valid_on_change`).
+pub const ON_CHANGE_OVERWRITE: &str = "overwrite";
+pub const ON_CHANGE_KEEP: &str = "keep";
+
+/// The watch folder editor's draft: one watch's fields, as they are being typed.
+///
+/// It lives on [`UiState`] rather than in egui's own store because the shell
+/// fills one field of it: "Choose…" answers through the folder panel, which runs
+/// on the blocking pool, and its answer is put back into [`WatchEditor::local`]
+/// when it lands.
+///
+/// Nothing is written to the app while the dialog is open: [`WatchEditor::request`]
+/// is the only way out that asks for anything, so closing the dialog — Cancel,
+/// Escape or a click on the backdrop — leaves the watch exactly as it was.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchEditor {
+    /// The watch this dialog edits, by the app's id; `None` while it creates one.
+    pub id: Option<String>,
+    /// The local folder the watch reads (upload, mirror) or writes (download).
+    pub local: String,
+    /// The Frame.io account id, pasted — there is no browser for it here.
+    pub account_id: String,
+    /// The Frame.io folder id, pasted.
+    pub folder_id: String,
+    /// The destination's name on screen. Empty means the folder's own name.
+    pub label: String,
+    /// [`DIRECTION_UPLOAD`], [`DIRECTION_DOWNLOAD`] or [`DIRECTION_MIRROR`].
+    pub direction: String,
+    /// [`ON_CHANGE_OVERWRITE`] or [`ON_CHANGE_KEEP`].
+    pub on_change: String,
+    /// The core's `include_existing`: files already in the folder are taken too.
+    /// The core reads it on every call, and only a side that is new uses it.
+    pub include_existing: bool,
+    /// A watch Portal owns. The dialog shows its values and offers no Save: the
+    /// next reconcile would overwrite whatever an edit wrote, so the sentence it
+    /// carries points at Portal instead.
+    pub read_only: bool,
+}
+
+impl WatchEditor {
+    /// The dialog for an existing watch, opened with the values the row carries.
+    pub fn editing(row: &WatchRow) -> WatchEditor {
+        WatchEditor {
+            id: Some(row.id.clone()),
+            local: row.local.clone(),
+            account_id: row.account_id.clone(),
+            folder_id: row.folder_id.clone(),
+            label: row.label.clone(),
+            direction: if row.direction.is_empty() {
+                DIRECTION_UPLOAD.to_string()
+            } else {
+                row.direction.clone()
+            },
+            on_change: if row.on_change.is_empty() {
+                ON_CHANGE_OVERWRITE.to_string()
+            } else {
+                row.on_change.clone()
+            },
+            include_existing: false,
+            read_only: row.from_portal,
+        }
+    }
+
+    /// The dialog for a new watch. The destination starts at the one the app
+    /// remembers (`Settings::last_*`), which is what the webview's Add flow
+    /// watched with; the local folder is the one thing it cannot know.
+    pub fn creating(settings: &Settings) -> WatchEditor {
+        WatchEditor {
+            id: None,
+            local: String::new(),
+            account_id: settings.last_account_id.clone(),
+            folder_id: settings.last_folder_id.clone(),
+            label: settings.last_folder_label.clone(),
+            direction: DIRECTION_UPLOAD.to_string(),
+            on_change: ON_CHANGE_OVERWRITE.to_string(),
+            include_existing: false,
+            read_only: false,
+        }
+    }
+
+    /// Why Save is off, in one sentence, or `None` when every field is usable.
+    ///
+    /// A read-only dialog has no Save to hold back, so it has no reason either.
+    /// The folder is checked for being an absolute path, not for existing: a
+    /// view does not touch the disk, and the core's `add`/`update` answer
+    /// `not a folder: …` for a path that is not there.
+    pub fn reason(&self) -> Option<&'static str> {
+        if self.read_only {
+            return None;
+        }
+        let local = self.local.trim();
+        if local.is_empty() {
+            return Some("Choose the folder to watch first.");
+        }
+        if !local.starts_with('/') {
+            return Some("The folder has to be an absolute path, starting at /.");
+        }
+        if self.account_id.trim().is_empty() {
+            return Some("Paste the Frame.io account id.");
+        }
+        if self.folder_id.trim().is_empty() {
+            return Some("Paste the Frame.io folder id.");
+        }
+        None
+    }
+
+    /// What Save asks the app for: `UpdateWatch` for a watch that exists,
+    /// `AddWatch` for one that does not — the same seven values either way, with
+    /// the ids trimmed and the label filled in if it was left empty.
+    pub fn request(&self) -> Request {
+        let label = self.label_or_folder();
+        match &self.id {
+            Some(id) => Request::UpdateWatch {
+                id: id.clone(),
+                local: self.local.trim().to_string(),
+                acct: self.account_id.trim().to_string(),
+                folder: self.folder_id.trim().to_string(),
+                label,
+                dir: self.direction.clone(),
+                on_change: self.on_change.clone(),
+                include_existing: self.include_existing,
+            },
+            None => Request::AddWatch {
+                local: self.local.trim().to_string(),
+                acct: self.account_id.trim().to_string(),
+                folder: self.folder_id.trim().to_string(),
+                label,
+                dir: self.direction.clone(),
+                on_change: self.on_change.clone(),
+                include_existing: self.include_existing,
+            },
+        }
+    }
+
+    /// The label to save: what was typed, or the folder's own name when the
+    /// field was left empty — the default the field's hint shows.
+    pub fn label_or_folder(&self) -> String {
+        let label = self.label.trim();
+        if !label.is_empty() {
+            return label.to_string();
+        }
+        let local = self.local.trim().trim_end_matches('/');
+        match local.rsplit('/').next() {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => local.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1073,5 +1269,125 @@ mod tests {
 
         // Nothing to group is no blocks, not a block with no rows.
         assert!(watch_blocks(&[]).is_empty());
+    }
+
+    // ---------- the watch folder editor ----------
+
+    fn row_for_editor() -> WatchRow {
+        let (duplex_id, lane) = lane_of("portal:L1", "download");
+        WatchRow {
+            id: "w-1".to_string(),
+            local: "/Users/chaos/Live_Work/LUC/1_DRIVE".to_string(),
+            label: "LUC".to_string(),
+            direction: "download".to_string(),
+            enabled: true,
+            pending: 0,
+            from_portal: true,
+            duplex_id,
+            lane,
+            account_id: "acct-1".to_string(),
+            folder_id: "fld-1".to_string(),
+            on_change: "keep".to_string(),
+        }
+    }
+
+    /// The editor opens on the values the row carries — every one of them, since
+    /// a field it invented would be saved over the record.
+    #[test]
+    fn the_editor_opens_on_the_rows_values() {
+        let editor = WatchEditor::editing(&row_for_editor());
+        assert_eq!(editor.id.as_deref(), Some("w-1"));
+        assert_eq!(editor.local, "/Users/chaos/Live_Work/LUC/1_DRIVE");
+        assert_eq!(editor.account_id, "acct-1");
+        assert_eq!(editor.folder_id, "fld-1");
+        assert_eq!(editor.label, "LUC");
+        assert_eq!(editor.direction, DIRECTION_DOWNLOAD);
+        assert_eq!(editor.on_change, ON_CHANGE_KEEP);
+        assert!(!editor.include_existing, "the checkbox starts off, as the webview's did");
+        // A watch Portal owns is the read-only dialog: no edit here survives the
+        // next reconcile.
+        assert!(editor.read_only);
+        assert!(editor.reason().is_none(), "a read-only dialog has no Save to hold back");
+    }
+
+    /// A watch the user made is editable, and a record with no direction or rule
+    /// in it still opens on something the core accepts.
+    #[test]
+    fn an_empty_record_opens_on_the_defaults_the_core_accepts() {
+        let mut row = row_for_editor();
+        row.from_portal = false;
+        row.direction = String::new();
+        row.on_change = String::new();
+        let editor = WatchEditor::editing(&row);
+        assert!(!editor.read_only);
+        assert_eq!(editor.direction, DIRECTION_UPLOAD);
+        assert_eq!(editor.on_change, ON_CHANGE_OVERWRITE);
+    }
+
+    /// Save is off until the folder is an absolute path and both ids are there,
+    /// and each refusal says which one it is.
+    #[test]
+    fn the_reason_a_save_is_off_names_the_field_to_fix() {
+        let mut editor = WatchEditor { id: Some("w-1".to_string()), ..WatchEditor::default() };
+        assert_eq!(editor.reason(), Some("Choose the folder to watch first."));
+        editor.local = "Movies/Rushes".to_string();
+        assert_eq!(
+            editor.reason(),
+            Some("The folder has to be an absolute path, starting at /.")
+        );
+        editor.local = "/Users/chaos/Movies/Rushes".to_string();
+        assert_eq!(editor.reason(), Some("Paste the Frame.io account id."));
+        editor.account_id = "acct-1".to_string();
+        assert_eq!(editor.reason(), Some("Paste the Frame.io folder id."));
+        editor.folder_id = "fld-1".to_string();
+        assert_eq!(editor.reason(), None);
+        // The label is never a reason: empty means the folder's own name.
+        assert_eq!(editor.label, "");
+        assert_eq!(editor.label_or_folder(), "Rushes");
+        editor.label = "  Rushes 2026 ".to_string();
+        assert_eq!(editor.label_or_folder(), "Rushes 2026");
+    }
+
+    /// Save asks for the right call: an update for a watch that exists, an add
+    /// for one that does not, with the ids trimmed and the label filled in.
+    #[test]
+    fn the_editor_asks_for_an_update_or_an_add_by_what_it_was_opened_on() {
+        let editor = WatchEditor {
+            local: " /Users/chaos/Movies/Rushes ".to_string(),
+            account_id: " acct-1 ".to_string(),
+            folder_id: "fld-1 ".to_string(),
+            direction: DIRECTION_MIRROR.to_string(),
+            on_change: ON_CHANGE_KEEP.to_string(),
+            include_existing: true,
+            ..WatchEditor::default()
+        };
+        // No id: a new watch.
+        assert_eq!(
+            editor.request(),
+            Request::AddWatch {
+                local: "/Users/chaos/Movies/Rushes".to_string(),
+                acct: "acct-1".to_string(),
+                folder: "fld-1".to_string(),
+                label: "Rushes".to_string(),
+                dir: DIRECTION_MIRROR.to_string(),
+                on_change: ON_CHANGE_KEEP.to_string(),
+                include_existing: true,
+            }
+        );
+        // An id: the same seven values, for the watch it names.
+        let editor = WatchEditor { id: Some("w-1".to_string()), ..editor };
+        assert_eq!(
+            editor.request(),
+            Request::UpdateWatch {
+                id: "w-1".to_string(),
+                local: "/Users/chaos/Movies/Rushes".to_string(),
+                acct: "acct-1".to_string(),
+                folder: "fld-1".to_string(),
+                label: "Rushes".to_string(),
+                dir: DIRECTION_MIRROR.to_string(),
+                on_change: ON_CHANGE_KEEP.to_string(),
+                include_existing: true,
+            }
+        );
     }
 }

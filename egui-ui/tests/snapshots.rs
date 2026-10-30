@@ -276,6 +276,9 @@ fn a_tall_screen_scrolls_instead_of_widening() {
             from_portal: false,
             duplex_id: None,
             lane: fiotransfer_egui::model::Lane::None,
+            account_id: "acct-nightfall".into(),
+            folder_id: format!("fld-reel-{i:03}"),
+            on_change: "overwrite".into(),
         })
         .collect();
     let mut harness = Harness::builder()
