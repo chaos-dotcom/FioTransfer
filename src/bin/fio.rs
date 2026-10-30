@@ -7,6 +7,10 @@
 //!   fio ls [account-id [folder-id]]
 //!   fio up <path>... --account <id> --folder <id>
 //!   fio history [-n 20]
+//!   fio portal status [--url <url>]
+//!   fio portal signin <url> <email> | signout
+//!   fio portal reconcile [--url <url>]
+//!   fio portal token <token> | --clear
 
 #![forbid(unsafe_code)]
 // The terminal and signal questions are `fiotransfer-sys`'s; nothing here
@@ -16,11 +20,15 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use fiotransfer::api::Client;
+use fiotransfer::app::App;
 use fiotransfer::auth::AuthManager;
 use fiotransfer::config;
 use fiotransfer::history;
 use fiotransfer::limiter::human_bytes;
+use fiotransfer::portal::{self, agent::PortalStatus, PortalErr};
 use fiotransfer::share;
 use fiotransfer::xfer::{self, manager as xfer_manager, DownloadOptions, Status, UploadOptions};
 
@@ -34,7 +42,10 @@ fn usage() -> ! {
   fio login | logout | whoami                 Adobe sign-in for uploads
   fio ls [account [folder]]                   browse your Frame.io accounts/projects/folders
   fio up <path>... --account ID --folder ID   upload files/folders
-  fio history [-n 20]                         recent transfers"
+  fio history [-n 20]                         recent transfers
+  fio portal status|signin|signout|reconcile|token
+                                              set up and check the Portal connection
+                                              without the GUI (fio portal --help)"
     );
     std::process::exit(2);
 }
@@ -225,6 +236,7 @@ async fn main() {
             }
             println!("Log: {}", h.log_path());
         }
+        "portal" => portal_command(args).await,
         _ => usage(),
     }
 }
@@ -238,6 +250,440 @@ async fn new_manager(client: Arc<Client>, settings: config::Settings) -> Arc<xfe
     let m = xfer_manager::new_manager(client, h, Box::new(move || cell.lock().unwrap().clone()));
     m.set_keep_awake(true);
     m
+}
+
+// ---------- Portal ----------
+
+const PORTAL_USAGE: &str = "fio portal — the Portal connection, set up and checked without the GUI
+
+  fio portal status [--url URL]        is it set up, with which address and account, and how
+                                       the last reconcile went (exit 0 configured, 1 not)
+  fio portal signin <url> <email>      Portal's own admin sign-in; the password comes from
+                                       $FIO_PORTAL_PASSWORD, or one line from stdin
+  fio portal signout                   forget the stored session
+  fio portal reconcile [--url URL]     make the watch folders Portal's markers ask for
+  fio portal token <token> | --clear   store a bearer token instead (TOTP/passkey deployments)
+
+The token and the session are kept in the Keychain, or in a 0600 file under the
+app's data folder where there is no Keychain (FIO_NO_KEYCHAIN=1). Neither is
+ever printed, and neither is written to settings.json.";
+
+fn portal_usage() -> ! {
+    eprintln!("{}", PORTAL_USAGE);
+    std::process::exit(2);
+}
+
+async fn portal_command(args: &[String]) -> ! {
+    let Some((sub, rest)) = args.split_first() else { portal_usage() };
+    match sub.as_str() {
+        "status" => portal_status_command(rest),
+        "signin" => portal_signin_command(rest).await,
+        "signout" => portal_signout_command(),
+        "reconcile" => portal_reconcile_command(rest).await,
+        "token" => portal_token_command(rest),
+        "--help" | "-h" | "help" => {
+            println!("{}", PORTAL_USAGE);
+            std::process::exit(0)
+        }
+        _ => portal_usage(),
+    }
+}
+
+/// The real `App` for one Portal command. `App::new` builds the object and
+/// nothing else: no store, no watcher, no loop.
+///
+/// `App::start` is not called. It belongs to the GUI: it marks unfinished
+/// transfers interrupted, and a CLI run may not do that to an app that is
+/// transferring. The settings this copy carries switch the background poller off
+/// and the update check with it, in memory and never written back, so a
+/// one-command process has nothing to stop.
+fn portal_app(mut settings: config::Settings, url: &str) -> Arc<App> {
+    let url = url.trim().to_string();
+    if !url.is_empty() {
+        settings.portal_url = url;
+    }
+    settings.portal_enabled = false;
+    settings.no_update_check = true;
+    App::new(settings)
+}
+
+/// The same, with the history store, the manager and the watcher that a
+/// reconcile reads and writes the watch list through — opened the way
+/// `tests/portal_live.rs` opens them for a headless run.
+///
+/// The watcher is closed the moment it is made: this process reports what Portal
+/// asks for, and a watch it creates must not start scanning behind the report.
+fn portal_app_for_reconcile(settings: config::Settings, url: &str) -> Arc<App> {
+    let app = portal_app(settings, url);
+    let hist = match history::Store::open(&config::dir(), &config::log_dir()) {
+        Ok(h) => Arc::new(h),
+        Err(e) => fatal(&e),
+    };
+    *app.hist.lock().unwrap() = Some(hist.clone());
+    let cell = {
+        let a = app.clone();
+        move || a.settings()
+    };
+    let mgr = xfer_manager::new_manager(app.api.clone(), hist, Box::new(cell));
+    let wat = xfer::watch::Watcher::new(mgr.clone());
+    wat.close();
+    *app.wat.lock().unwrap() = Some(wat);
+    *app.mgr.lock().unwrap() = Some(mgr);
+    app
+}
+
+/// `App::portal_status()`, with the stored credential read now.
+///
+/// The app caches "a credential is stored" and the email, and fills that cache
+/// in `App::start` and whenever one is stored or forgotten — the lifetime of a
+/// window. One CLI process is one command, so it reads the Keychain (or the
+/// 0600 file standing in for it) here, once. Everything else on the line is the
+/// app's own answer.
+fn portal_status_now(app: &App) -> PortalStatus {
+    let mut st = app.portal_status();
+    let stored = portal::session();
+    st.signed_in = portal::token().is_some() || stored.is_some();
+    st.email = stored.map(|s| s.email).unwrap_or_default();
+    // …and the last reconcile this CLI ran, if it was against this address.
+    if st.last_at <= 0 {
+        if let Some(rec) = read_last_reconcile() {
+            if !st.url.trim().is_empty() && same_url(&rec.url, &st.url) {
+                st.last_at = rec.at;
+                st.links_seen = rec.links_seen;
+                st.ensured = rec.kept;
+                st.removed = rec.removed;
+                st.skipped = rec.skipped;
+                st.error = rec.error;
+            }
+        }
+    }
+    st
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/').eq_ignore_ascii_case(b.trim().trim_end_matches('/'))
+}
+
+/// What `fio portal reconcile` leaves behind for `fio portal status`.
+///
+/// The app keeps the last report in memory, and that lasts as long as a window.
+/// A CLI process is one command, so `reconcile` writes its report to a small file
+/// in the app's own data folder and `status` reads it: the sentence is then the
+/// app's own, with the age and the counts of the run that actually happened,
+/// instead of "not checked yet" a minute after a check. It holds no secret — no
+/// token, no cookie, no password — and settings.json is not touched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct LastReconcile {
+    /// The Portal it ran against: a report about some other address is not this
+    /// address's last check.
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    at: i64,
+    #[serde(default)]
+    links_seen: usize,
+    #[serde(default)]
+    kept: usize,
+    #[serde(default)]
+    removed: usize,
+    #[serde(default)]
+    skipped: usize,
+    #[serde(default)]
+    error: String,
+}
+
+fn last_reconcile_path() -> std::path::PathBuf {
+    config::dir().join("portal-last-reconcile.json")
+}
+
+/// The record, when there is one and it reads back. A record that does not is
+/// not an error: `status` then says what the app says, "not checked yet".
+fn read_last_reconcile() -> Option<LastReconcile> {
+    let raw = std::fs::read(last_reconcile_path()).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Records one run. A failure to write it is not a failure of the run: the report
+/// has been made and is about to be printed either way.
+fn write_last_reconcile(rec: &LastReconcile) {
+    if let Ok(text) = serde_json::to_vec_pretty(rec) {
+        let _ = std::fs::write(last_reconcile_path(), text);
+    }
+}
+
+/// `--url` when it is given, refused the way `App::set_portal` refuses it; empty
+/// when it is not. A typo here fails before a request is made, not inside one.
+fn portal_url_flag(args: &[String]) -> Result<String, String> {
+    let (flag, _) = flags_and_positional(args, &["--url"]);
+    if flag.trim().is_empty() {
+        return Ok(String::new());
+    }
+    check_url(&flag)
+}
+
+/// A Portal address as it is stored: trimmed, without a trailing slash, and one
+/// this client can call.
+fn check_url(u: &str) -> Result<String, String> {
+    let u = u.trim().trim_end_matches('/').to_string();
+    if u.is_empty() {
+        return Err("no Portal URL was given".to_string());
+    }
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        return Err("the Portal URL has to start with http:// or https://".to_string());
+    }
+    Ok(u)
+}
+
+/// The tokens of a line that are not flags: `signin <url> <email>` takes two.
+fn positionals(args: &[String]) -> Vec<String> {
+    args.iter().filter(|a| !a.starts_with('-')).cloned().collect()
+}
+
+fn portal_status_command(args: &[String]) -> ! {
+    let url = match portal_url_flag(args) {
+        Ok(u) => u,
+        Err(e) => fatal(&e),
+    };
+    let app = portal_app(config::load(), &url);
+    let st = portal_status_now(&app);
+    println!("{}", portal_line(&st, xfer::now_ms()));
+    println!("url:        {}", if st.url.is_empty() { "(none)".to_string() } else { st.url.clone() });
+    println!("credential: {}", portal_credential(&st));
+    println!("root:       {}", st.root);
+    std::process::exit(if portal_configured(&st) { 0 } else { 1 });
+}
+
+/// Which credential is stored, in words: the admin's email for a session, the
+/// token's presence for a bearer credential — never the token itself.
+fn portal_credential(st: &PortalStatus) -> String {
+    if !st.signed_in {
+        return "no credential".to_string();
+    }
+    let email = st.email.trim();
+    if email.is_empty() {
+        "an access token is stored".to_string()
+    } else {
+        format!("signed in as {}", email)
+    }
+}
+
+/// Configured: an address to call and a credential to call it with. This is what
+/// the exit code of `fio portal status` answers.
+fn portal_configured(st: &PortalStatus) -> bool {
+    !st.url.trim().is_empty() && st.signed_in
+}
+
+async fn portal_signin_command(args: &[String]) -> ! {
+    let pos = positionals(args);
+    if pos.len() < 2 {
+        portal_usage();
+    }
+    let url = match check_url(&pos[0]) {
+        Ok(u) => u,
+        Err(e) => fatal(&e),
+    };
+    let email = pos[1].trim().to_string();
+    let password = read_password();
+    let app = portal_app(config::load(), &url);
+    // `App::portal_sign_in` keeps the session and the email; the address is kept
+    // here, and only once the sign-in worked, so a refused one leaves a fresh
+    // machine exactly as it was.
+    match app.portal_sign_in(&email, &password).await {
+        Ok(st) => {
+            if let Err(e) = config::update(|s| s.portal_url = url.clone()) {
+                fatal(&format!("signed in, but the Portal address could not be saved: {}", e));
+            }
+            println!("signed in as {}", st.email);
+            std::process::exit(0)
+        }
+        // A one-time code is not a refusal: Portal wants a second factor, and a
+        // password cannot supply one.
+        Err(e) if e == PortalErr::TotpRequired.to_string() => {
+            eprintln!("error: {}", e);
+            eprintln!("A bearer token is needed for this deployment: fio portal token <token>");
+            std::process::exit(2)
+        }
+        Err(e) => fatal(&e),
+    }
+}
+
+/// The Portal password: `$FIO_PORTAL_PASSWORD` when it is set and not empty,
+/// otherwise one line from stdin.
+///
+/// There is no portable no-echo helper here (`sys` has `is_tty` and nothing
+/// else), so on a terminal the prompt says the typing will be visible instead of
+/// pretending it will not be. Off a terminal — piped, `--password-stdin` style,
+/// a script, a CI job — the line is how a password is passed without leaving it
+/// in the shell's history.
+fn read_password() -> String {
+    if let Ok(p) = std::env::var("FIO_PORTAL_PASSWORD") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    let prompt = if stdin_is_tty() {
+        "Portal password (this will be visible: this build has no no-echo prompt): "
+    } else {
+        "Portal password: "
+    };
+    eprint!("{}", prompt);
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        fatal("could not read the password from stdin");
+    }
+    // The line ending only: a password may end in a space.
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    line
+}
+
+fn portal_signout_command() -> ! {
+    let had = portal::session().is_some();
+    let app = portal_app(config::load(), "");
+    let st = app.portal_sign_out();
+    if had {
+        println!("signed out: the stored Portal session is gone.");
+    } else {
+        println!("no Portal session was stored.");
+    }
+    if st.signed_in {
+        println!("A stored access token is still in place: fio portal token --clear forgets it.");
+    }
+    std::process::exit(0);
+}
+
+async fn portal_reconcile_command(args: &[String]) -> ! {
+    let url = match portal_url_flag(args) {
+        Ok(u) => u,
+        Err(e) => fatal(&e),
+    };
+    let app = portal_app_for_reconcile(config::load(), &url);
+    let rep = app.portal_reconcile().await;
+    // Kept before the report is printed or the error ends the command, so
+    // `fio portal status` can say how the last run went even when it failed.
+    write_last_reconcile(&LastReconcile {
+        url: app.settings().portal_url,
+        at: rep.at,
+        links_seen: rep.links_seen,
+        kept: rep.ensured,
+        removed: rep.removed,
+        skipped: rep.skipped.len(),
+        error: rep.error.trim().to_string(),
+    });
+    if !rep.error.trim().is_empty() {
+        // The same sentence the app's status line carries.
+        fatal(rep.error.trim());
+    }
+    println!("links seen: {}", rep.links_seen);
+    println!("kept in step: {}", rep.ensured);
+    println!("removed: {}", rep.removed);
+    for s in &rep.skipped {
+        let link = if s.link.is_empty() { "(no id)".to_string() } else { s.link.clone() };
+        println!("skipped {} \"{}\": {}", link, s.marker, s.reason);
+    }
+    // Read back from the store rather than from the report: what Portal owns now,
+    // which is exactly the folders this run created or brought in line.
+    let rows = app.hist().map(|h| h.watches().unwrap_or_default()).unwrap_or_default();
+    let mine: Vec<_> = rows.into_iter().filter(|w| portal::agent::link_of(&w.origin).is_some()).collect();
+    if !mine.is_empty() {
+        println!("watch folders:");
+        for w in mine {
+            println!("  {} ← {}/{}", w.local_path, w.account_id, w.folder_id);
+        }
+    }
+    std::process::exit(0);
+}
+
+fn portal_token_command(args: &[String]) -> ! {
+    match args {
+        [only] if only == "--clear" => {
+            portal::clear_token();
+            println!("forgot the stored Portal access token.");
+        }
+        [only] if !only.starts_with('-') && !only.trim().is_empty() => match portal::set_token(only) {
+            Ok(()) => println!("stored the Portal access token."),
+            Err(e) => fatal(&e),
+        },
+        _ => portal_usage(),
+    }
+    std::process::exit(0);
+}
+
+/// One number with its word: `1 link`, `4 links`. The same words the Settings
+/// card uses.
+fn counted(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// How long ago the last reconcile ran, in the words a status line can carry.
+/// `at` and `now` are unix milliseconds; a clock that went backwards is "just
+/// now", not a negative age.
+fn portal_when(at: i64, now: i64) -> String {
+    if at <= 0 {
+        return "never".to_string();
+    }
+    let secs = ((now - at).max(0)) / 1000;
+    let ago = |n: i64, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one} ago")
+        } else {
+            format!("{n} {many} ago")
+        }
+    };
+    match secs {
+        0..=4 => "just now".to_string(),
+        5..=59 => "under a minute ago".to_string(),
+        60..=3599 => ago(secs / 60, "min", "min"),
+        3600..=86_399 => ago(secs / 3600, "h", "h"),
+        _ => ago(secs / 86_400, "day", "days"),
+    }
+}
+
+/// The status sentence the Settings card shows.
+///
+/// `views::settings::portal_line` is that sentence in the GUI crate, which this
+/// binary does not link; this is the same line, spelled the same way, from
+/// `App::portal_status()`. The only difference is the pointer at the end of the
+/// two "not set up yet" lines: the card says "above", where the fields are, and
+/// this says which command does the same thing.
+fn portal_line(st: &PortalStatus, now: i64) -> String {
+    if st.url.trim().is_empty() {
+        return if st.signed_in {
+            "No Portal address yet: set one with fio portal signin <url> <email>.".to_string()
+        } else {
+            "Not set up: no Portal address and no token yet.".to_string()
+        };
+    }
+    if !st.signed_in {
+        return "Not signed in yet: store an access token (fio portal token <token>), or sign in (fio portal signin <url> <email>)."
+            .to_string();
+    }
+    if !st.error.trim().is_empty() {
+        return format!("Failed {}: {}", portal_when(st.last_at, now), st.error.trim());
+    }
+    if st.running {
+        return "Reconciling…".to_string();
+    }
+    if st.last_at <= 0 {
+        return "Configured. Portal has not been checked yet.".to_string();
+    }
+    let mut text = format!(
+        "{} · {}, {} kept in step, {} removed",
+        portal_when(st.last_at, now),
+        counted(st.links_seen, "link", "links"),
+        counted(st.ensured, "folder", "folders"),
+        st.removed
+    );
+    if st.skipped > 0 {
+        text.push_str(&format!(", {}", counted(st.skipped, "skipped", "skipped")));
+    }
+    text
 }
 
 fn check_range(flag: &str, v: i64, lo: i64, hi: i64) {
@@ -429,6 +875,14 @@ const STDOUT_FILENO: i32 = 1;
 
 fn is_tty() -> bool {
     fiotransfer_sys::platform::is_tty(STDOUT_FILENO)
+}
+
+/// fd 0, as `libc::STDIN_FILENO`: the password prompt says whether the typing
+/// will be visible only when there is a terminal to see it on.
+const STDIN_FILENO: i32 = 0;
+
+fn stdin_is_tty() -> bool {
+    fiotransfer_sys::platform::is_tty(STDIN_FILENO)
 }
 
 fn signalled() -> bool {
@@ -797,5 +1251,170 @@ mod tests {
         // `fio up` keeps every bare token as a path.
         let (paths, _, _, _) = parse_up_flags(&a(&["a.mov", "--account", "x", "b c.mov"]), &d);
         assert_eq!(paths, vec!["a.mov".to_string(), "b c.mov".to_string()]);
+    }
+
+    // ---------- Portal: the status line, its exit code, and its arguments ----------
+
+    fn status(url: &str, signed_in: bool, email: &str) -> PortalStatus {
+        PortalStatus {
+            url: url.to_string(),
+            signed_in,
+            email: email.to_string(),
+            root: "/r".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Not set up, and the two ways of being half set up, in the card's words.
+    #[test]
+    fn a_portal_that_is_not_set_up_reads_as_the_card_reads_it() {
+        assert_eq!(
+            portal_line(&status("", false, ""), 1_000),
+            "Not set up: no Portal address and no token yet."
+        );
+        // A credential with no address is a fault, and says which command fixes it.
+        let no_url = portal_line(&status("", true, "ops@nightfall.tv"), 1_000);
+        assert!(no_url.starts_with("No Portal address yet"), "{no_url}");
+        assert!(no_url.contains("fio portal signin"), "{no_url}");
+        // An address with no credential is a fault too, and names both ways in.
+        let no_cred = portal_line(&status("http://127.0.0.1:18080", false, ""), 1_000);
+        assert!(no_cred.starts_with("Not signed in yet"), "{no_cred}");
+        assert!(no_cred.contains("fio portal token <token>"), "{no_cred}");
+        assert!(no_cred.contains("fio portal signin"), "{no_cred}");
+        // Nothing that is printed here carries a secret, because none is in it.
+        assert!(!no_cred.to_lowercase().contains("password"), "{no_cred}");
+    }
+
+    /// Configured, never checked; then the counts, with the skipped number only
+    /// when there is one; then a failed run, which shows its reason and no counts.
+    #[test]
+    fn a_configured_portal_says_what_the_last_run_did() {
+        let mut st = status("http://127.0.0.1:18080", true, "chaos@localhost");
+        assert_eq!(portal_line(&st, 1_000), "Configured. Portal has not been checked yet.");
+
+        // Three links, one folder kept in step, one removed, two skipped.
+        st.last_at = 1_000_000;
+        st.links_seen = 3;
+        st.ensured = 1;
+        st.removed = 1;
+        st.skipped = 2;
+        assert_eq!(
+            portal_line(&st, 1_000_000 + 120_000),
+            "2 min ago · 3 links, 1 folder kept in step, 1 removed, 2 skipped"
+        );
+        // One of each, singular; and nothing skipped is not mentioned.
+        st.ensured = 1;
+        st.removed = 0;
+        st.skipped = 0;
+        st.links_seen = 1;
+        assert_eq!(
+            portal_line(&st, 1_000_000 + 3_000),
+            "just now · 1 link, 1 folder kept in step, 0 removed"
+        );
+        // A failed run says so, with its reason, and shows no numbers: there are
+        // none to show.
+        st.error = "  can't reach Portal: timed out  ".to_string();
+        let failed = portal_line(&st, 1_000_000 + 120_000);
+        assert_eq!(failed, "Failed 2 min ago: can't reach Portal: timed out");
+        // A run in progress is neither a success nor a failure.
+        st.error.clear();
+        st.running = true;
+        assert_eq!(portal_line(&st, 1_000_000), "Reconciling…");
+    }
+
+    /// The ages the line can print, at every boundary, and a clock that went
+    /// backwards reading as "just now" rather than as a negative.
+    #[test]
+    fn an_age_is_in_words_at_every_boundary() {
+        let at = 1_000_000_000_000;
+        for (delta_s, want) in [
+            (0, "just now"),
+            (4, "just now"),
+            (5, "under a minute ago"),
+            (59, "under a minute ago"),
+            (60, "1 min ago"),
+            (120, "2 min ago"),
+            (3599, "59 min ago"),
+            (3600, "1 h ago"),
+            (7200, "2 h ago"),
+            (86_399, "23 h ago"),
+            (86_400, "1 day ago"),
+            (172_800, "2 days ago"),
+        ] {
+            assert_eq!(portal_when(at, at + delta_s * 1000), want, "after {}s", delta_s);
+        }
+        assert_eq!(portal_when(at, at - 60_000), "just now", "a clock that went backwards");
+        assert_eq!(portal_when(0, at), "never");
+        assert_eq!(portal_when(-5, at), "never");
+    }
+
+    /// `1 link` / `4 links`, and the same for every noun the line uses.
+    #[test]
+    fn a_count_carries_its_word() {
+        assert_eq!(counted(0, "link", "links"), "0 links");
+        assert_eq!(counted(1, "link", "links"), "1 link");
+        assert_eq!(counted(2, "link", "links"), "2 links");
+        assert_eq!(counted(1, "folder", "folders"), "1 folder");
+        assert_eq!(counted(3, "skipped", "skipped"), "3 skipped");
+    }
+
+    /// Configured is an address *and* a credential: either alone cannot call
+    /// Portal, and `fio portal status` exits 1 for it.
+    #[test]
+    fn configured_needs_an_address_and_a_credential() {
+        assert!(!portal_configured(&status("", true, "a@b")));
+        assert!(!portal_configured(&status("http://p", false, "")));
+        assert!(portal_configured(&status("http://p", true, "")));
+        assert!(portal_configured(&status("http://p", true, "a@b")));
+        // The credential in words, never a value.
+        assert_eq!(portal_credential(&status("http://p", false, "")), "no credential");
+        assert_eq!(portal_credential(&status("http://p", true, "chaos@localhost")), "signed in as chaos@localhost");
+        assert_eq!(portal_credential(&status("http://p", true, "")), "an access token is stored");
+        // A credential with no address says what is missing, not who is signed in:
+        // there is no Portal to be signed in to.
+        assert!(!portal_line(&status("", true, "chaos@localhost"), 0).contains("chaos@localhost"));
+    }
+
+    /// A `--url` is trimmed, loses its trailing slash, and has to be one of the
+    /// two schemes `App::set_portal` accepts.
+    #[test]
+    fn a_url_override_is_checked_the_way_the_app_checks_it() {
+        assert_eq!(check_url("  http://127.0.0.1:18080/  "), Ok("http://127.0.0.1:18080".to_string()));
+        assert_eq!(check_url("https://portal.example.com"), Ok("https://portal.example.com".to_string()));
+        assert_eq!(
+            check_url("127.0.0.1:18080"),
+            Err("the Portal URL has to start with http:// or https://".to_string())
+        );
+        assert_eq!(check_url("ftp://p"), Err("the Portal URL has to start with http:// or https://".to_string()));
+        assert_eq!(check_url("   "), Err("no Portal URL was given".to_string()));
+        // The flag itself: absent, empty, and with no value at all.
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(portal_url_flag(&a(&["status"])), Ok(String::new()));
+        assert_eq!(portal_url_flag(&a(&["--url"])), Ok(String::new()), "a flag with no value is no override");
+        assert_eq!(portal_url_flag(&a(&["--url", "http://p/"])), Ok("http://p".to_string()));
+        assert!(portal_url_flag(&a(&["--url", "p"])).is_err());
+    }
+
+    /// `signin <url> <email>` takes exactly two positionals; a flag is not one.
+    #[test]
+    fn signin_takes_the_url_then_the_email() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(positionals(&a(&["http://p", "chaos@localhost"])).len(), 2);
+        let pos = positionals(&a(&["--url", "http://p", "chaos@localhost"]));
+        assert_eq!(pos, vec!["http://p".to_string(), "chaos@localhost".to_string()]);
+        assert!(positionals(&a(&["http://p"])).len() < 2, "an email is required");
+    }
+
+    /// The words that say a second factor is needed are the app's own sentence,
+    /// compared exactly and not searched for: that is what makes exit 2 the TOTP
+    /// code and exit 1 a refusal.
+    #[test]
+    fn the_second_factor_is_recognised_by_its_exact_sentence() {
+        let totp = PortalErr::TotpRequired.to_string();
+        assert!(totp.contains("one-time code"), "{totp}");
+        assert!(totp.contains("bearer token"), "{totp}");
+        let refused = PortalErr::Login { status: 401, detail: "Invalid email or password".to_string() }.to_string();
+        assert_ne!(refused, totp, "a refused password is not a second factor");
+        assert!(!refused.contains("one-time code"), "{refused}");
     }
 }
