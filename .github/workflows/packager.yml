@@ -69,7 +69,7 @@ jobs:
             libxcb-xfixes0-dev libwayland-dev libudev-dev libssl-dev \
             fuse libfuse2 file
       - name: Package the egui front end (unsigned)
-        run: cargo packager -p fiotransfer-egui --formats deb appimage
+        run: cargo packager -p fiotransfer-egui --formats deb,appimage
       - uses: actions/upload-artifact@v4
         with:
           name: FioTransfer-linux-unsigned
