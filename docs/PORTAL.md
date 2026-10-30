@@ -197,6 +197,31 @@ the idempotence rule, visible.
   created is **unwatched — not deleted**. Removing local media is always your decision.
 * Reconciling twice changes nothing the second time.
 
+## When it says no
+
+Every refusal is a sentence you can act on. The status line, the CLI and the logs use the same words, so
+this table works for all three.
+
+| What you see | What it means | What to do |
+| --- | --- | --- |
+| `Not set up: no Portal address and no token yet.` | Nothing is configured. | Fill in the address, then sign in or paste a token. |
+| `No Portal address yet: add one above.` | A credential is stored, but no URL. | Add the URL, e.g. `https://portal.shed.gay`. |
+| `No access token yet: paste one above and press Save.` | URL set, no credential. | Sign in with the admin email and password, or paste a token. |
+| `Portal refused the sign-in (401): Invalid email or password` | The email or the password is wrong. | Check both against Portal's `.env` (`ADMIN_EMAIL`). |
+| `Portal wants a one-time code…` | The account has a second factor. | Type the six digits — in Settings, or `--totp`/`$FIO_PORTAL_TOTP` for the CLI. |
+| `Portal refused the one-time code (401): Invalid code` | The code was wrong or expired (30 s window). | Wait for the next one and retype it. A phone whose clock is far out will not work. |
+| `Portal refused the token (401). It may be wrong, or Portal's .env may set none at all` | The bearer token is wrong **or does not exist** — Portal answers both the same way. | Check `PORTAL_API_TOKEN` on the server; while it is unset no token can work. Or sign in instead. |
+| `the Portal session expired (401): sign in again…` | The session cookie aged out (14 days) or was replaced. | Sign in again; nothing else needs redoing. |
+| `Portal has no /api/upload-links (404): is that the Portal address?` | The URL is not a Portal, or not this version of one. | Check the address; `/api/health` should answer `{"status":"ok"…}`. |
+| `can't reach Portal: …` | DNS, TLS or the network. | `curl https://your-host/api/health` from the same machine. |
+| `Configured. Press Reconcile now, or switch it on to check every 30 s.` | Nothing has run yet. | Press the button, or switch **Enabled** on. |
+| `just now · 3 links, 0 folders kept in step, 0 removed, 2 skipped` | It ran, found nothing new to do. | Normal on a second run. Read the skip lines below it. |
+| `skipped …: the turbosort marker "…" contains '/': one path segment only` | A marker in Portal is not a single folder name. | Fix the link in Portal; FioTransfer refuses it rather than writing outside the root. |
+
+Two things that are *not* errors, though they look like them: a second reconcile reporting `0 folders kept in
+step` is idempotence working, and `2 skipped` on a Portal that has links without markers is the reconciler
+correctly ignoring them.
+
 ## Checking it without your Portal
 
 ```sh
