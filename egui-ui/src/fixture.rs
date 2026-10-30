@@ -8,8 +8,8 @@
 //! Nothing here does I/O or touches a screen: it builds a [`UiState`] and stops.
 
 use crate::model::{
-    Crumb, FileView, HistoryRow, JobView, Settings, Snapshot, Toast, ToastKind, UiState, UpdateState, User, View,
-    WatchRow,
+    Crumb, FileView, HistoryRow, JobView, Settings, Snapshot, SpaceAccount, SpaceRow, Toast, ToastKind, UiState,
+    UpdateState, User, View, WatchRow,
 };
 
 /// The status a job carries, spelled the way the app spells it — the
@@ -178,6 +178,68 @@ pub fn fixture_state(view: View) -> UiState {
         },
         history,
         watches,
+        // What the last reading found: two projects the walk added up (one of
+        // them not whole — a permission error part way), and one Frame.io sized
+        // itself, so its row shows a dash where a file count would be.
+        space: vec![
+            SpaceRow {
+                account_id: "acct-farbhaus".into(),
+                account_name: "Farbhaus".into(),
+                workspace_name: "Shows".into(),
+                project_id: "proj-nightfall".into(),
+                name: "Nightfall".into(),
+                bytes: 12_400_000_000,
+                files: 1_284,
+                walked: true,
+                error: String::new(),
+            },
+            SpaceRow {
+                account_id: "acct-farbhaus".into(),
+                account_name: "Farbhaus".into(),
+                workspace_name: "Shows".into(),
+                project_id: "proj-archive".into(),
+                name: "Archive 2024".into(),
+                bytes: 2_100_000_000,
+                files: 212,
+                walked: true,
+                error: "403 forbidden: the walk could not read folder 9f2c1a".into(),
+            },
+            SpaceRow {
+                account_id: "acct-farbhaus".into(),
+                account_name: "Farbhaus".into(),
+                workspace_name: "Marketing".into(),
+                project_id: "proj-trailer".into(),
+                name: "Trailer Cutdown".into(),
+                bytes: 640_000_000,
+                files: 0,
+                walked: false,
+                error: String::new(),
+            },
+        ],
+        // The headline's three cases, one per account: a limit with room left, an
+        // account Frame.io says has no limit (`storage_limit: null`), and one
+        // that reports no usage at all.
+        space_accounts: vec![
+            SpaceAccount {
+                account_id: "acct-farbhaus".into(),
+                name: "Farbhaus".into(),
+                limit: Some(2_000_000_000_000),
+                used: Some(1_240_000_000_000),
+            },
+            SpaceAccount {
+                account_id: "acct-archive".into(),
+                name: "Farbhaus Archive".into(),
+                limit: None,
+                used: Some(640_000_000_000),
+            },
+            SpaceAccount {
+                account_id: "acct-quiet".into(),
+                name: "Quiet Account".into(),
+                limit: Some(500_000_000_000),
+                used: None,
+            },
+        ],
+        space_walking: false,
         toasts: vec![
             Toast {
                 text: "Share link copied".into(),
@@ -207,4 +269,19 @@ pub fn fixture_state(view: View) -> UiState {
         // Nothing asked of the app: the fixture is a picture, not a session.
         requests: Vec::new(),
     }
+}
+
+/// The Space screen before anything has been counted: signed in, no projects,
+/// no accounts, no walk running — the state the empty block is written for.
+///
+/// `space-empty.png` is drawn from this, because "nothing counted yet" is half
+/// of what the screen has to say and none of the populated fixture reaches it.
+pub fn fixture_state_empty_space() -> UiState {
+    let mut state = fixture_state(View::Space);
+    state.space.clear();
+    state.space_accounts.clear();
+    state.space_walking = false;
+    state.logged_in = true;
+    state.toasts.clear();
+    state
 }

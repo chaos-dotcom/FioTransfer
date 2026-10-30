@@ -3,7 +3,7 @@
 //! `fiotransfer-core` cannot build for `wasm32-unknown-unknown`: it is tokio,
 //! rustls and rusqlite underneath, and none of those compile there. The browser
 //! build (`src/wasm.rs`) is a *renderer* of the fixture, not the app: it has no
-//! engine, no API and no disk. What it does have is four screens that read
+//! engine, no API and no disk. What it does have is five screens that read
 //! `UiState`, so it needs the types those screens read:
 //!
 //! * [`JobView`], [`FileView`], [`Snapshot`] — what the Transfers screen draws;

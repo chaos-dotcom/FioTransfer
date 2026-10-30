@@ -1,6 +1,6 @@
 //! FioTransfer's egui front end: the app itself.
 //!
-//! `cargo run -p fiotransfer-egui` opens the same four screens as the webview
+//! `cargo run -p fiotransfer-egui` opens the same five screens as the webview
 //! front end, over the same engine (`fiotransfer_core::App`), with the same
 //! strings. The shell that drives it is [`fiotransfer_egui::Shell`]: it owns the
 //! runtime, answers every request a screen pushes, and hands the desktop's
