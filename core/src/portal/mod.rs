@@ -1469,4 +1469,19 @@ mod tests {
         assert_eq!(json_body(br#"{"a":1}"#).unwrap()["a"], 1);
     }
 
+    #[test]
+    fn the_base_url_and_the_path_join_with_exactly_one_separator() {
+        // A Portal behind a proxy on a subpath is a normal deployment.
+        for base in ["https://host/portal", "https://host/portal/", "https://host/portal///"] {
+            let c = PortalClient::new(base, "t");
+            assert_eq!(c.url("/api/upload-links"), "https://host/portal/api/upload-links", "base {base:?}");
+        }
+        // Surrounding whitespace is not part of an address.
+        let c = PortalClient::new("  https://host  ", "t");
+        assert_eq!(c.url("/api/health"), "https://host/api/health");
+        // And an empty base still produces a relative path rather than panicking:
+        // `get` refuses before it ever uses it.
+        assert_eq!(PortalClient::new("", "t").url("/api/health"), "/api/health");
+    }
+
 }
