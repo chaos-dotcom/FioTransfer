@@ -880,6 +880,9 @@ mod tests {
             .build_state(
                 |ctx, state: &mut UiState| {
                     install_inter(ctx);
+                    // The window's strip sits above the panel in the app, so the
+                    // picture of the panel has it: the sidebar starts 32 px down.
+                    crate::chrome::show(ctx);
                     egui::SidePanel::left("sidebar")
                         .exact_width(WIDTH)
                         .resizable(false)
