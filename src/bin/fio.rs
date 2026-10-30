@@ -8,7 +8,7 @@
 //!   fio up <path>... --account <id> --folder <id>
 //!   fio history [-n 20]
 //!   fio portal status [--url <url>]
-//!   fio portal signin <url> <email> | signout
+//!   fio portal signin <url> <email> [--totp CODE] | signout
 //!   fio portal reconcile [--url <url>]
 //!   fio portal token <token> | --clear
 
@@ -258,11 +258,15 @@ const PORTAL_USAGE: &str = "fio portal — the Portal connection, set up and che
 
   fio portal status [--url URL]        is it set up, with which address and account, and how
                                        the last reconcile went (exit 0 configured, 1 not)
-  fio portal signin <url> <email>      Portal's own admin sign-in; the password comes from
-                                       $FIO_PORTAL_PASSWORD, or one line from stdin
+  fio portal signin <url> <email> [--totp CODE]
+                                       Portal's own admin sign-in; the password comes from
+                                       $FIO_PORTAL_PASSWORD, or one line from stdin, and a
+                                       one-time code (two-factor) from --totp, $FIO_PORTAL_TOTP,
+                                       or a second line
   fio portal signout                   forget the stored session
   fio portal reconcile [--url URL]     make the watch folders Portal's markers ask for
-  fio portal token <token> | --clear   store a bearer token instead (TOTP/passkey deployments)
+  fio portal token <token> | --clear   store a bearer token instead (a deployment's
+                                       PORTAL_API_TOKEN, or a passkey-only account)
 
 The token and the session are kept in the Keychain, or in a 0600 file under the
 app's data folder where there is no Keychain (FIO_NO_KEYCHAIN=1). Neither is
@@ -434,11 +438,6 @@ fn check_url(u: &str) -> Result<String, String> {
     Ok(u)
 }
 
-/// The tokens of a line that are not flags: `signin <url> <email>` takes two.
-fn positionals(args: &[String]) -> Vec<String> {
-    args.iter().filter(|a| !a.starts_with('-')).cloned().collect()
-}
-
 fn portal_status_command(args: &[String]) -> ! {
     let url = match portal_url_flag(args) {
         Ok(u) => u,
@@ -474,7 +473,7 @@ fn portal_configured(st: &PortalStatus) -> bool {
 }
 
 async fn portal_signin_command(args: &[String]) -> ! {
-    let pos = positionals(args);
+    let (pos, totp) = portal_signin_args(args);
     if pos.len() < 2 {
         portal_usage();
     }
@@ -489,21 +488,107 @@ async fn portal_signin_command(args: &[String]) -> ! {
     // here, and only once the sign-in worked, so a refused one leaves a fresh
     // machine exactly as it was.
     match app.portal_sign_in(&email, &password).await {
-        Ok(st) => {
-            if let Err(e) = config::update(|s| s.portal_url = url.clone()) {
-                fatal(&format!("signed in, but the Portal address could not be saved: {}", e));
-            }
-            println!("signed in as {}", st.email);
-            std::process::exit(0)
-        }
-        // A one-time code is not a refusal: Portal wants a second factor, and a
-        // password cannot supply one.
+        Ok(st) => signed_in(&url, &st),
+        // A one-time code is not a refusal: Portal took the password and wants
+        // the second factor. The pending session lives in this process, so the
+        // code finishes the same sign-in.
         Err(e) if e == PortalErr::TotpRequired.to_string() => {
-            eprintln!("error: {}", e);
-            eprintln!("A bearer token is needed for this deployment: fio portal token <token>");
-            std::process::exit(2)
+            let Some(code) = read_totp_code(totp) else {
+                // Still no code: nothing was signed in, and nothing was stored.
+                eprintln!("error: {}", e);
+                eprintln!(
+                    "Pass it with --totp <code>, set $FIO_PORTAL_TOTP, or type it when asked: fio portal signin <url> <email> --totp <code>"
+                );
+                std::process::exit(2)
+            };
+            match app.portal_sign_in_totp(&code).await {
+                Ok(st) => signed_in(&url, &st),
+                // Portal's own sentence: a wrong code and an expired pending
+                // step do not read the same, and the user needs the difference.
+                Err(e) => fatal(&e),
+            }
         }
         Err(e) => fatal(&e),
+    }
+}
+
+/// The sign-in worked: the address is kept as a setting — and only now, so a
+/// refused sign-in leaves a fresh machine exactly as it was — and the account
+/// Portal named is printed.
+fn signed_in(url: &str, st: &PortalStatus) -> ! {
+    if let Err(e) = config::update(|s| s.portal_url = url.to_string()) {
+        fatal(&format!("signed in, but the Portal address could not be saved: {}", e));
+    }
+    println!("signed in as {}", st.email);
+    std::process::exit(0)
+}
+
+/// `fio portal signin <url> <email> [--totp <code>]`, split into the arguments
+/// that are not flags and the code when one was given.
+///
+/// `--totp` takes the value after it; `--totp` with nothing after it is no code
+/// at all, so the environment or the prompt answers — never a usage error, which
+/// would tell the user to do the thing they just did.
+fn portal_signin_args(args: &[String]) -> (Vec<String>, Option<String>) {
+    let mut pos: Vec<String> = Vec::new();
+    let mut totp: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--totp" {
+            let value = args.get(i + 1).map(|v| v.trim().to_string()).unwrap_or_default();
+            if value.is_empty() {
+                i += 1;
+            } else {
+                totp = Some(value);
+                i += 2;
+            }
+            continue;
+        }
+        if !args[i].starts_with('-') {
+            pos.push(args[i].clone());
+        }
+        i += 1;
+    }
+    (pos, totp)
+}
+
+/// The one-time code: `--totp`, then `$FIO_PORTAL_TOTP`, then one line from
+/// stdin. `None` when there is none to be had, which is the one case that ends
+/// `signin` with exit 2.
+///
+/// The code is not echoed, not logged and not written anywhere: it is this
+/// command's argument and Portal's, and it is dropped when the sign-in answers.
+/// On a terminal the prompt says the typing will be visible, exactly as the
+/// password prompt does, because there is no no-echo helper here either.
+fn read_totp_code(flag: Option<String>) -> Option<String> {
+    if let Some(code) = flag.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) {
+        return Some(code);
+    }
+    if let Ok(code) = std::env::var("FIO_PORTAL_TOTP") {
+        let code = code.trim().to_string();
+        if !code.is_empty() {
+            return Some(code);
+        }
+    }
+    let prompt = if stdin_is_tty() {
+        "Portal one-time code (this will be visible: this build has no no-echo prompt): "
+    } else {
+        "Portal one-time code: "
+    };
+    eprint!("{}", prompt);
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        None
+    } else {
+        Some(code)
     }
 }
 
@@ -1395,26 +1480,60 @@ mod tests {
         assert!(portal_url_flag(&a(&["--url", "p"])).is_err());
     }
 
-    /// `signin <url> <email>` takes exactly two positionals; a flag is not one.
+    /// `signin <url> <email>` takes exactly two positionals; a flag is not one,
+    /// and neither is a flag's value.
     #[test]
     fn signin_takes_the_url_then_the_email() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
-        assert_eq!(positionals(&a(&["http://p", "chaos@localhost"])).len(), 2);
-        let pos = positionals(&a(&["--url", "http://p", "chaos@localhost"]));
+        assert_eq!(portal_signin_args(&a(&["http://p", "chaos@localhost"])).0.len(), 2);
+        let (pos, _) = portal_signin_args(&a(&["--url", "http://p", "chaos@localhost"]));
         assert_eq!(pos, vec!["http://p".to_string(), "chaos@localhost".to_string()]);
-        assert!(positionals(&a(&["http://p"])).len() < 2, "an email is required");
+        assert!(
+            portal_signin_args(&a(&["http://p"])).0.len() < 2,
+            "an email is required"
+        );
     }
 
     /// The words that say a second factor is needed are the app's own sentence,
-    /// compared exactly and not searched for: that is what makes exit 2 the TOTP
-    /// code and exit 1 a refusal.
+    /// compared exactly and not searched for: that is what makes exit 2 the "no
+    /// code yet" answer and exit 1 a refusal.
     #[test]
     fn the_second_factor_is_recognised_by_its_exact_sentence() {
         let totp = PortalErr::TotpRequired.to_string();
         assert!(totp.contains("one-time code"), "{totp}");
-        assert!(totp.contains("bearer token"), "{totp}");
+        assert!(totp.contains("authenticator"), "it says where the digits come from: {totp}");
         let refused = PortalErr::Login { status: 401, detail: "Invalid email or password".to_string() }.to_string();
         assert_ne!(refused, totp, "a refused password is not a second factor");
         assert!(!refused.contains("one-time code"), "{refused}");
+        // A refused *code* is neither: it is a refusal, with Portal's sentence,
+        // so it exits 1 and never 2.
+        let bad_code = PortalErr::TotpRefused { status: 401, detail: "Invalid code".into() }.to_string();
+        assert_ne!(bad_code, totp);
+        assert!(bad_code.contains("refused the one-time code"), "{bad_code}");
+        assert!(bad_code.contains("Invalid code"), "{bad_code}");
+    }
+
+    /// `--totp <code>` is a flag, not a third positional; the code it carries is
+    /// the flag's value and nothing else.
+    #[test]
+    fn signin_takes_the_code_as_a_flag() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let (pos, totp) = portal_signin_args(&a(&["http://p", "chaos@localhost", "--totp", "123456"]));
+        assert_eq!(pos, vec!["http://p".to_string(), "chaos@localhost".to_string()]);
+        assert_eq!(totp.as_deref(), Some("123456"));
+        // Before the positionals, and only once: the same answer.
+        let (pos, totp) = portal_signin_args(&a(&["--totp", "123456", "http://p", "chaos@localhost"]));
+        assert_eq!(pos, vec!["http://p".to_string(), "chaos@localhost".to_string()]);
+        assert_eq!(totp.as_deref(), Some("123456"));
+        // Without the flag there is no code, and the two positionals are all
+        // that is left — which is the usage check `signin` makes.
+        let (pos, totp) = portal_signin_args(&a(&["http://p", "chaos@localhost"]));
+        assert_eq!(pos.len(), 2);
+        assert!(totp.is_none());
+        // `--totp` with nothing after it is no code rather than a usage error:
+        // the environment or the prompt answers instead.
+        let (pos, totp) = portal_signin_args(&a(&["http://p", "chaos@localhost", "--totp"]));
+        assert_eq!(pos.len(), 2, "{:?}", pos);
+        assert!(totp.is_none());
     }
 }

@@ -83,9 +83,22 @@ pub enum PortalErr {
     /// `POST /api/auth/login` would not sign this email and password in. The
     /// detail is Portal's own sentence; the password is never part of it.
     Login { status: u16, detail: String },
-    /// Portal wants a one-time code (`totp_required`): this client cannot
-    /// supply one, so the sign-in stops here and says so.
+    /// Portal accepted the password and wants a one-time code
+    /// (`totp_required`): the sign-in is not finished, and the same session is
+    /// waiting for [`PortalClient::login_totp`]. Nothing secret is carried: the
+    /// code has not been typed yet.
     TotpRequired,
+    /// `POST /api/auth/login/totp` would not take this code. The detail is
+    /// Portal's own sentence ("Invalid code", "Your login session expired —
+    /// start again", "Too many incorrect codes — sign in again"), which says
+    /// which of the two it was; the code itself is never part of it.
+    TotpRefused { status: u16, detail: String },
+    /// A code was offered and there is no half-finished sign-in to give it to:
+    /// the password step never ran, or another one replaced it.
+    NoPendingSignIn,
+    /// The session could not be written to the Keychain or its 0600 stand-in.
+    /// Nothing about the credential is in the sentence.
+    Store(String),
     /// Portal accepted the password but set no session cookie, so there was
     /// nothing to keep and nothing to send later.
     NoSessionCookie,
@@ -139,8 +152,21 @@ impl std::fmt::Display for PortalErr {
             }
             PortalErr::TotpRequired => write!(
                 f,
-                "this account wants a one-time code, which FioTransfer can't ask for: sign in with a browser and copy Portal's session, or store a bearer token"
+                "Portal wants a one-time code to finish this sign-in: type the six digits from your authenticator app"
             ),
+            PortalErr::TotpRefused { status, detail } => {
+                let detail = detail.trim();
+                if detail.is_empty() {
+                    write!(f, "Portal refused the one-time code ({})", status)
+                } else {
+                    write!(f, "Portal refused the one-time code ({}): {}", status, detail)
+                }
+            }
+            PortalErr::NoPendingSignIn => write!(
+                f,
+                "there is no sign-in waiting for a code: sign in with the password first"
+            ),
+            PortalErr::Store(e) => write!(f, "{}", e),
             PortalErr::NoSessionCookie => write!(
                 f,
                 "Portal accepted the password but set no session cookie, so there is nothing to keep"
@@ -609,6 +635,22 @@ fn cookie_for_plain_http(plain_http: bool, set_cookie: &str) -> String {
         .join(";")
 }
 
+/// What `POST /api/auth/login` answered: a finished sign-in, or the password
+/// step of one that Portal wants a one-time code for.
+///
+/// Both carry a client, because the difference is a second request on the same
+/// session — not a different session. Neither holds the password, and neither
+/// holds a code.
+pub enum SignIn {
+    /// Portal accepted the email and the password: the client holds the session
+    /// cookie, and `store_session` keeps it.
+    Done(PortalClient),
+    /// Portal accepted the email and the password *and* wants a one-time code.
+    /// The client holds Portal's pending session — a uid and a timestamp, not a
+    /// signed-in admin — so it can finish the sign-in and can do nothing else.
+    Totp(PortalClient),
+}
+
 /// A cookie-enabled client, seeded from a stored jar: `reqwest` adds `Cookie:`
 /// to every request and keeps what a reply sets.
 ///
@@ -640,11 +682,28 @@ pub struct PortalClient {
     /// The HTTP client for this credential: the shared one for a bearer token,
     /// one of its own — with the cookie jar — for a session.
     http: reqwest::Client,
+    /// Set while Portal has taken the password and is waiting for a one-time
+    /// code: the email that was typed, so a sign-in can still be named when
+    /// `GET /api/auth/me` cannot be read. The jar in `cred` is Portal's
+    /// *pending* session — it is not a signed-in session and is never stored.
+    pending: Option<Pending>,
+}
+
+/// A sign-in Portal asked a second factor for. The email only: the password is
+/// gone the moment the login reply arrived, and a code has not been typed yet.
+#[derive(Clone)]
+struct Pending {
+    email: String,
 }
 
 impl Clone for PortalClient {
     fn clone(&self) -> PortalClient {
-        PortalClient { base: self.base.clone(), cred: self.cred.clone(), http: self.http.clone() }
+        PortalClient {
+            base: self.base.clone(),
+            cred: self.cred.clone(),
+            http: self.http.clone(),
+            pending: self.pending.clone(),
+        }
     }
 }
 
@@ -653,6 +712,7 @@ impl std::fmt::Debug for PortalClient {
         f.debug_struct("PortalClient")
             .field("base", &self.base)
             .field("credential", &self.cred)
+            .field("waiting_for_a_code", &self.pending.is_some())
             .finish()
     }
 }
@@ -665,6 +725,7 @@ impl PortalClient {
             base: base_of(base_url),
             cred: Credential::Bearer(token.trim().to_string()),
             http: http().clone(),
+            pending: None,
         }
     }
 
@@ -675,7 +736,7 @@ impl PortalClient {
             return Err(PortalErr::NoUrl);
         }
         let http = session_http(&base, &session.cookies)?;
-        Ok(PortalClient { base, cred: Credential::Session(Arc::new(session)), http })
+        Ok(PortalClient { base, cred: Credential::Session(Arc::new(session)), http, pending: None })
     }
 
     /// The client the app builds: the base URL from the settings, then the first
@@ -701,12 +762,20 @@ impl PortalClient {
         }
     }
 
-    /// The jar this client holds, when it signed in with one.
+    /// The jar this client holds, when it signed in with one. While Portal is
+    /// waiting for a one-time code this is its *pending* session: see
+    /// [`PortalClient::waiting_for_code`].
     pub fn session(&self) -> Option<&Session> {
         match &self.cred {
             Credential::Session(s) => Some(s),
             Credential::Bearer(_) => None,
         }
+    }
+
+    /// Whether Portal has taken the password and is waiting for a one-time
+    /// code: the sign-in is not finished and there is nothing to keep yet.
+    pub fn waiting_for_code(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// Which credential the calls use: `token` or `session`.
@@ -715,8 +784,16 @@ impl PortalClient {
     }
 
     /// Keeps this client's jar in the Keychain, under its own key. The password
-    /// is not here: the client never held it.
+    /// is not here: the client never held it. A half-finished sign-in is
+    /// refused: its cookie says "a uid is waiting for a code", which is not a
+    /// session any call would accept.
     pub fn store_session(&self) -> Result<(), String> {
+        if self.pending.is_some() {
+            return Err(
+                "Portal is waiting for a one-time code: finish the sign-in before keeping the session"
+                    .to_string(),
+            );
+        }
         match self.session() {
             Some(s) => save_session(s),
             None => Err("this client is not signed in with a session".to_string()),
@@ -732,7 +809,13 @@ impl PortalClient {
     /// reply's `Set-Cookie`, so it is read here — once — and kept as the
     /// client's [`Session`]. The password is read from the argument, used for
     /// this one request, and dropped.
-    pub async fn login(base_url: &str, email: &str, password: &str) -> Result<PortalClient, PortalErr> {
+    ///
+    /// Two answers are a success: [`SignIn::Done`], the client a signed-in
+    /// session makes, and [`SignIn::Totp`], the same client holding Portal's
+    /// *pending* session because this account has a second factor. A password
+    /// sign-in that stops there stores nothing; [`PortalClient::login_totp`]
+    /// is what finishes it.
+    pub async fn signin(base_url: &str, email: &str, password: &str) -> Result<SignIn, PortalErr> {
         let base = base_of(base_url);
         if base.is_empty() {
             return Err(PortalErr::NoUrl);
@@ -773,7 +856,21 @@ impl PortalClient {
         }
         let v: Value = serde_json::from_slice(&data).map_err(|e| PortalErr::Json(e.to_string()))?;
         if v.get("totp_required").and_then(|b| b.as_bool()).unwrap_or(false) {
-            return Err(PortalErr::TotpRequired);
+            // The password was right and half a sign-in exists: Portal keeps the
+            // pending uid in the same session, so the cookie is kept — as a
+            // *pending* jar, which no call of this client uses and which is
+            // never stored as a session.
+            if cookies.is_empty() {
+                return Err(PortalErr::NoSessionCookie);
+            }
+            // Built the way every session client is, so a plain-http Portal
+            // gets the same treatment of its `Secure` cookie as it does on the
+            // next run — the pending uid is in that cookie.
+            let at = base.clone();
+            let jar = Session { base, email: email.trim().to_string(), cookies };
+            let mut client = PortalClient::with_session(&at, jar)?;
+            client.pending = Some(Pending { email: email.trim().to_string() });
+            return Ok(SignIn::Totp(client));
         }
         if cookies.is_empty() {
             return Err(PortalErr::NoSessionCookie);
@@ -784,7 +881,100 @@ impl PortalClient {
             email: if named.is_empty() { email.trim().to_string() } else { named },
             cookies,
         };
-        PortalClient::with_session(&base, session)
+        Ok(SignIn::Done(PortalClient::with_session(&base, session)?))
+    }
+
+    /// The same sign-in, for a caller that cannot supply a one-time code: a
+    /// second factor is the end of the road here, reported as
+    /// [`PortalErr::TotpRequired`]. The pending jar is dropped, because nothing
+    /// is left that could finish the sign-in — a caller that can finish it uses
+    /// [`PortalClient::signin`] and [`PortalClient::login_totp`].
+    pub async fn login(base_url: &str, email: &str, password: &str) -> Result<PortalClient, PortalErr> {
+        match PortalClient::signin(base_url, email, password).await? {
+            SignIn::Done(c) => Ok(c),
+            SignIn::Totp(_) => Err(PortalErr::TotpRequired),
+        }
+    }
+
+    /// `POST /api/auth/login/totp` with the six digits, on this same client and
+    /// so on the same session cookie the password step left behind — which is
+    /// what Portal requires: the code finishes *that* session, and a jar of its
+    /// own would have no pending uid in it.
+    ///
+    /// On Portal's yes the client becomes a signed-in one: the session cookie
+    /// Portal re-set is kept, `GET /api/auth/me` names the admin, and the jar is
+    /// stored exactly as [`PortalClient::login`]'s is (Keychain, or the 0600
+    /// stand-in). On Portal's no nothing is stored and nothing changes: the
+    /// refusal is [`PortalErr::TotpRefused`] with Portal's own sentence, which
+    /// says whether the code was wrong or the pending step is over.
+    ///
+    /// The code is this call's argument and nothing else. It is not stored, not
+    /// logged, and not part of any error: only Portal's reply is.
+    pub async fn login_totp(&mut self, code: &str) -> Result<(), PortalErr> {
+        let Some(pending) = self.pending.clone() else {
+            return Err(PortalErr::NoPendingSignIn);
+        };
+        // Portal normalises spaces and dashes itself; trimming is all this needs
+        // to do, and an empty code is not worth one of the five attempts Portal
+        // gives the pending step.
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(PortalErr::TotpRequired);
+        }
+        let url = reqwest::Url::parse(&format!("{}/api/auth/login/totp", self.base))
+            .map_err(|e| PortalErr::Http(format!("the Portal address {:?} is not a URL: {}", self.base, e)))?;
+        let body = serde_json::json!({ "code": code });
+        // One attempt, as `login` makes one: Portal rate-limits this route too.
+        let res = self
+            .http
+            .post(url)
+            .header("Accept", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| PortalErr::Http(e.to_string()))?;
+        let status = res.status().as_u16();
+        let cookies: Vec<String> = res
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| cookie_pair(v).is_some())
+            .collect();
+        let data = res.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+        if status == 401 || status == 403 {
+            return Err(PortalErr::TotpRefused { status, detail: detail_of(&crate::netx::trim_body(&data)) });
+        }
+        if status >= 300 {
+            return Err(PortalErr::Status { status, body: crate::netx::trim_body(&data) });
+        }
+        // Portal re-sets the session cookie with the signed-in uid in it. If it
+        // sent none, the jar already held is the one it means: the same cookie,
+        // and `/api/auth/me` below is what decides whether it is signed in.
+        let held = self.session().map(|s| s.cookies.clone()).unwrap_or_default();
+        let jar = if cookies.is_empty() { held } else { cookies };
+        self.cred = Credential::Session(Arc::new(Session {
+            base: self.base.clone(),
+            email: pending.email.clone(),
+            cookies: jar,
+        }));
+        // The same confirmation a password sign-in makes. A session Portal will
+        // not accept is not stored; a read that merely failed is not proof, so
+        // the typed address names the session, as `App::portal_sign_in` has it.
+        let email = match self.me().await {
+            Ok(who) => who.email,
+            Err(e @ PortalErr::SessionExpired { .. }) => return Err(e),
+            Err(_) => pending.email.clone(),
+        };
+        let session = match self.session() {
+            Some(s) => s.named(&email),
+            None => return Err(PortalErr::NoSessionCookie),
+        };
+        save_session(&session).map_err(PortalErr::Store)?;
+        self.cred = Credential::Session(Arc::new(session));
+        self.pending = None;
+        Ok(())
     }
 
     /// The URL one call goes to.
@@ -1108,6 +1298,56 @@ mod tests {
         assert!(PortalErr::TotpRequired.to_string().contains("one-time code"));
         assert!(PortalErr::NoSessionCookie.to_string().contains("no session cookie"));
         assert!(PortalErr::NoToken.to_string().contains("token"));
+    }
+
+    #[test]
+    fn a_second_factor_has_three_sentences_and_none_of_them_carries_a_code() {
+        // Wanted: the state, not a refusal. It asks for the six digits.
+        let wanted = PortalErr::TotpRequired.to_string();
+        assert!(wanted.contains("wants a one-time code"), "{wanted}");
+        assert!(wanted.contains("six digits"), "{wanted}");
+        assert!(!wanted.contains("bearer token"), "a token is no longer the only way in: {wanted}");
+
+        // Refused: Portal's own sentence, and never the code that was typed.
+        let refused = PortalErr::TotpRefused { status: 401, detail: "Invalid code".into() }.to_string();
+        assert_eq!(refused, "Portal refused the one-time code (401): Invalid code");
+        let expired = PortalErr::TotpRefused {
+            status: 401,
+            detail: "Your login session expired — start again".into(),
+        }
+        .to_string();
+        assert!(expired.contains("start again"), "{expired}");
+        let bare = PortalErr::TotpRefused { status: 401, detail: "  ".into() }.to_string();
+        assert_eq!(bare, "Portal refused the one-time code (401)");
+
+        // No half-finished sign-in to give it to.
+        let nothing = PortalErr::NoPendingSignIn.to_string();
+        assert!(nothing.contains("sign in with the password first"), "{nothing}");
+        assert_eq!(PortalErr::Store("could not store the Portal session: no room".into()).to_string(), "could not store the Portal session: no room");
+    }
+
+    #[test]
+    fn a_pending_sign_in_is_never_stored_as_a_session() {
+        // The shape `signin` builds when Portal answers `totp_required`: the
+        // pending jar in `cred`, and `pending` naming the address.
+        let client = PortalClient {
+            base: "https://portal.example.com".to_string(),
+            cred: Credential::Session(Arc::new(session_at("https://portal.example.com"))),
+            http: http().clone(),
+            pending: Some(Pending { email: "chaos@localhost".to_string() }),
+        };
+        assert!(client.waiting_for_code());
+        let err = client.store_session().expect_err("a pending jar is not a session");
+        assert!(err.contains("one-time code"), "{err}");
+        // Its `{:?}` says a code is awaited, and prints no cookie.
+        let text = format!("{:?}", client);
+        assert!(text.contains("waiting_for_a_code: true"), "{text}");
+        assert!(!text.contains("eyJ1c2VyX2lk"), "{text}");
+
+        // A signed-in client is not waiting, and is storable.
+        let done = PortalClient::with_session("https://portal.example.com", session_at("https://portal.example.com")).unwrap();
+        assert!(!done.waiting_for_code());
+        assert_eq!(done.credential(), "session");
     }
 
     #[test]

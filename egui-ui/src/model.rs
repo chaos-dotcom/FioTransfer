@@ -152,6 +152,10 @@ pub enum Request {
     /// this enum can print it, and it is never a setting: the app posts it,
     /// keeps the cookie Portal answers with and hands the new status back.
     SignInPortal { email: String, password: Secret },
+    /// The six digits Portal asked for, finishing the sign-in the password
+    /// started (`App::portal_sign_in_totp`). A [`Secret`] like the password: no
+    /// `{:?}` of this enum prints it, and it is never a setting.
+    SignInPortalTotp { code: Secret },
     /// Forget the stored session cookie (`App::portal_sign_out`). A bearer
     /// token is a different credential under a different key, and stays.
     SignOutPortal,
@@ -332,6 +336,13 @@ pub struct PortalUi {
     pub password_draft: String,
     /// Why Portal refused the last sign-in, in the app's own words.
     pub signin_error: Option<String>,
+    /// The one-time code being typed, while Portal waits for one. Cleared by the
+    /// shell the moment the code answers, whichever way it went: a code is not
+    /// kept, not even a refused one.
+    pub code_draft: String,
+    /// Why Portal refused the last one-time code, in the app's own words — which
+    /// say whether the code was wrong or the sign-in must start again.
+    pub code_error: Option<String>,
     /// A sign-in is in flight: the button waits rather than posting twice.
     pub signing_in: bool,
 }
@@ -385,6 +396,9 @@ pub struct PortalView {
     /// The admin the stored session belongs to. Empty for a bearer token, which
     /// names no account, and empty when nobody is signed in.
     pub email: String,
+    /// A sign-in is half done: Portal took the password and is waiting for a
+    /// six-digit code. Not a credential, and not `signed_in`.
+    pub needs_code: bool,
     pub url: String,
     /// The local root, resolved to an absolute path.
     pub root: String,
@@ -417,6 +431,7 @@ impl PortalView {
         PortalView {
             enabled: st.enabled,
             signed_in: st.signed_in,
+            needs_code: st.needs_code,
             email: st.email.clone(),
             url: st.url.clone(),
             root: st.root.clone(),

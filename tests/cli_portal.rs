@@ -36,6 +36,15 @@ use serde_json::{json, Value};
 const EMAIL: &str = "chaos@localhost";
 const PASSWORD: &str = "portal-local-dev-pass-1";
 const TOKEN: &str = "local-dev-token-0000000000000000000000";
+/// The one-time code the stub's second-factor account accepts. Any other six
+/// digits are refused, as Portal refuses them.
+const GOOD_CODE: &str = "135790";
+/// The cookie the stub hands out on the password step when a second factor is
+/// wanted, and the one it hands out when the code is accepted. Two values, so a
+/// case can prove the code was sent on the *pending* session and not on a new
+/// one.
+const PENDING_COOKIE: &str = "portal_session=eyJ0b3RwX3BlbmRpbmdfdWlkIjoiYWJjIn0.auQbjA.pending";
+const SIGNED_COOKIE: &str = "portal_session=eyJ1c2VyX2lkIjoiYWJjIn0.auQbjA.signed";
 
 // ---------- the stub Portal ----------
 
@@ -46,6 +55,9 @@ struct StubState {
     totp: AtomicBool,
     /// How many requests came in, so a case can prove none did.
     hits: AtomicUsize,
+    /// The `Cookie:` header every `/api/auth/login/totp` request carried, in
+    /// order: the proof that the code finished the session the password started.
+    totp_cookies: Mutex<Vec<String>>,
     /// Every request line, for a case that wants to see what was called.
     lines: Mutex<Vec<String>>,
 }
@@ -103,6 +115,11 @@ impl Stub {
     /// Every request line Portal saw, in order.
     fn lines(&self) -> Vec<String> {
         self.state.lines.lock().unwrap().clone()
+    }
+
+    /// Every `Cookie:` header a `/api/auth/login/totp` request carried.
+    fn totp_cookies(&self) -> Vec<String> {
+        self.state.totp_cookies.lock().unwrap().clone()
     }
 }
 
@@ -171,14 +188,34 @@ fn answer(mut c: TcpStream, st: Arc<StubState>) {
             if email == EMAIL && password == PASSWORD {
                 let totp = st.totp.load(Ordering::SeqCst);
                 let body = if totp {
-                    json!({ "totp_required": true, "id": "u1", "email": EMAIL }).to_string()
+                    json!({ "totp_required": true, "id": null, "email": null }).to_string()
                 } else {
                     json!({ "totp_required": false, "id": "u1", "email": EMAIL }).to_string()
                 };
-                let cookie = "portal_session=eyJ1c2VyX2lkIjoiYWJjIn0.auQbjA.sig; path=/; Max-Age=1209600; httponly; samesite=lax; secure";
-                (200u16, Some(cookie.to_string()), body)
+                // A second factor leaves Portal's session *pending* in the
+                // cookie it sets; a plain sign-in leaves it signed in.
+                let pair = if totp { PENDING_COOKIE } else { SIGNED_COOKIE };
+                let cookie = format!("{}; path=/; Max-Age=1209600; httponly; samesite=lax; secure", pair);
+                (200u16, Some(cookie), body)
             } else {
                 (401, None, json!({ "detail": "Invalid email or password" }).to_string())
+            }
+        }
+        // The second step, on the session the first one left: Portal looks the
+        // pending uid up in that session's cookie, so a code sent on any other
+        // jar is "your login session expired".
+        ("POST", "/api/auth/login/totp") => {
+            let cookie = header("cookie").unwrap_or_default();
+            st.totp_cookies.lock().unwrap().push(cookie.clone());
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+            if !cookie.contains(PENDING_COOKIE) {
+                (401, None, json!({ "detail": "Your login session expired — start again" }).to_string())
+            } else if code != GOOD_CODE {
+                (401, None, json!({ "detail": "Invalid code" }).to_string())
+            } else {
+                let pair = format!("{}; path=/; Max-Age=1209600; httponly; samesite=lax; secure", SIGNED_COOKIE);
+                (200u16, Some(pair), json!({ "id": "u1", "email": EMAIL }).to_string())
             }
         }
         ("GET", "/api/auth/me") if authorised => (200, None, json!({ "id": "u1", "email": EMAIL }).to_string()),
@@ -425,20 +462,107 @@ fn signin_with_the_password_on_stdin_signs_in_and_keeps_the_session() {
 }
 
 #[test]
-fn signin_that_needs_a_second_factor_exits_two_and_says_a_token_is_needed() {
+fn signin_that_needs_a_second_factor_and_has_no_code_exits_two() {
+    let h = Home::new();
+    let stub = Stub::start();
+    stub.want_totp();
+    // Nothing on stdin, and no code anywhere: the one case that is exit 2.
+    let out = h.fio(
+        &["portal", "signin", &stub.base, EMAIL],
+        &[("FIO_PORTAL_PASSWORD", PASSWORD)],
+        Some(""),
+    );
+    assert_eq!(out.code, 2, "a missing code is its own exit code: {} {}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("one-time code"), "{}", out.stderr);
+    // The way on is named, and it is no longer "find a bearer token": the same
+    // command takes the code.
+    assert!(out.stderr.contains("--totp <code>"), "{}", out.stderr);
+    assert!(out.stderr.contains("FIO_PORTAL_TOTP"), "{}", out.stderr);
+    assert!(out.stderr.contains("fio portal signin <url> <email> --totp <code>"), "{}", out.stderr);
+    // The prompt is the password's own idiom: it says where the code is read
+    // from, and it is on stderr, not in the output.
+    assert!(out.stderr.contains("Portal one-time code:"), "{}", out.stderr);
+    assert!(out.stdout.is_empty(), "nothing was signed in: {}", out.stdout);
+    h.assert_password_nowhere(&out);
+    assert!(!h.data().join("portal-session").exists(), "a half-finished sign-in stores no session");
+    assert!(!h.settings().contains(&stub.base), "a sign-in that did not finish stores no address");
+    // One password step was made; the code step was not, because there was no
+    // code to send.
+    assert!(stub.totp_cookies().is_empty(), "no code step without a code: {:?}", stub.totp_cookies());
+}
+
+#[test]
+fn signin_with_a_wrong_code_exits_one_with_portals_sentence() {
     let h = Home::new();
     let stub = Stub::start();
     stub.want_totp();
     let out = h.fio(
-        &["portal", "signin", &stub.base, EMAIL],
+        &["portal", "signin", &stub.base, EMAIL, "--totp", "000000"],
         &[("FIO_PORTAL_PASSWORD", PASSWORD)],
         None,
     );
-    assert_eq!(out.code, 2, "a second factor is its own exit code: {} {}", out.stdout, out.stderr);
-    assert!(out.stderr.contains("one-time code"), "{}", out.stderr);
-    assert!(out.stderr.contains("fio portal token <token>"), "the way on is named: {}", out.stderr);
+    assert_eq!(out.code, 1, "a refused code is a refusal: {} {}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("Portal refused the one-time code (401)"), "{}", out.stderr);
+    assert!(out.stderr.contains("Invalid code"), "Portal's own sentence: {}", out.stderr);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
     h.assert_password_nowhere(&out);
-    assert!(!h.data().join("portal-session").exists(), "no session was kept");
+    // Nothing is kept, and the address is not adopted either.
+    assert!(!h.data().join("portal-session").exists(), "a refused code stored a session");
+    assert!(!h.settings().contains(&stub.base), "a refused code stored the address");
+    // The code did reach Portal, on the pending session the password made.
+    let cookies = stub.totp_cookies();
+    assert_eq!(cookies.len(), 1, "{:?}", cookies);
+    assert!(cookies[0].contains("pending"), "the code went on the pending jar: {:?}", cookies);
+    // And it was not written anywhere the app writes.
+    for (path, text) in h.every_document() {
+        assert!(!text.contains("000000"), "{} carries the code", path.display());
+    }
+}
+
+#[test]
+fn signin_with_the_right_code_finishes_the_same_sign_in() {
+    let h = Home::new();
+    let stub = Stub::start();
+    stub.want_totp();
+    // The code from `$FIO_PORTAL_TOTP` this time: `--totp` is one way in, not
+    // the only one.
+    let out = h.fio(
+        &["portal", "signin", &stub.base, EMAIL],
+        &[("FIO_PORTAL_PASSWORD", PASSWORD), ("FIO_PORTAL_TOTP", GOOD_CODE)],
+        None,
+    );
+    assert_eq!(out.code, 0, "{} {}", out.stdout, out.stderr);
+    assert_eq!(out.stdout.trim(), format!("signed in as {}", EMAIL), "{}", out.stdout);
+
+    // The code was sent on the cookie the password step left — the same jar, so
+    // the same session — and the cookie Portal re-set is the one kept.
+    let cookies = stub.totp_cookies();
+    assert_eq!(cookies.len(), 1, "{:?}", cookies);
+    assert!(cookies[0].contains("pending"), "the code went on the pending jar: {:?}", cookies);
+    let jar = std::fs::read_to_string(h.data().join("portal-session")).expect("a stored session");
+    assert!(jar.contains("signed"), "the signed-in cookie is the one stored: {jar}");
+    assert!(!jar.contains("pending"), "the pending jar is not kept: {jar}");
+
+    // The address and the email are settings; the password and the code are not.
+    let settings = h.settings();
+    assert!(settings.contains(&stub.base), "{settings}");
+    assert!(settings.contains(EMAIL), "{settings}");
+    assert!(!settings.contains(PASSWORD), "{settings}");
+    // No file the app wrote carries the code, and nothing printed it.
+    assert!(!out.stdout.contains(GOOD_CODE) && !out.stderr.contains(GOOD_CODE), "{} {}", out.stdout, out.stderr);
+    for (path, text) in h.every_document() {
+        if path.ends_with("portal-session") {
+            // The jar is the credential itself; check it does not name the code.
+            assert!(!text.contains(GOOD_CODE), "{} carries the code", path.display());
+            continue;
+        }
+        assert!(!text.contains(GOOD_CODE), "{} carries the code", path.display());
+    }
+
+    // And a later process is signed in on the strength of that jar alone.
+    let st = h.fio(&["portal", "status"], &[], None);
+    assert_eq!(st.code, 0, "{}", st.stdout);
+    assert!(st.stdout.contains(&format!("credential: signed in as {}", EMAIL)), "{}", st.stdout);
 }
 
 #[test]
@@ -593,6 +717,9 @@ fn the_usage_names_every_portal_command() {
     for word in ["status", "signin", "signout", "reconcile", "token"] {
         assert!(help.stdout.contains(word), "the usage does not name {}: {}", word, help.stdout);
     }
+    // A second factor is a code on the same command now, and the usage says so.
+    assert!(help.stdout.contains("--totp CODE"), "{}", help.stdout);
+    assert!(help.stdout.contains("FIO_PORTAL_TOTP"), "{}", help.stdout);
     // No subcommand, and an unknown one, are usage errors — and call nothing.
     let bare = h.fio(&["portal"], &[], None);
     assert_eq!(bare.code, 2, "{}", bare.stderr);

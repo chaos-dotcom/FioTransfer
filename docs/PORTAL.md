@@ -40,7 +40,7 @@ Settings → **Portal**:
 | --- | --- |
 | **Server URL** | Your Portal, e.g. `https://portal.yourdomain.com`. Must be `http://` or `https://` with a host. |
 | **Access token** | The `PORTAL_API_TOKEN` from Portal's `.env` (generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`). Saved to the login keychain; never written to `settings.json`, never displayed again. Optional: see "Signing in instead" below. |
-| **Sign in instead** | Your Portal admin email and password. FioTransfer calls Portal's own login, keeps the session cookie, and throws the password away. Use this when the deployment has no `PORTAL_API_TOKEN`. |
+| **Sign in instead** | Your Portal admin email and password. FioTransfer calls Portal's own login, keeps the session cookie, and throws the password away. Use this when the deployment has no `PORTAL_API_TOKEN`. If the account has TOTP on, a **One-time code** row appears for the six digits, on the same session. |
 | **Local folder** | Where the project folders live. Default `~/Live_Work`. |
 | **Enabled** | Off by default: nothing is contacted until you turn it on. |
 
@@ -63,8 +63,25 @@ never written to `settings.json`, never logged, and never shown by the app again
 Precedence: if a bearer token is stored, it wins — that is what a headless install has. Otherwise
 the session is used. A session Portal stops accepting is reported as *"the Portal session
 expired"*, which is a different message from *"Portal refused the token"*: the fix is to sign in
-again, not to look for a token. Portal accounts with a second factor (TOTP or a passkey) cannot
-complete this sign-in from the app; use a bearer token there.
+again, not to look for a token.
+
+### An account with a second factor
+
+If the admin account has TOTP turned on in Portal, the password is only half of the sign-in: Portal
+answers `totp_required` and keeps a *pending* uid in the same session until the six digits arrive. FioTransfer
+finishes it. The card then shows a **One-time code** row under the two fields — six digits, one **Sign in** —
+and the sign-in completes on the same session the password step opened. Nothing is stored until the code is
+accepted: a pending session is not a credential, and the app never keeps it.
+
+What is not kept or shown: the code. It is typed into the row (or given to `fio` on the command line), sent
+once, and dropped; it is not written to `settings.json`, not put in a log, and not part of any message.
+
+A wrong code is refused with Portal's own sentence — *"Portal refused the one-time code (401): Invalid code"*. If
+the message says *"your login session expired — start again"* instead, the pending step has timed out (Portal
+allows five minutes, and five wrong codes), and pressing **Sign in** with the password starts a new one.
+
+Passkeys are not covered: a passkey sign-in is a browser ceremony, so on an account that has one and no password,
+sign in with a browser and store a bearer token.
 
 Portal marks its session cookie `Secure` even when it is reached over plain http
 (`SESSION_COOKIE_SECURE` defaults to true). Over `https://` the cookie is sent exactly as Portal
@@ -113,7 +130,7 @@ fio portal signin https://portal.shed.gay you@yourdomain     # session only; the
 fio portal reconcile                                          # what it did, and what it refused
 fio portal status                                             # the sentence the Settings card shows
 fio portal signout
-fio portal token <token>                                      # instead, for a TOTP or passkey deployment
+fio portal token <token>                                      # instead: a deployment's PORTAL_API_TOKEN, or a passkey-only account
 ```
 
 ### Where `fio` comes from
@@ -139,6 +156,14 @@ without the window, and it needs no GUI dependencies.
 `signin` takes the password from `$FIO_PORTAL_PASSWORD` when set, otherwise reads one line — and on a terminal it
 says plainly that the typing is visible, because there is no no-echo helper here.
 
+On an account with TOTP, the same command takes the six digits: `--totp <code>`, then `$FIO_PORTAL_TOTP`, then one
+line from stdin (the prompt says the typing is visible too). The code is sent on the session the password step
+opened, and is never printed or written anywhere:
+
+```sh
+FIO_PORTAL_PASSWORD=… fio portal signin https://portal.shed.gay you@yourdomain --totp 123456
+```
+
 `reconcile` prints the counts, then one line per skipped marker **with the reason**, then the folders it keeps in
 step:
 
@@ -153,7 +178,8 @@ watch folders:
 ```
 
 Exit codes are meant for scripts: `0` done, `1` refused or failed (with the sentence you would have seen on
-screen), `2` Portal wants a one-time code, which means this deployment needs a bearer token instead.
+screen), `2` Portal wants a one-time code and none was given — pass `--totp`, set `$FIO_PORTAL_TOTP`, or let the
+prompt read one. A code Portal then refuses is `1`, with Portal's sentence.
 
 A second `reconcile` reporting `kept in step: 0` is the system saying the first one already did the work — that is
 the idempotence rule, visible.
@@ -189,11 +215,23 @@ a session whose cookies are gone reading as expired rather than as a refused tok
 case is skipped unless its variables are set, so ordinary test runs stay offline. The
 password is read from the environment only: it is never a constant in the test file.
 
+The second-factor case goes further, on the same variables: it turns TOTP **on** through
+Portal's own `/api/settings/totp/*` routes (computing the codes itself, RFC 6238), proves a
+sign-in that stops at a code, a wrong code refused and nothing stored, the right code
+signing in, and `GET /api/upload-links` with the session it produced — then turns TOTP **off**
+again. The restore runs whether the body passed, failed or panicked, and the case ends by
+asserting that the password alone signs in again. If the process is killed before that, the
+manual step is at the head of the case in `tests/portal_live.rs`:
+`POST /api/settings/totp/disable` with the admin's password.
+
 ## What it does not do yet
 
 * Portal's sync rules are read for reference only; FioTransfer does not adopt them.
 * Nothing is sent back to Portal — a link's state in Portal is unaffected by what
   FioTransfer does with its folder.
 * The token cannot be rotated from the app; change it in Portal and re-enter it here.
-* A second-factor (TOTP or passkey) sign-in is not something the app can complete: sign in
-  with a browser and use a bearer token on such a deployment.
+* A passkey sign-in is not something the app can complete: sign in with a browser and use a
+  bearer token on such a deployment. TOTP is: see "An account with a second factor".
+* Nothing about the second factor is configurable here: the app assumes the six digits and the
+  30 s step that Portal's own login asks for, and has no recovery-code path (Portal's recovery
+  codes work only in its own login screen).
