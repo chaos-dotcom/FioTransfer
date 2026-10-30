@@ -1375,7 +1375,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "fiotransfer"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "bytes",
  "fiotransfer-core",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "fiotransfer-core"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "fiotransfer-egui"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "eframe",
  "egui",
