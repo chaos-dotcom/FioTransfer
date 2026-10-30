@@ -131,6 +131,31 @@ fn detail_of(body: &str) -> String {
     crate::netx::trim_body(t.as_bytes())
 }
 
+
+/// JSON from a body that should be JSON.
+///
+/// `serde_json`'s own message for a web page is "expected value at line 1 column 1",
+/// which tells a person nothing. A Portal behind a proxy that answers with a login
+/// page — an expired session, a WAF, a wrong address — lands here, so name that.
+fn json_body(data: &[u8]) -> Result<Value, PortalErr> {
+    if let Ok(v) = serde_json::from_slice::<Value>(data) {
+        return Ok(v);
+    }
+    let text = String::from_utf8_lossy(data);
+    let head = text.trim_start();
+    if head.starts_with('<') || head.to_ascii_lowercase().contains("<html") {
+        return Err(PortalErr::Json(
+            "the address answered with a web page instead of JSON — the address is not Portal, or a proxy in \
+             front of it wants a sign-in"
+                .to_string(),
+        ));
+    }
+    Err(PortalErr::Json(match serde_json::from_slice::<Value>(data) {
+        Err(e) => e.to_string(),
+        Ok(_) => "the reply is not JSON".to_string(),
+    }))
+}
+
 impl std::fmt::Display for PortalErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -868,7 +893,7 @@ impl PortalClient {
         if status >= 300 {
             return Err(PortalErr::Status { status, body: crate::netx::trim_body(&data) });
         }
-        let v: Value = serde_json::from_slice(&data).map_err(|e| PortalErr::Json(e.to_string()))?;
+        let v: Value = json_body(&data)?;
         if v.get("totp_required").and_then(|b| b.as_bool()).unwrap_or(false) {
             // The password was right and half a sign-in exists: Portal keeps the
             // pending uid in the same session, so the cookie is kept — as a
@@ -1000,7 +1025,7 @@ impl PortalClient {
     /// For a session this is the name the Settings screen shows.
     pub async fn me(&self) -> Result<Who, PortalErr> {
         let raw = self.get("/api/auth/me").await?;
-        let v: Value = serde_json::from_slice(&raw).map_err(|e| PortalErr::Json(e.to_string()))?;
+        let v: Value = json_body(&raw)?;
         let who = Who { id: text_at(&v, "id"), email: text_at(&v, "email") };
         if who.email.is_empty() {
             return Err(PortalErr::Json("no email in the reply".to_string()));
@@ -1120,7 +1145,7 @@ pub struct Who {
 /// how Frame.io's envelopes carry pagination, and reading a cursor as a list
 /// would be worse than saying the reply is not understood.
 pub fn rows(raw: &[u8], key: &str) -> Result<Vec<Value>, PortalErr> {
-    let v: Value = serde_json::from_slice(raw).map_err(|e| PortalErr::Json(e.to_string()))?;
+    let v: Value = json_body(raw)?;
     if let Value::Array(a) = &v {
         return Ok(a.clone());
     }
@@ -1424,6 +1449,24 @@ mod tests {
         // Portal's own JSON still reads normally.
         let json = PortalErr::Status { status: 502, body: r#"{"detail":"bad gateway upstream"}"#.into() };
         assert_eq!(json.to_string(), "Portal answered 502: bad gateway upstream");
+    }
+
+    #[test]
+    fn a_login_page_where_json_belongs_says_so() {
+        // What a proxy or an auth gate in front of Portal can answer with.
+        let page = json_body(b"<!doctype html><html><body>Sign in</body></html>");
+        let text = page.unwrap_err().to_string();
+        assert!(text.contains("web page"), "{text}");
+        assert!(text.contains("proxy"), "{text}");
+        assert!(!text.contains("<html"), "HTML reached the user: {text}");
+
+        // A body that is simply not JSON keeps serde's own message, which is
+        // accurate for a truncated or empty reply.
+        let junk = json_body(b"not json at all").unwrap_err().to_string();
+        assert!(junk.contains("expected") || junk.contains("JSON"), "{junk}");
+
+        // And real JSON still parses.
+        assert_eq!(json_body(br#"{"a":1}"#).unwrap()["a"], 1);
     }
 
 }
