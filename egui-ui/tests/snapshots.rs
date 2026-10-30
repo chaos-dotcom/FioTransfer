@@ -274,6 +274,8 @@ fn a_tall_screen_scrolls_instead_of_widening() {
             enabled: i % 3 != 0,
             pending: i % 5,
             from_portal: false,
+            duplex_id: None,
+            lane: fiotransfer_egui::model::Lane::None,
         })
         .collect();
     let mut harness = Harness::builder()

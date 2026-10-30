@@ -831,6 +831,8 @@ mod tests {
                     enabled: true,
                     pending: 0,
                     from_portal: false,
+                    duplex_id: None,
+                    lane: crate::model::Lane::None,
                 },
                 WatchRow {
                     id: "w-archive".into(),
@@ -840,6 +842,8 @@ mod tests {
                     enabled: false,
                     pending: 3,
                     from_portal: false,
+                    duplex_id: None,
+                    lane: crate::model::Lane::None,
                 },
             ],
             ..Default::default()

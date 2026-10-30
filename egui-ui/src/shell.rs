@@ -45,8 +45,8 @@ use fiotransfer_core::portal::agent::PortalStatus;
 use fiotransfer_core::xfer::{DownloadOptions, LinkInfo};
 
 use crate::model::{
-    fmt_bytes, Crumb, HistoryRow, LinkInfo as UiLinkInfo, PortalView, Request, ToastKind, UiState,
-    UpdateState, View, WatchRow,
+    fmt_bytes, in_block_order, Crumb, HistoryRow, LinkInfo as UiLinkInfo, PortalView, Request,
+    ToastKind, UiState, UpdateState, View, WatchRow,
 };
 use crate::platform;
 
@@ -865,8 +865,15 @@ impl Shell {
         ui.space_walking = self.app.space_walking();
     }
 
+    /// The watch folders, as the screen draws them: one row per watch, each
+    /// carrying the duplex and lane its record's `origin` names, and the rows
+    /// put in the order the screen draws them — a duplex's two lanes adjacent,
+    /// inbound first, and the blocks in label order. The screen groups by
+    /// `duplex_id` itself, so the order here is what a straight walk of
+    /// `UiState::watches` sees, not something it has to trust.
     fn read_watches(&mut self, ui: &mut UiState) {
-        ui.watches = self.app.watches().iter().map(WatchRow::from_core).collect();
+        let rows: Vec<WatchRow> = self.app.watches().iter().map(WatchRow::from_core).collect();
+        ui.watches = in_block_order(rows);
     }
 
     /// The expanded job's files. `UiState::files` belongs to the screen, so this
