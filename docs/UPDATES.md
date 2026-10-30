@@ -9,11 +9,14 @@ anything that can write to the release. So every release now also carries:
 * `latest.json` — one document naming the version, the release notes and, per
   platform, the artifact's URL, its signature and its format.
 
-The client is `cargo-packager-updater` 0.2.3. It reads `latest.json`, picks the
-entry for its own `<os>-<arch>`, downloads that URL, and checks the bytes against
-the signature **before** it installs anything (`Update::download` →
-`verify_signature`). A file that fails the check is not installed, and neither is
-a file whose signature the client cannot find.
+The feed is written for `cargo-packager-updater` 0.2.3, which is what the app's
+updater is being moved onto: it reads `latest.json`, picks the entry for its own
+`<os>-<arch>`, downloads that URL, and checks the bytes against the signature
+**before** it installs anything (`Update::download` → `verify_signature`). A file
+that fails the check is not installed, and neither is a file whose signature the
+client cannot find. This document describes the release side of that contract;
+the half in `core/` is a separate change, and until it lands the app still asks
+the GitHub API for the newest release. Nothing here depends on that half.
 
 ## The endpoint
 
