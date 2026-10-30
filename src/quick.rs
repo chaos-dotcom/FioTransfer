@@ -13,10 +13,10 @@
 //! goroutines, here they run inline, so a host must not block — it should post
 //! the work into the app's runtime and return, which keeps the panel
 //! responsive while a link is inspected.
+//!
+//! The C calls and the `goQuick*` entry points the panel calls back are
+//! `fiotransfer_sys::quick`'s; this module registers what answers them.
 
-#![allow(unsafe_code)] // calls the download panel shims in mac/quick_darwin.m
-
-use std::ffi::{c_char, c_int, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,12 +26,6 @@ pub const QUICK_OK: i32 = 1;
 pub const QUICK_PASS: i32 = 2;
 /// The link can't be downloaded: `info`'s name is the message.
 pub const QUICK_ERROR: i32 = 3;
-
-extern "C" {
-    fn fioQuickShow(link: *const c_char, dir: *const c_char);
-    fn fioQuickInfo(seq: c_int, state: c_int, name: *const c_char, detail: *const c_char, warn: *const c_char);
-    fn fioQuickStarted(err: *const c_char);
-}
 
 /// What the panel asks the app to do.
 ///
@@ -54,24 +48,6 @@ static HOST: Mutex<Option<Arc<dyn QuickHost>>> = Mutex::new(None);
 /// looking broken.
 static WARNED: AtomicBool = AtomicBool::new(false);
 
-fn cstr(s: &str) -> CString {
-    match CString::new(s) {
-        Ok(c) => c,
-        Err(_) => {
-            let cleaned: String = s.chars().map(|c| if c == '\0' { ' ' } else { c }).collect();
-            CString::new(cleaned).unwrap_or_else(|_| CString::new("").expect("empty"))
-        }
-    }
-}
-
-/// A string the panel passed in; NULL reads as empty.
-fn from_c(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-}
-
 fn host() -> Option<Arc<dyn QuickHost>> {
     let host = HOST.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if host.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
@@ -84,52 +60,56 @@ fn host() -> Option<Arc<dyn QuickHost>> {
 /// started; without a host the panel still opens and previews nothing.
 pub fn start(host: Arc<dyn QuickHost>) {
     *HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some(host);
+    install();
+}
+
+/// Tells the C side which functions answer the panel's buttons. Idempotent, so
+/// `show` installs them as well in case it runs before `start`.
+fn install() {
+    fiotransfer_sys::quick::set_quick_hooks(fiotransfer_sys::quick::QuickHooks {
+        inspect: inspect_from_c,
+        dest: dest_from_c,
+        start: start_from_c,
+    });
 }
 
 /// Opens the panel, or brings it forward with what it holds. A panel that was
 /// closed starts over with `link` (may be empty) and `dir`.
 pub fn show(link: &str, dir: &str) {
-    let (cl, cd) = (cstr(link), cstr(dir));
-    unsafe { fioQuickShow(cl.as_ptr(), cd.as_ptr()) };
+    install();
+    fiotransfer_sys::quick::quick_show(link, dir);
 }
 
 /// Answers `inspect(seq)`: the link's name (or a message) and its detail, with
 /// `warn` in the notice color.
 pub fn info(seq: i32, state: i32, name: &str, detail: &str, warn: &str) {
-    let (cn, cd, cw) = (cstr(name), cstr(detail), cstr(warn));
-    unsafe { fioQuickInfo(seq, state, cn.as_ptr(), cd.as_ptr(), cw.as_ptr()) };
+    fiotransfer_sys::quick::quick_info(seq, state, name, detail, warn);
 }
 
 /// Closes the panel, or shows why the download didn't start.
 pub fn started(err: &str) {
-    let c = cstr(err);
-    unsafe { fioQuickStarted(c.as_ptr()) };
+    fiotransfer_sys::quick::quick_started(err);
 }
 
-/// The panel's link needed a preview.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub extern "C" fn goQuickInspect(seq: c_int, link: *const c_char, pass: *const c_char) {
+/// The panel's link needed a preview (called from `quick_darwin.m` through
+/// `fiotransfer_sys::quick::goQuickInspect`).
+fn inspect_from_c(seq: i32, link: &str, pass: &str) {
     if let Some(h) = host() {
-        h.inspect(seq, from_c(link), from_c(pass));
+        h.inspect(seq, link.to_string(), pass.to_string());
     }
 }
 
 /// The panel's folder button changed the download folder.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub extern "C" fn goQuickDest(dir: *const c_char) {
+fn dest_from_c(dir: &str) {
     if let Some(h) = host() {
-        h.dest(from_c(dir));
+        h.dest(dir.to_string());
     }
 }
 
 /// The panel's Download button was pressed.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub extern "C" fn goQuickStart(link: *const c_char, pass: *const c_char, dir: *const c_char, subfolder: c_int) {
+fn start_from_c(link: &str, pass: &str, dir: &str, subfolder: bool) {
     if let Some(h) = host() {
-        h.start(from_c(link), from_c(pass), from_c(dir), subfolder != 0);
+        h.start(link.to_string(), pass.to_string(), dir.to_string(), subfolder);
     }
 }
 
@@ -139,9 +119,11 @@ mod tests {
 
     #[test]
     fn from_c_reads_utf8_and_null() {
+        // What the panel's strings go through (fiotransfer_sys::from_c_str).
+        use std::ffi::CString;
         let c = CString::new("Frame.io link").expect("no nul");
-        assert_eq!(from_c(c.as_ptr()), "Frame.io link");
-        assert_eq!(from_c(std::ptr::null()), "");
+        assert_eq!(fiotransfer_sys::from_c_str(c.as_ptr()), "Frame.io link");
+        assert_eq!(fiotransfer_sys::from_c_str(std::ptr::null()), "");
     }
 
     #[test]

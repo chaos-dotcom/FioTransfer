@@ -1,8 +1,6 @@
 //! Records every transfer in SQLite and in a human-readable monthly log under
 //! ~/Library/Logs/FioTransfer.
 
-#![allow(unsafe_code)] // formats local time with libc::localtime_r
-
 pub mod unfinished;
 pub mod watch;
 
@@ -584,28 +582,16 @@ pub(crate) fn now_ms() -> i64 {
 
 /// Local broken-down time, the way Go's time.Now() reports it (the machine's
 /// zone, DST included).
-fn local_tm(ms: i64) -> Option<libc::tm> {
-    let secs = ms.div_euclid(1000) as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let ok = unsafe { !libc::localtime_r(&secs, &mut tm).is_null() };
-    if ok {
-        Some(tm)
-    } else {
-        None
-    }
+fn local_tm(ms: i64) -> Option<fiotransfer_sys::platform::LocalParts> {
+    fiotransfer_sys::platform::local_time(ms.div_euclid(1000))
 }
 
 /// "2006-01-02 15:04:05" for a unix-ms stamp.
 fn fmt_stamp(ms: i64) -> String {
     match local_tm(ms) {
-        Some(tm) => format!(
+        Some(t) => format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
+            t.year, t.month, t.day, t.hour, t.minute, t.second
         ),
         None => String::new(),
     }
@@ -614,7 +600,7 @@ fn fmt_stamp(ms: i64) -> String {
 /// "2006-01", the log file's month.
 fn fmt_month(ms: i64) -> String {
     match local_tm(ms) {
-        Some(tm) => format!("{:04}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1),
+        Some(t) => format!("{:04}-{:02}", t.year, t.month),
         None => String::new(),
     }
 }

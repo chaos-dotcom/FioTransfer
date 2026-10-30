@@ -5,8 +5,6 @@
 //! `/usr/bin/open -g <app> --args --hidden`. Nothing here touches AppKit, so it
 //! works from any thread.
 
-#![allow(unsafe_code)] // reads strerror for LaunchAgent write errors
-
 use std::path::{Path, PathBuf};
 
 /// The LaunchAgent's label, and its file name in ~/Library/LaunchAgents.
@@ -109,10 +107,10 @@ fn path_error(op: &str, path: &Path, e: &std::io::Error) -> String {
 /// The strerror text for an OS error, which is what Go printed.
 fn os_message(e: &std::io::Error) -> String {
     if let Some(code) = e.raw_os_error() {
-        // SAFETY: strerror returns a static string for any int.
-        let p = unsafe { libc::strerror(code) };
-        if !p.is_null() {
-            return unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned();
+        // The C library's text for the code, as Go printed it.
+        let text = fiotransfer_sys::platform::strerror_text(code);
+        if !text.is_empty() {
+            return text;
         }
     }
     e.to_string()

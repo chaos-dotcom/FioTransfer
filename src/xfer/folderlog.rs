@@ -1,8 +1,6 @@
 //! The transfer log written next to the media: in the download folder, or in
 //! the folder an upload was taken from.
 
-#![allow(unsafe_code)] // formats local time with libc::localtime_r
-
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -243,18 +241,8 @@ fn ts(ms: i64) -> String {
 /// log is written in the user's time zone, so the C library's conversion is
 /// used (the same one Go's time package calls).
 fn local_fields(unix_secs: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let t = unix_secs as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
-    if !ok {
-        return (1970, 1, 1, 0, 0, 0);
+    match fiotransfer_sys::platform::local_time(unix_secs) {
+        Some(t) => (t.year, t.month, t.day, t.hour, t.minute, t.second),
+        None => (1970, 1, 1, 0, 0, 0),
     }
-    (
-        tm.tm_year + 1900,
-        (tm.tm_mon + 1) as u32,
-        tm.tm_mday as u32,
-        tm.tm_hour as u32,
-        tm.tm_min as u32,
-        tm.tm_sec as u32,
-    )
 }

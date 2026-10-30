@@ -4,10 +4,9 @@
 //! The same window, the same frontend, the same menu bar item and Finder
 //! services as the Go app, with the transfer engine and the app itself in Rust.
 
-#![deny(unsafe_code)]
-// `unsafe` is allowed only where this app has to call C: the AppKit shims in
-// `mac/` and the handful of `libc` calls listed below. Anywhere else it is a
-// build error, which is the point.
+#![forbid(unsafe_code)]
+// The C side (`mac/`) is reached through `fiotransfer-sys`, which is the only
+// crate here that may write `unsafe`.
 
 use fiotransfer as fio;
 

@@ -5,8 +5,6 @@
 //! accept the localhost certificate it signs. The CA is name-constrained to
 //! localhost, so even its private key can't mint certificates for other sites.
 
-#![allow(unsafe_code)] // reads the hostname with libc::gethostname for the local CA name
-
 use std::path::PathBuf;
 
 use rcgen::{
@@ -25,20 +23,10 @@ const OLD_CA_FILE: &str = "local-ca-old.pem";
 /// means the CA came from an earlier build and must be replaced.
 const CA_MARKER: &str = "local-ca-v2";
 
-fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if r != 0 {
-        return "localhost".to_string();
-    }
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
-}
-
 fn ca_params() -> Result<CertificateParams, String> {
     let mut p = CertificateParams::new(Vec::<String>::new()).map_err(|e| e.to_string())?;
     p.distinguished_name = DistinguishedName::new();
-    p.distinguished_name.push(DnType::CommonName, format!("FioTransfer Local CA ({})", hostname()));
+    p.distinguished_name.push(DnType::CommonName, format!("FioTransfer Local CA ({})", fiotransfer_sys::platform::hostname()));
     p.distinguished_name.push(DnType::OrganizationName, "FioTransfer");
     p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];

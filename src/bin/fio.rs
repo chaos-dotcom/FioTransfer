@@ -8,11 +8,9 @@
 //!   fio up <path>... --account <id> --folder <id>
 //!   fio history [-n 20]
 
-#![deny(unsafe_code)]
-#![allow(unsafe_code)] // asks libc whether stdout is a terminal and whether SIGINT was ignored
-// `unsafe` is allowed only where this app has to call C: the AppKit shims in
-// `mac/` and the handful of `libc` calls listed below. Anywhere else it is a
-// build error, which is the point.
+#![forbid(unsafe_code)]
+// The terminal and signal questions are `fiotransfer-sys`'s; nothing here
+// writes `unsafe`.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -425,12 +423,16 @@ fn pct(a: i64, b: i64) -> f64 {
     }
 }
 
+/// fd 1, as `libc::STDOUT_FILENO`: the progress line is only rewritten in
+/// place on a terminal.
+const STDOUT_FILENO: i32 = 1;
+
 fn is_tty() -> bool {
-    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+    fiotransfer_sys::platform::is_tty(STDOUT_FILENO)
 }
 
 fn signalled() -> bool {
-    unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_IGN }
+    fiotransfer_sys::platform::sigint_ignored()
 }
 
 fn fmt_ms(ms: i64) -> String {
