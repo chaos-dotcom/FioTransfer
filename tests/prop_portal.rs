@@ -878,6 +878,53 @@ fn set_portal_stores_the_settings_and_the_token_but_not_in_the_settings_file() {
     assert!(w.app.set_portal("file:///etc/passwd", "", "", true).is_err());
 }
 
+/// The Settings screen's URL field commits through `App::set_portal` with an
+/// empty token (which keeps the stored one), so the URL alone can change without
+/// the token ever reaching settings.json.
+#[test]
+fn saving_the_url_alone_never_writes_the_token_into_settings_json() {
+    let w = World::new();
+    w.app
+        .set_portal("https://portal.example.com", "sekret", "~/Live_Work", true)
+        .expect("the token is stored");
+    let st = w
+        .app
+        .set_portal("https://portal.example.org", "", "", true)
+        .expect("the address is saved");
+    assert_eq!(st.url, "https://portal.example.org");
+    assert!(st.signed_in, "the token is still stored");
+    assert_eq!(portal::token().as_deref(), Some("sekret"));
+
+    let saved = std::fs::read_to_string(fiotransfer::config::path()).expect("settings.json");
+    assert!(!saved.contains("sekret"), "the token is not in settings.json: {saved}");
+    assert!(saved.contains("portal.example.org"));
+    // Nor in anything else the app keeps beside it.
+    for entry in std::fs::read_dir(fiotransfer::config::dir()).expect("the data folder") {
+        let path = entry.expect("an entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(!text.contains("sekret"), "{} carries the token", path.display());
+        }
+    }
+}
+
+/// "Forget" in the Settings screen: the token goes, the status line's
+/// `signed_in` goes with it, and no setting changes.
+#[test]
+fn forgetting_the_token_leaves_the_settings_alone() {
+    let w = World::new();
+    w.app
+        .set_portal("https://portal.example.com", "sekret", "~/Live_Work", true)
+        .expect("the portal is set");
+    let before = std::fs::read_to_string(fiotransfer::config::path()).expect("settings.json");
+    let st = w.app.forget_portal_token();
+    assert!(!st.signed_in, "the flag the status line reads is cleared with the token");
+    assert_eq!(portal::token(), None, "nothing is left to send with");
+    let after = std::fs::read_to_string(fiotransfer::config::path()).expect("settings.json");
+    assert_eq!(before, after, "forgetting a token is not a settings change");
+    assert!(after.contains("portal.example.com"), "the address is still there");
+}
+
 #[test]
 fn a_reconcile_without_a_token_says_so_and_changes_nothing() {
     let w = World::new();
