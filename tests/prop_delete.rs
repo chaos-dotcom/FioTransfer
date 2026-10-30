@@ -108,7 +108,13 @@ fn snap(root: &Path) -> BTreeMap<String, Entry> {
         }
     }
     let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
+    match std::fs::read_dir(root) {
+        Ok(_) => walk(root, root, &mut out),
+        // A case whose root was deleted still needs a comparable snapshot.
+        Err(e) => {
+            out.insert("<root>".to_string(), Entry::Link(format!("unreadable: {}", e)));
+        }
+    }
     out
 }
 
@@ -279,7 +285,10 @@ impl World {
     fn new(mode: Mode, collide: bool) -> World {
         let _ = test_home();
         let tmp = tempfile::TempDir::new().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        // One level down: the case runs with its working directory inside
+        // `sandbox`, so even the id `..` can only reach this case's own tmp dir.
+        std::fs::create_dir_all(tmp.path().join("sandbox")).unwrap();
+        let root = std::fs::canonicalize(tmp.path().join("sandbox")).unwrap();
         seed_media(&root);
         let data = root.join("Library/Application Support/FioTransfer");
         let logs = root.join("Library/Logs/FioTransfer");
