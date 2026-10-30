@@ -400,6 +400,20 @@ b933b6c merge: the Space screen on the one-app line        <- HEAD
 * 1bf2c59 origin/portal-agent
 ```
 
+
+### Joining the histories, and why
+
+GitHub will not open a pull request between two roots that share no ancestor
+(`GraphQL: The consolidate branch has no history in common with main`), and these
+two genuinely are unrelated roots. The branch therefore ends with one merge of
+`origin/main` made with `git merge -s ours`: main becomes an ancestor, its tree is
+**not** taken, and the branch's tree stays byte-identical to the one that was
+tested (the merge has an empty diff against the commit before it). What the pull
+request shows against `main` is then the one-app change set: `core/` added,
+`frontend/` and `bench/web-ref/` deleted, the AppKit `sys` modules gone, `egui-ui`
+driving the real `App`, the Space screen with its quota headline, the Portal
+reconciler, the three sweeps and the four fixes.
+
 `Cargo.lock` was regenerated (`cargo metadata --offline`, then `cargo check
 --offline`) by the commits that moved a manifest, so the lock carries the three
 new workspace dependencies at once: `proptest`/`tempfile` for `fiotransfer-sys`
