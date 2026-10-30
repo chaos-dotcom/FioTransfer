@@ -283,19 +283,17 @@ fn the_chrome_strip_sits_at_the_top_of_the_window() {
         head.top()
     );
 
-    // The picture: the band, its hairline, the three dot colours, and the page
-    // below it.
+    // The picture: the two surfaces the strip continues, the three dot colours,
+    // and the page below it. The strip has no colour of its own — `--panel` over
+    // the sidebar's column, `--base` over the page — and no hairline: the seam
+    // test below is what holds the two edges together, pixel for pixel.
     let image = harness.render().expect("render");
     let pixel = |x: u32, y: u32| {
         let p = image.get_pixel(x, y);
         [p[0], p[1], p[2]]
     };
-    assert_eq!(pixel(600, 5), [theme::PANEL.r(), theme::PANEL.g(), theme::PANEL.b()]);
-    assert_ne!(
-        pixel(600, chrome::STRIP_HEIGHT as u32 - 1),
-        [theme::PANEL.r(), theme::PANEL.g(), theme::PANEL.b()],
-        "the strip's bottom hairline is not drawn"
-    );
+    assert_eq!(pixel(100, 5), [theme::PANEL.r(), theme::PANEL.g(), theme::PANEL.b()]);
+    assert_eq!(pixel(600, 5), [theme::BASE.r(), theme::BASE.g(), theme::BASE.b()]);
     assert_eq!(pixel(600, chrome::STRIP_HEIGHT as u32), [theme::BASE.r(), theme::BASE.g(), theme::BASE.b()]);
     for dot in Dot::ALL {
         let centre = dot.centre();
@@ -313,6 +311,142 @@ fn the_chrome_strip_sits_at_the_top_of_the_window() {
     options.output_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("snapshots");
     harness.snapshot_options("chrome", &options);
+}
+
+/// The window as the app draws it, 1180 x 780, in the state every other picture
+/// in this file uses.
+fn window_image() -> image::RgbaImage {
+    window_harness().render().expect("render")
+}
+
+/// The seam, measured: there is no line and no step where the strip meets the
+/// window below it.
+///
+/// The strip paints no colour of its own — each of its columns paints the
+/// surface it continues — so for every one of the window's 1180 columns the last
+/// row of the strip and the first row of the page are the same pixel, and the
+/// top row of the window is that same pixel too. Before this, x = 600 read
+/// `--panel` `(18, 20, 30)` at y = 30, the 1 px `--border` rule `(32, 34, 43)` at
+/// y = 31 and `--base` `(0, 0, 0)` at y = 32: a line across the whole window with
+/// a step of 30 levels under it.
+///
+/// The one column that is not one of the two surfaces is x = 223, the sidebar's
+/// `--border` right edge; the strip carries it up to y = 0, so that column is the
+/// same pixel in every row from the top of the window to the bottom.
+#[test]
+fn the_strip_meets_the_page_without_a_line_or_a_step() {
+    let image = window_image();
+    let radius = chrome::WINDOW_RADIUS_PX as u32;
+    let last_strip_row = chrome::STRIP_HEIGHT as u32 - 1;
+    for x in 0..WINDOW_WIDTH as u32 {
+        assert_eq!(
+            image.get_pixel(x, last_strip_row),
+            image.get_pixel(x, last_strip_row + 1),
+            "a line or a step at the strip's bottom edge, x = {x}: {:?} above {:?}",
+            image.get_pixel(x, last_strip_row),
+            image.get_pixel(x, last_strip_row + 1)
+        );
+    }
+    // The strip continues the window: its top row is its last row, everywhere
+    // but the two rounded corners (the next test is about those).
+    for x in radius..(WINDOW_WIDTH as u32 - radius) {
+        assert_eq!(
+            image.get_pixel(x, 0),
+            image.get_pixel(x, last_strip_row),
+            "the strip does not continue the surface below it, x = {x}"
+        );
+    }
+    // ... and the two surfaces are the palette's: `--panel` under the sidebar's
+    // column, `--base` under the page, in the strip and below it alike.
+    let panel = image.get_pixel(100, 5);
+    assert_eq!(&[panel[0], panel[1], panel[2]], &[theme::PANEL.r(), theme::PANEL.g(), theme::PANEL.b()]);
+    assert_eq!(panel, image.get_pixel(100, last_strip_row + 1));
+    // The page's own column, clear of the north-east corner's rounding.
+    for x in [(WINDOW_WIDTH as u32) / 2, WINDOW_WIDTH as u32 - radius - 1] {
+        let page = image.get_pixel(x, 5);
+        assert_eq!(
+            &[page[0], page[1], page[2]],
+            &[theme::BASE.r(), theme::BASE.g(), theme::BASE.b()],
+            "the page's column of the strip is not --base, x = {x}"
+        );
+        assert_eq!(page, image.get_pixel(x, last_strip_row + 1));
+    }
+}
+
+/// The window's four corners are round, and the pixels outside them are never
+/// painted.
+///
+/// The window is undecorated, so no platform rounds it any more; the app rounds
+/// it itself (`chrome::WINDOW_RADIUS_PX`, 10 px) and `main.rs` asks for a
+/// transparent window so that the pixels outside a corner stay transparent
+/// instead of being painted black. Measured, per corner: 17 fully transparent
+/// and 14 partly transparent pixels in a 14 x 14 box, with `--panel` inside the
+/// two left corners and `--base` inside the two right ones — a quarter circle of
+/// radius 10, the same at all four.
+#[test]
+fn the_window_corners_are_round_and_unpainted() {
+    let image = window_image();
+    let (w, h) = (WINDOW_WIDTH as i32, WINDOW_HEIGHT as i32);
+    let radius = chrome::WINDOW_RADIUS_PX as i32;
+    struct Corner {
+        name: &'static str,
+        origin: (i32, i32),
+        step: (i32, i32),
+        inside: egui::Color32,
+    }
+    let corners = [
+        Corner { name: "north-west", origin: (0, 0), step: (1, 1), inside: theme::PANEL },
+        Corner { name: "north-east", origin: (w - 1, 0), step: (-1, 1), inside: theme::BASE },
+        Corner { name: "south-west", origin: (0, h - 1), step: (1, -1), inside: theme::PANEL },
+        Corner {
+            name: "south-east",
+            origin: (w - 1, h - 1),
+            step: (-1, -1),
+            inside: theme::BASE,
+        },
+    ];
+    for corner in corners {
+        let at = |dx: i32, dy: i32| {
+            let x = (corner.origin.0 + dx * corner.step.0) as u32;
+            let y = (corner.origin.1 + dy * corner.step.1) as u32;
+            *image.get_pixel(x, y)
+        };
+        // The corner pixel itself is outside the shape.
+        assert_eq!(at(0, 0)[3], 0, "the {} corner is painted square", corner.name);
+        // So are the first half-radius pixels along both of its edges, which a
+        // square corner (or a 1 px nibble) could not manage.
+        for k in 0..radius / 2 {
+            assert_eq!(at(k, 0)[3], 0, "{} corner: {k} px along the top/bottom edge", corner.name);
+            assert_eq!(at(0, k)[3], 0, "{} corner: {k} px along the side edge", corner.name);
+        }
+        // A quarter of the corner's box is not drawn at all — a square window
+        // would paint all of it.
+        let mut unpainted = 0;
+        for dy in 0..radius {
+            for dx in 0..radius {
+                if at(dx, dy)[3] == 0 {
+                    unpainted += 1;
+                }
+            }
+        }
+        assert!(
+            unpainted >= 10,
+            "{} corner: only {unpainted} of the {} pixels in its {} x {} box are unpainted",
+            corner.name,
+            radius * radius,
+            radius,
+            radius
+        );
+        // And a radius in, the window is the surface that owns the corner.
+        let inside = at(radius, radius);
+        assert_eq!(inside[3], 255, "{} corner is still transparent {} px in", corner.name, radius);
+        assert_eq!(
+            &[inside[0], inside[1], inside[2]],
+            &[corner.inside.r(), corner.inside.g(), corner.inside.b()],
+            "{} corner is not the surface that owns it",
+            corner.name
+        );
+    }
 }
 
 /// A harness over the whole window, the state the other pictures use.

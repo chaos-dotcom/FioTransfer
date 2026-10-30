@@ -24,6 +24,33 @@
 //! The dots are 12 px circles, 8 px apart, the first starting at x = 20 and all
 //! centred in the strip: their centres are (26, 16), (46, 16) and (66, 16).
 //!
+//! ## The strip has no colour of its own, so there is no seam under it
+//!
+//! The strip paints no colour of its own. Its two columns paint the surface they
+//! continue — `--panel` over the sidebar's 224 px, `--base` over the page — so
+//! every column of the window has one colour from row 0 to the last row, and
+//! the boundary between the strip and the window below it is not a line, a step
+//! or a gradient: it is not there. The 1 px `--border` rule that used to sit on
+//! the strip's bottom edge went with it; the sidebar's own `--border` right edge
+//! is carried up to y = 0, so the divider runs the window's whole height.
+//!
+//! ## Rounded window corners
+//!
+//! A decorated macOS window is rounded; an undecorated one is a square
+//! rectangle, which is what `with_decorations(false)` left behind. The app draws
+//! the corners itself: `main.rs` asks for a transparent window
+//! (`with_transparent(true)`), and every surface that reaches a window corner
+//! fills a rounded rect there — the strip's two columns carry the top corners
+//! ([`CORNER_NW`], [`CORNER_NE`]), the sidebar the bottom-left ([`CORNER_SW`])
+//! and the central panel the bottom-right ([`CORNER_SE`]), all with
+//! [`WINDOW_RADIUS_PX`]. The pixels outside a corner are never painted, so the
+//! window is transparent there and the desktop shows through — the shape the
+//! window server rounds and shadows is the app's own.
+//!
+//! The radius is a constant here rather than a platform value: it is the same 10
+//! px on all three targets, so the goldens in `tests/snapshots.rs` are the same
+//! picture everywhere.
+//!
 //! ## Why the seam looks like this
 //!
 //! Everything that decides *what* the window should do is a plain function with
@@ -53,8 +80,8 @@
 //! `cfg!` on the target, not a call into it.
 
 use egui::{
-    Color32, CursorIcon, Frame, Id, Key, KeyboardShortcut, Modifiers, Pos2, Rect, Sense, Stroke,
-    Vec2, ViewportCommand, pos2, vec2, viewport::ResizeDirection,
+    Color32, CornerRadius, CursorIcon, Frame, Id, Key, KeyboardShortcut, Modifiers, Pos2, Rect,
+    Sense, Stroke, Vec2, ViewportCommand, pos2, vec2, viewport::ResizeDirection,
 };
 
 use crate::theme;
@@ -74,6 +101,45 @@ pub const DOT_GAP: f32 = 8.0;
 pub const DOT_FIRST_X: f32 = 20.0;
 /// The hit band along each edge and corner: 6 px.
 pub const RESIZE_BAND: f32 = 6.0;
+
+/// The window's own corner radius: 10 px, what a decorated macOS window had
+/// before `with_decorations(false)` took the platform's corners away. It is the
+/// app's number now — see the module note on the rounded window corners — so it
+/// is a constant here rather than a platform default, and it is the same on
+/// every OS the app builds for, which keeps `tests/snapshots.rs` portable.
+pub const WINDOW_RADIUS_PX: u8 = 10;
+
+/// 10 px on the window's north-west corner — the sidebar's column at the
+/// window's top-left.
+pub const CORNER_NW: CornerRadius = CornerRadius {
+    nw: WINDOW_RADIUS_PX,
+    ne: 0,
+    sw: 0,
+    se: 0,
+};
+/// 10 px on the window's north-east corner — the page at the window's top-right.
+pub const CORNER_NE: CornerRadius = CornerRadius {
+    nw: 0,
+    ne: WINDOW_RADIUS_PX,
+    sw: 0,
+    se: 0,
+};
+/// 10 px on the window's south-west corner — the sidebar's column at the
+/// window's bottom-left.
+pub const CORNER_SW: CornerRadius = CornerRadius {
+    nw: 0,
+    ne: 0,
+    sw: WINDOW_RADIUS_PX,
+    se: 0,
+};
+/// 10 px on the window's south-east corner — the page at the window's
+/// bottom-right.
+pub const CORNER_SE: CornerRadius = CornerRadius {
+    nw: 0,
+    ne: 0,
+    sw: 0,
+    se: WINDOW_RADIUS_PX,
+};
 
 /// `#FF5F57` — the red dot.
 pub const DOT_RED: Color32 = Color32::from_rgb(0xff, 0x5f, 0x57);
@@ -386,6 +452,22 @@ fn window_geometry(ctx: &egui::Context) -> Option<(Vec2, Pos2)> {
 // Drawing
 // ---------------------------------------------------------------------------
 
+/// The strip's two columns, in window coordinates: the sidebar's own column
+/// (which carries the window's north-west corner) and the page's (which carries
+/// the north-east one). The split is `.app { grid-template-columns: 224px 1fr }`
+/// — [`theme::size::SIDEBAR_W`].
+///
+/// The strip is not a band of its own colour laid over the window: each column
+/// paints the surface it continues, so the strip and the window below it are one
+/// picture. See the module note on why there is no seam under the strip.
+pub fn strip_columns(strip: Rect) -> (Rect, Rect) {
+    let split = strip.left() + theme::size::SIDEBAR_W.min(strip.width());
+    (
+        Rect::from_min_max(strip.min, pos2(split, strip.bottom())),
+        Rect::from_min_max(pos2(split, strip.top()), strip.max),
+    )
+}
+
 /// The title strip: 32 px across the top, the three dots at its left. Returns
 /// what the strip asked for on this frame, if anything.
 ///
@@ -397,19 +479,34 @@ fn window_geometry(ctx: &egui::Context) -> Option<(Vec2, Pos2)> {
 /// sees it as a drag.
 pub fn strip(ctx: &egui::Context) -> Option<Action> {
     let mut action = None;
+    // No fill on the frame: the strip paints its own two columns below. A single
+    // `--panel` band here would be a colour of its own, and that is the seam this
+    // change removes.
     egui::TopBottomPanel::top(Id::new("fio-chrome-strip"))
         .exact_height(STRIP_HEIGHT)
         .resizable(false)
-        .frame(Frame::NONE.fill(theme::PANEL))
+        .frame(Frame::NONE)
         .show_separator_line(false)
         .show(ctx, |ui| {
             let rect = ui.max_rect();
-            // The strip's bottom hairline: the same 1 px `--border` the sidebar
-            // draws on its right edge.
-            ui.painter().hline(
-                rect.x_range(),
-                rect.bottom() - theme::size::HAIRLINE,
-                Stroke::new(theme::size::HAIRLINE, theme::BORDER),
+            let (sidebar_column, page_column) = strip_columns(rect);
+            // The page: `--base`, the surface the central panel continues, with
+            // the window's north-east corner rounded off.
+            ui.painter()
+                .rect_filled(page_column, CORNER_NE, theme::BASE);
+            // The sidebar's column: `--panel`, the surface the sidebar
+            // continues, with the window's north-west corner rounded off. It is
+            // painted second so the two meet on the sidebar's own right edge,
+            // like every other row of the window.
+            ui.painter()
+                .rect_filled(sidebar_column, CORNER_NW, theme::PANEL);
+            // The sidebar's 1 px `--border` right edge, carried up to the top of
+            // the window: without it the divider stops dead 32 px short of the
+            // corner and the strip reads as a notch cut into the sidebar.
+            ui.painter().vline(
+                sidebar_column.right() - theme::size::HAIRLINE * 0.5,
+                sidebar_column.y_range(),
+                theme::stroke_border(),
             );
 
             let band = ui.interact(rect, Id::new("fio-chrome-band"), Sense::click_and_drag());
@@ -579,6 +676,49 @@ mod tests {
         assert_eq!(strip.top(), 0.0);
         assert_eq!(strip.height(), 32.0);
         assert_eq!(STRIP_HEIGHT, 32.0);
+    }
+
+    #[test]
+    fn the_strip_paints_the_two_surfaces_it_continues() {
+        let strip = strip_rect(window());
+        let (sidebar, page) = strip_columns(strip);
+        // `.app { grid-template-columns: 224px 1fr }`, carried to the top of the
+        // window: the sidebar's column, then the page's.
+        assert_eq!(sidebar.min, pos2(0.0, 0.0));
+        assert_eq!(sidebar.right(), theme::size::SIDEBAR_W);
+        assert_eq!(page.min, pos2(theme::size::SIDEBAR_W, 0.0));
+        assert_eq!(page.right(), WINDOW_WIDTH);
+        // Side by side, no gap, and together the whole strip.
+        assert_eq!(sidebar.right(), page.left());
+        assert_eq!(sidebar.union(page), strip);
+        assert_eq!(sidebar.height(), STRIP_HEIGHT);
+        assert_eq!(page.height(), STRIP_HEIGHT);
+        // A strip narrower than the sidebar is all sidebar's column, never a
+        // rect with a negative width.
+        let narrow = Rect::from_min_size(Pos2::ZERO, vec2(100.0, STRIP_HEIGHT));
+        let (only_sidebar, nothing) = strip_columns(narrow);
+        assert_eq!(only_sidebar, narrow);
+        assert_eq!(nothing.width(), 0.0);
+    }
+
+    #[test]
+    fn each_window_corner_is_rounded_and_only_that_corner() {
+        // 10 px, the radius a decorated macOS window had, on one corner each and
+        // nothing on the other three: a surface rounds the corner it holds, so a
+        // column that runs down the whole window is not rounded in the middle.
+        assert_eq!(WINDOW_RADIUS_PX, 10);
+        for (corner, nw, ne, sw, se) in [
+            (CORNER_NW, 10, 0, 0, 0),
+            (CORNER_NE, 0, 10, 0, 0),
+            (CORNER_SW, 0, 0, 10, 0),
+            (CORNER_SE, 0, 0, 0, 10),
+        ] {
+            assert_eq!(
+                (corner.nw, corner.ne, corner.sw, corner.se),
+                (nw, ne, sw, se),
+                "a corner rounds more than the corner it holds"
+            );
+        }
     }
 
     #[test]
