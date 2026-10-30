@@ -8,11 +8,19 @@
 //! "Change…", "Save log with media", "App log" + "Show in Finder"), then the
 //! `.about` line.
 //!
+//! Below them is a fifth section the webview never had: **Portal**, the service
+//! that publishes this project's links and names the `Live_Work` folder each one
+//! belongs to. It is four settings (`App::set_portal` writes them: the address,
+//! the local folder, the on/off flag and — to the keychain, never to
+//! settings.json — the bearer token), one status line from `App::portal_status`,
+//! and a "Reconcile now". It draws with the same rows as everything above it: no
+//! new colour, no new font, no new height.
+//!
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`]. `.settings
 //! { max-width: 680px }` is applied here because it is this screen's own measure.
 
-use crate::model::{Request, UiState};
+use crate::model::{PortalView, Request, Secret, UiState};
 use crate::theme;
 use egui::{
     Align, Checkbox, CollapsingHeader, Color32, ComboBox, CornerRadius, Frame, Layout, Margin,
@@ -80,6 +88,20 @@ pub enum Action {
     UpdateClicked,
     /// "Show in Finder" on the App log row (`OpenLogs`).
     ShowLogs,
+
+    /// The Portal address, committed from its field on Enter or focus loss. It
+    /// has already passed [`portal_url_reason`]: a refused value never gets here.
+    SetPortalUrl(String),
+    /// The local folder Portal's markers are mirrored under.
+    SetPortalRoot(String),
+    /// "Save" next to the access token: the token, on its way to the keychain.
+    SavePortalToken(Secret),
+    /// "Forget" next to the access token.
+    ForgetPortalToken,
+    /// The "Enabled" toggle.
+    SetPortalEnabled(bool),
+    /// "Reconcile now".
+    ReconcileNow,
 }
 
 /// The screen, wired to the app: whatever [`show_with_actions`] reports is
@@ -118,6 +140,12 @@ fn ask(state: &mut UiState, action: Action) {
             }
         }
         Action::ShowLogs => state.ask(Request::OpenLogs),
+        Action::SetPortalUrl(url) => state.ask(Request::SetPortalUrl(url)),
+        Action::SetPortalRoot(root) => state.ask(Request::SetPortalRoot(root)),
+        Action::SavePortalToken(token) => state.ask(Request::SetPortalToken(token)),
+        Action::ForgetPortalToken => state.ask(Request::ForgetPortalToken),
+        Action::SetPortalEnabled(on) => state.ask(Request::SetPortalEnabled(on)),
+        Action::ReconcileNow => state.ask(Request::PortalReconcile),
     }
 }
 
@@ -186,6 +214,24 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
             folder_logs_line(ui, state, &mut action);
             rule(ui);
             log_line(ui, state, &mut action);
+        });
+        ui.add_space(SECTION_GAP);
+
+        // ---------- Portal ----------
+        section_title(ui, "Portal");
+        ui.add_space(CARD_GAP);
+        card(ui, |ui| {
+            portal_url_line(ui, state, &mut action);
+            rule(ui);
+            portal_token_line(ui, state, &mut action);
+            rule(ui);
+            portal_root_line(ui, state, &mut action);
+            rule(ui);
+            portal_enabled_line(ui, state, &mut action);
+            rule(ui);
+            portal_status_line(ui, state);
+            rule(ui);
+            portal_reconcile_line(ui, state, &mut action);
         });
         ui.add_space(SECTION_GAP);
 
@@ -726,6 +772,428 @@ pub fn short_path(path: &str, home: &str) -> String {
     }
 }
 
+// ---------- Portal ----------
+
+/// The address field's placeholder: what an address looks like, not a default.
+const PORTAL_URL_HINT: &str = "https://portal.example.com";
+/// The folder field's placeholder: `Settings::PORTAL_ROOT_DIR` under `HOME`, in
+/// the words the field can take back (`Settings::portal_root_path` expands it).
+const PORTAL_ROOT_HINT: &str = "~/Live_Work";
+/// The token field's placeholder. The field never shows the stored token, so an
+/// empty field says which of the two states it is in instead.
+const TOKEN_STORED: &str = "stored in your keychain";
+const TOKEN_MISSING: &str = "not set";
+/// What the address field says when it refuses a value.
+const PORTAL_URL_REASON: &str = "The Portal address has to start with http:// or https://";
+
+/// Why this Portal address cannot be used, or `None` when it can.
+///
+/// `App::set_portal` refuses the same two things — no `http://` / `https://`, or
+/// a scheme with nothing after it — but this decides before the write, so a
+/// refused address is never the one in `settings.json`. An empty address is
+/// allowed: it is how Portal is switched off.
+pub fn portal_url_reason(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let rest = match url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) {
+        Some(rest) => rest,
+        None => return Some(PORTAL_URL_REASON.to_string()),
+    };
+    if rest.trim_matches('/').is_empty() {
+        return Some("The Portal address has no host after the scheme".to_string());
+    }
+    if rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("The Portal address has a space or a control character in it".to_string());
+    }
+    None
+}
+
+/// Why this local folder cannot be used, or `None` when it can.
+///
+/// Empty means "the default", which is `~/Live_Work`. The disk root is refused
+/// here because `Settings::normalize` would silently replace it: a setting that
+/// cannot be saved is better refused out loud.
+pub fn portal_root_reason(root: &str) -> Option<String> {
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+    if root == "/" {
+        return Some("The whole disk is not a Portal folder".to_string());
+    }
+    if !root.starts_with('/') && !root.starts_with('~') {
+        return Some("Enter an absolute path, or one starting with ~".to_string());
+    }
+    if root.chars().any(|c| c.is_control()) {
+        return Some("The folder has a control character in it".to_string());
+    }
+    None
+}
+
+/// `~/Live_Work` with the home expanded: the absolute path Portal's folders are
+/// actually created under.
+///
+/// The same expansion as `Settings::portal_root_path`, in strings: the browser
+/// capture has no core `Settings` to ask, and the row has to show the resolved
+/// path either way.
+pub fn resolved_portal_root(root: &str, home: &str) -> String {
+    let home = home.trim().trim_end_matches('/');
+    let root = root.trim();
+    let root = if root.is_empty() { format!("{home}/Live_Work") } else { root.to_string() };
+    match root.strip_prefix('~') {
+        Some(rest) if rest.is_empty() => home.to_string(),
+        Some(rest) => match rest.strip_prefix('/') {
+            Some(rest) => format!("{home}/{rest}"),
+            // `~someone/x` is not this user's home: taken as given.
+            None => root,
+        },
+        None => root,
+    }
+}
+
+/// One number with its word: `1 link`, `4 links`.
+fn counted(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// How long ago the last reconcile ran, in the words a status line can carry.
+///
+/// `at` and `now` are unix milliseconds. A clock that went backwards (or a
+/// report stamped a moment in the future) is "just now", not a negative age.
+pub fn portal_when(at: i64, now: i64) -> String {
+    if at <= 0 {
+        return "never".to_string();
+    }
+    let secs = ((now - at).max(0)) / 1000;
+    let ago = |n: i64, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one} ago")
+        } else {
+            format!("{n} {many} ago")
+        }
+    };
+    match secs {
+        0..=4 => "just now".to_string(),
+        5..=59 => "under a minute ago".to_string(),
+        60..=3599 => ago(secs / 60, "min", "min"),
+        3600..=86_399 => ago(secs / 3600, "h", "h"),
+        _ => ago(secs / 86_400, "day", "days"),
+    }
+}
+
+/// The status line: one sentence, and whether it is bad news.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalLine {
+    pub text: String,
+    /// The last reconcile failed, so the line is drawn in the error colour and
+    /// says so: it must never read as a success.
+    pub failed: bool,
+}
+
+/// What the status line says, from the last status the app gave.
+///
+/// The order matters: "not set up" and "no token" are the reasons a reconcile
+/// cannot run at all, so they come before the numbers; and a failed run says
+/// "Failed" with its reason and no numbers, because a report that failed has
+/// none to show.
+pub fn portal_line(status: &PortalView) -> PortalLine {
+    let line = |text: String, failed: bool| PortalLine { text, failed };
+    let url = status.url.trim();
+    if url.is_empty() {
+        return if status.signed_in {
+            line("No Portal address yet: add one above.".to_string(), true)
+        } else {
+            line("Not set up: no Portal address and no token yet.".to_string(), false)
+        };
+    }
+    if !status.signed_in {
+        return line("No access token yet: paste one above and press Save.".to_string(), true);
+    }
+    if !status.error.trim().is_empty() {
+        let when = portal_when(status.last_at, status.now_ms);
+        return line(format!("Failed {when}: {}", status.error.trim()), true);
+    }
+    if status.running {
+        return line("Reconciling…".to_string(), false);
+    }
+    if status.last_at <= 0 {
+        return line("Configured. Portal has not been checked yet.".to_string(), false);
+    }
+    let mut text = format!(
+        "{} · {}, {} kept in step, {} removed",
+        portal_when(status.last_at, status.now_ms),
+        counted(status.links_seen, "link", "links"),
+        counted(status.ensured, "folder", "folders"),
+        status.removed
+    );
+    if status.skipped > 0 {
+        text.push_str(&format!(", {}", counted(status.skipped, "skipped", "skipped")));
+    }
+    line(text, false)
+}
+
+/// `.input` as the Client ID field draws it: the surface fill, 10 px either
+/// side, the full width it is given.
+fn portal_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::Response {
+    let width = ui.available_width();
+    ui.scope(|ui| {
+        ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+        ui.add(
+            TextEdit::singleline(text)
+                .hint_text(hint)
+                .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                .desired_width(width),
+        )
+    })
+    .inner
+}
+
+/// `.help`: 12 px, `--text-3`, one line, the whole words on hover.
+fn help_line(ui: &mut egui::Ui, text: &str) {
+    ui.add(theme::truncating(
+        RichText::new(text)
+            .font(theme::detail())
+            .line_height(Some(HELP_LINE))
+            .color(theme::TEXT_3),
+    ))
+    .on_hover_text(text);
+}
+
+/// The same line, for something the user has to read and fix.
+fn reason_line(ui: &mut egui::Ui, text: &str) {
+    ui.add(theme::truncating(
+        RichText::new(text)
+            .font(theme::detail())
+            .line_height(Some(HELP_LINE))
+            .color(theme::ERROR_TEXT),
+    ))
+    .on_hover_text(text);
+}
+
+/// "Server URL": a field committed on Enter or on focus loss, with the reason
+/// under it when the value is refused.
+fn portal_url_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let mut text = state.portal.url_draft.clone().unwrap_or_else(|| state.settings.portal_url.clone());
+    line(ui, |ui| {
+        let label = field_label(ui, "Server URL");
+        ui.add_space(theme::space::M);
+        // `label for=` as the webview has it: the field is named by the words
+        // above it, for a screen reader and for this screen's own tests.
+        let response = portal_field(ui, &mut text, PORTAL_URL_HINT).labelled_by(label.id);
+        if response.changed() {
+            // Typing is not a commit: the setting waits for Enter or for the
+            // field to lose focus.
+            state.portal.url_draft = Some(text.clone());
+            state.portal.url_error = None;
+        }
+        if response.lost_focus() {
+            match portal_url_reason(&text) {
+                None => {
+                    let url = text.trim().trim_end_matches('/').to_string();
+                    state.settings.portal_url = url.clone();
+                    state.portal.url_draft = None;
+                    state.portal.url_error = None;
+                    *action = Some(Action::SetPortalUrl(url));
+                }
+                Some(reason) => {
+                    // Not saved: the field keeps what was typed so it can be
+                    // fixed, and the setting keeps the value already there.
+                    state.portal.url_draft = Some(text.clone());
+                    state.portal.url_error = Some(reason);
+                }
+            }
+        }
+        ui.add_space(theme::space::XXS);
+        match state.portal.url_error.clone() {
+            Some(reason) => reason_line(ui, &reason),
+            None => help_line(ui, "Leave the address empty to switch Portal off."),
+        }
+    });
+}
+
+/// "Access token": a password field, "Save" and "Forget".
+///
+/// The field is emptied by the shell once the token is stored, so nothing on
+/// screen ever holds the token: what is drawn is the mask egui puts over
+/// whatever is being typed.
+fn portal_token_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let stored = state.portal.status.signed_in;
+    let typed = !state.portal.token_draft.trim().is_empty();
+    line(ui, |ui| {
+        let label = field_label(ui, "Access token");
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            // Right to left, so "Save" sits on the card's edge and the field
+            // takes what is left, exactly as the Client ID row does.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let save = ui
+                    .add_enabled(
+                        typed,
+                        egui::Button::new(RichText::new("Save").font(theme::body()))
+                            .min_size(vec2(0.0, theme::size::CONTROL_H)),
+                    )
+                    .clicked();
+                let forget = ui
+                    .add_enabled(
+                        stored,
+                        egui::Button::new(RichText::new("Forget").font(theme::body()))
+                            .min_size(vec2(0.0, theme::size::CONTROL_H)),
+                    )
+                    .clicked();
+                let field_width = (ui.available_width() - 2.0 * theme::space::L).max(60.0);
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+                    ui.add(
+                        TextEdit::singleline(&mut state.portal.token_draft)
+                            .password(true)
+                            .hint_text(if stored { TOKEN_STORED } else { TOKEN_MISSING })
+                            .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                            .desired_width(field_width),
+                    )
+                    .labelled_by(label.id);
+                });
+                if save {
+                    let token = state.portal.token_draft.trim().to_string();
+                    if !token.is_empty() {
+                        *action = Some(Action::SavePortalToken(Secret::new(token)));
+                    }
+                }
+                if forget {
+                    *action = Some(Action::ForgetPortalToken);
+                }
+            });
+        });
+        ui.add_space(theme::space::XXS);
+        if stored {
+            help_line(ui, "A token is stored in your keychain, never in settings.json.");
+        } else {
+            help_line(ui, "No token is stored yet. Paste one and press Save.");
+        }
+    });
+}
+
+/// "Local folder": the folder the marker names go under, with the absolute path
+/// it resolves to beneath it.
+fn portal_root_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let mut text = state.portal.root_draft.clone().unwrap_or_else(|| state.settings.portal_root.clone());
+    let home = state.home.clone();
+    line(ui, |ui| {
+        let label = field_label(ui, "Local folder");
+        ui.add_space(theme::space::M);
+        let response = portal_field(ui, &mut text, PORTAL_ROOT_HINT).labelled_by(label.id);
+        if response.changed() {
+            state.portal.root_draft = Some(text.clone());
+            state.portal.root_error = None;
+        }
+        if response.lost_focus() {
+            match portal_root_reason(&text) {
+                None => {
+                    let root = text.trim().to_string();
+                    state.settings.portal_root = root.clone();
+                    state.portal.root_draft = None;
+                    state.portal.root_error = None;
+                    *action = Some(Action::SetPortalRoot(root));
+                }
+                Some(reason) => {
+                    state.portal.root_draft = Some(text.clone());
+                    state.portal.root_error = Some(reason);
+                }
+            }
+        }
+        ui.add_space(theme::space::XXS);
+        match state.portal.root_error.clone() {
+            Some(reason) => reason_line(ui, &reason),
+            None => {
+                // The resolved path, so nobody has to guess where the folders go.
+                let resolved = resolved_portal_root(
+                    state.portal.root_draft.as_deref().unwrap_or(&state.settings.portal_root),
+                    &home,
+                );
+                help_line(ui, &format!("Folders are created under {resolved}"));
+            }
+        }
+    });
+}
+
+/// "Enabled": the label on the left, the box on the right, and what the state
+/// means underneath — off is a promise that nothing is contacted.
+fn portal_enabled_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let mut enabled = state.settings.portal_enabled;
+    let every = state.settings.portal_every_secs;
+    line_with(ui, CHECK_ROW_CONTROL, |ui| {
+        ui.horizontal(|ui| {
+            let label = field_label(ui, "Enabled");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().interact_size.y = CHECK_ROW_CONTROL;
+                let boxed = ui.add(Checkbox::without_text(&mut enabled)).labelled_by(label.id);
+                if boxed.changed() {
+                    *action = Some(Action::SetPortalEnabled(enabled));
+                }
+            });
+        });
+        ui.add_space(theme::space::XXS);
+        if enabled {
+            let every = if every >= 5 { every } else { 30 };
+            help_line(ui, &format!("Checked every {every} s in the background."));
+        } else {
+            help_line(ui, "Nothing is contacted while this is off.");
+        }
+    });
+    state.settings.portal_enabled = enabled;
+}
+
+/// The status line: the last reconcile, at a glance.
+fn portal_status_line(ui: &mut egui::Ui, state: &mut UiState) {
+    let words = portal_line(&state.portal.status);
+    line(ui, |ui| {
+        field_label(ui, "Status");
+        ui.add_space(theme::space::XXS);
+        let colour = if words.failed { theme::ERROR_TEXT } else { theme::TEXT_2 };
+        ui.add(theme::wrapping(
+            RichText::new(&words.text)
+                .font(theme::body())
+                .line_height(Some(HELP_LINE))
+                .color(colour),
+        ))
+        .on_hover_text(&words.text);
+    });
+}
+
+/// "Reconcile now": the button, and why it cannot be pressed when it cannot.
+fn portal_reconcile_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    let status = &state.portal.status;
+    let ready = status.configured();
+    let reason = if status.url.trim().is_empty() {
+        "Add the Portal address first."
+    } else if !status.signed_in {
+        "Add the access token first."
+    } else {
+        "Keeps one watch folder per live link, now."
+    };
+    line(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - 150.0).max(80.0));
+                ui.spacing_mut().interact_size.y = LABEL_LINE;
+                field_label(ui, "Reconcile");
+                ui.add_space(theme::space::XXS);
+                help_line(ui, reason);
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if secondary_button_enabled(ui, "Reconcile now", ready) {
+                    *action = Some(Action::ReconcileNow);
+                }
+            });
+        });
+    });
+}
+
 // ---------- the pieces of the layout ----------
 
 /// `.set-title`: 14 px, 600, `--text`.
@@ -885,7 +1353,7 @@ mod tests {
     use super::*;
     use crate::model::{Settings, UpdateState, User};
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT as _, Queryable};
 
     fn state(settings: Settings, logged_in: bool) -> UiState {
         UiState {
@@ -927,8 +1395,8 @@ mod tests {
 
     /// The toggle boxes in draw order, which is the order of the rows: "Open at
     /// login" and "Check for updates" (App), then "Save log with media"
-    /// (Storage). Each box's text label is drawn to its left, the way
-    /// `.set-line` puts a `label` beside a `.check` input.
+    /// (Storage), then Portal's "Enabled". Each box's text label is drawn to its
+    /// left, the way `.set-line` puts a `label` beside a `.check` input.
     fn toggle_boxes<'a>(harness: &'a Harness<'a, UiState>) -> Vec<egui_kittest::Node<'a>> {
         harness
             .get_all_by_role(egui::accesskit::Role::CheckBox)
@@ -946,7 +1414,9 @@ mod tests {
         harness.get_by_label("Not set up");
         harness.get_by_label("Sign in with Adobe");
         harness.get_by_label("Adobe Client ID");
-        harness.get_by_label("Save");
+        // Two "Save" buttons now (the Client ID's and the Portal token's): the
+        // first is this row's.
+        harness.get_all_by_label("Save").next().expect("a Save button");
         harness.get_by_label("Setup");
         harness.get_by_label("Copy");
         harness.get_by_label("Parallel streams");
@@ -1128,7 +1598,7 @@ mod tests {
         assert!(!harness.state().open_at_login);
         assert!(!harness.state().settings.no_update_check);
         assert!(!harness.state().settings.no_folder_logs);
-        assert_eq!(toggle_boxes(&harness).len(), 3, "three toggle rows");
+        assert_eq!(toggle_boxes(&harness).len(), 4, "four toggle rows: the three above, and Portal's");
 
         // Open at login.
         {
@@ -1269,7 +1739,7 @@ mod tests {
         ui_state.settings.client_id = "  abc123  ".to_string();
         let mut harness = screen_harness(ui_state);
 
-        harness.get_by_label("Save").click();
+        harness.get_all_by_label("Save").next().expect("the Client ID's Save").click();
         harness.run();
 
         assert_eq!(harness.state().settings.client_id, "abc123");
@@ -1413,6 +1883,457 @@ mod tests {
             2,
             "both the folder and the log path are unset"
         );
+    }
+
+    // ---------- the Portal section ----------
+
+    /// The moment the Portal cases are drawn at, so "2 min ago" is a number and
+    /// not a race with the clock.
+    const NOW: i64 = 1_793_266_860_000;
+
+    /// The screen with a Portal that is set up: an address, a token in the
+    /// keychain, the default folder, the poller on, and a reconcile that ran two
+    /// minutes before `NOW` over two links.
+    fn portal_state() -> UiState {
+        let mut ui_state = state(configured(), true);
+        ui_state.settings.portal_url = "https://portal.example.com".to_string();
+        ui_state.settings.portal_root = "/Users/chaos/Live_Work".to_string();
+        ui_state.settings.portal_enabled = true;
+        ui_state.portal.status = PortalView {
+            enabled: true,
+            signed_in: true,
+            url: "https://portal.example.com".to_string(),
+            root: "/Users/chaos/Live_Work".to_string(),
+            running: false,
+            last_at: NOW - 120_000,
+            links_seen: 2,
+            ensured: 3,
+            removed: 1,
+            skipped: 0,
+            error: String::new(),
+            now_ms: NOW,
+        };
+        ui_state
+    }
+
+    /// The whole node tree's words: every label and every value kittest can
+    /// reach, which is everything the screen renders as text.
+    fn every_word(harness: &Harness<'_, UiState>) -> Vec<String> {
+        use egui_kittest::kittest::NodeT as _;
+        let mut words: Vec<String> = Vec::new();
+        for node in harness.root().children_recursive() {
+            let node = node.accesskit_node();
+            if let Some(label) = node.label() {
+                words.push(label);
+            }
+            if let Some(value) = node.value() {
+                words.push(value);
+            }
+        }
+        words
+    }
+
+    #[test]
+    fn the_portal_section_is_the_last_card_and_names_its_five_rows() {
+        let harness = screen_harness(portal_state());
+
+        harness.get_by_label("Portal");
+        harness.get_by_label("Server URL");
+        harness.get_by_label("Access token");
+        harness.get_by_label("Local folder");
+        harness.get_by_label("Enabled");
+        harness.get_by_label("Status");
+        harness.get_by_label("Reconcile");
+        harness.get_by_label("Reconcile now");
+        // The address and the folder are what the settings hold, and the folder
+        // says where the folders really go.
+        assert!(every_word(&harness).contains(&"https://portal.example.com".to_string()));
+        harness.get_by_label("Folders are created under /Users/chaos/Live_Work");
+    }
+
+    #[test]
+    fn the_portal_folder_shows_the_resolved_absolute_path() {
+        // A `~` in the setting is expanded the way `Settings::portal_root_path`
+        // expands it, so the row never shows a path nobody can check.
+        assert_eq!(resolved_portal_root("~/Live_Work", "/Users/chaos"), "/Users/chaos/Live_Work");
+        assert_eq!(resolved_portal_root("/Volumes/Raid/Live", "/Users/chaos"), "/Volumes/Raid/Live");
+        // Empty means the default, which is `~/Live_Work`.
+        assert_eq!(resolved_portal_root("", "/Users/chaos"), "/Users/chaos/Live_Work");
+        assert_eq!(resolved_portal_root("~", "/Users/chaos"), "/Users/chaos");
+        assert_eq!(resolved_portal_root("~ada/Live", "/Users/chaos"), "~ada/Live", "another user's home is taken as given");
+        assert_eq!(resolved_portal_root("/Users/chaos/", "/Users/chaos/"), "/Users/chaos/");
+
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_root = "~/Live_Work".to_string();
+        let harness = screen_harness(ui_state);
+        harness.get_by_label("Folders are created under /Users/chaos/Live_Work");
+    }
+
+    #[test]
+    fn a_bad_portal_url_is_refused_and_the_old_value_kept() {
+        let mut harness = screen_harness(portal_state());
+
+        // Type a scheme-less address over the one in the field, then commit it
+        // the way the field commits: Enter, which is also a lost focus.
+        harness.get_by_label("Server URL").focus();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.get_by_label("Server URL").type_text("portal.example.com");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        harness.get_by_label(PORTAL_URL_REASON);
+        assert_eq!(
+            harness.state().settings.portal_url,
+            "https://portal.example.com",
+            "a refused address is never the one in the settings"
+        );
+        assert!(
+            !harness.state().requests.contains(&Request::SetPortalUrl("portal.example.com".to_string())),
+            "nothing was asked for: {:?}",
+            harness.state().requests
+        );
+        assert!(
+            !harness.state().requests.iter().any(|r| matches!(r, Request::SetPortalUrl(_))),
+            "no Portal URL was written: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn a_good_portal_url_is_committed_and_asks_the_app() {
+        let mut harness = screen_harness(state(configured(), true));
+        assert!(harness.state().settings.portal_url.is_empty());
+
+        harness.get_by_label("Server URL").focus();
+        harness.run();
+        harness.get_by_label("Server URL").type_text("https://portal.example.com/");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::SetPortalUrl("https://portal.example.com".to_string())),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        assert_eq!(harness.state().settings.portal_url, "https://portal.example.com");
+        assert_eq!(harness.state().portal.url_draft, None, "the field shows the setting again");
+        assert!(harness.query_by_label(PORTAL_URL_REASON).is_none());
+    }
+
+    #[test]
+    fn the_portal_url_scheme_rule_is_the_apps_and_a_host_is_required() {
+        assert_eq!(portal_url_reason(""), None, "empty is how Portal is switched off");
+        assert_eq!(portal_url_reason("  https://portal.example.com  "), None);
+        assert_eq!(portal_url_reason("http://192.168.1.9:8080"), None);
+        for bad in ["portal.example.com", "ftp://portal.example.com", "file:///etc/passwd", "//portal.example.com"] {
+            assert_eq!(portal_url_reason(bad).as_deref(), Some(PORTAL_URL_REASON), "{bad}");
+        }
+        assert!(portal_url_reason("https://").is_some(), "a scheme with no host is not an address");
+        assert!(portal_url_reason("https:///").is_some());
+        assert!(portal_url_reason("https://portal example.com").is_some(), "a space is not an address");
+    }
+
+    #[test]
+    fn the_portal_folder_rule_keeps_the_disk_root_out() {
+        assert_eq!(portal_root_reason(""), None, "empty means the default");
+        assert_eq!(portal_root_reason("~/Live_Work"), None);
+        assert_eq!(portal_root_reason("/Volumes/Raid/Live_Work"), None);
+        assert!(portal_root_reason("/").is_some(), "the whole disk is not a mirror root");
+        assert!(portal_root_reason("Live_Work").is_some(), "a relative path is not a root");
+        assert!(portal_root_reason("/tmp/a\nb").is_some());
+    }
+
+    #[test]
+    fn the_portal_toggle_asks_the_app_for_what_it_wrote() {
+        let mut harness = screen_harness(state(configured(), true));
+        assert!(!harness.state().settings.portal_enabled);
+
+        // The four toggles in draw order: Open at login, Check for updates, Save
+        // log with media, and Portal's own.
+        let boxes = toggle_boxes(&harness);
+        assert_eq!(boxes.len(), 4, "the Portal section adds the fourth toggle");
+        if let Some(boxed) = boxes.get(3) {
+            boxed.click();
+        }
+        harness.run();
+
+        assert!(harness.state().settings.portal_enabled);
+        assert!(
+            harness.state().requests.contains(&Request::SetPortalEnabled(true)),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // And back off again.
+        harness.state_mut().requests.clear();
+        let boxes = toggle_boxes(&harness);
+        if let Some(boxed) = boxes.get(3) {
+            boxed.click();
+        }
+        harness.run();
+        assert!(!harness.state().settings.portal_enabled);
+        assert!(
+            harness.state().requests.contains(&Request::SetPortalEnabled(false)),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn nothing_is_contacted_while_portal_is_off() {
+        let harness = screen_harness(state(configured(), true));
+        harness.get_by_label("Nothing is contacted while this is off.");
+
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_enabled = true;
+        let harness = screen_harness(ui_state);
+        harness.get_by_label("Checked every 30 s in the background.");
+    }
+
+    #[test]
+    fn reconcile_now_waits_for_an_address_and_a_token() {
+        // Neither: the button is there, dead, and says which one is missing.
+        let harness = screen_harness(state(configured(), true));
+        let button = harness.get_by_label("Reconcile now");
+        assert!(button.accesskit_node().is_disabled(), "no address and no token");
+        harness.get_by_label("Add the Portal address first.");
+
+        // An address but no token: the token is what is missing.
+        let mut ui_state = state(configured(), true);
+        ui_state.settings.portal_url = "https://portal.example.com".to_string();
+        ui_state.portal.status.url = "https://portal.example.com".to_string();
+        let harness = screen_harness(ui_state);
+        assert!(harness.get_by_label("Reconcile now").accesskit_node().is_disabled());
+        harness.get_by_label("Add the access token first.");
+
+        // Both: the button is live.
+        let harness = screen_harness(portal_state());
+        let button = harness.get_by_label("Reconcile now");
+        assert!(!button.accesskit_node().is_disabled(), "an address and a token are both set");
+    }
+
+    #[test]
+    fn reconcile_now_asks_the_app() {
+        let mut harness = screen_harness(portal_state());
+        harness.get_by_label("Reconcile now").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::PortalReconcile),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_status_line_reads_a_finished_reconcile_as_its_numbers() {
+        let words = portal_line(&portal_state().portal.status);
+        assert_eq!(words.text, "2 min ago · 2 links, 3 folders kept in step, 1 removed");
+        assert!(!words.failed);
+
+        let harness = screen_harness(portal_state());
+        harness.get_by_label("2 min ago · 2 links, 3 folders kept in step, 1 removed");
+    }
+
+    #[test]
+    fn the_status_line_reads_a_failure_as_a_failure() {
+        let mut ui_state = portal_state();
+        ui_state.portal.status.error = "can't reach Portal: connection refused".to_string();
+        // A failed report has no numbers, and the line must not invent any.
+        ui_state.portal.status.links_seen = 0;
+        ui_state.portal.status.ensured = 0;
+        ui_state.portal.status.removed = 0;
+        let words = portal_line(&ui_state.portal.status);
+        assert!(words.failed, "a failed reconcile is drawn as bad news");
+        assert_eq!(words.text, "Failed 2 min ago: can't reach Portal: connection refused");
+        assert!(!words.text.contains("links"), "a failed run claims no folders: {}", words.text);
+
+        let harness = screen_harness(ui_state);
+        harness.get_by_label("Failed 2 min ago: can't reach Portal: connection refused");
+        assert!(
+            harness.query_by_label("2 min ago · 2 links, 3 folders kept in step, 1 removed").is_none(),
+            "the old numbers are gone"
+        );
+    }
+
+    #[test]
+    fn the_status_line_says_what_is_missing_before_it_says_anything_else() {
+        let mut status = PortalView::default();
+        // Nothing at all: not set up, and it is not an error.
+        let words = portal_line(&status);
+        assert_eq!(words.text, "Not set up: no Portal address and no token yet.");
+        assert!(!words.failed);
+
+        // A token but no address, and the other way round: each names what is
+        // missing, and both are reasons nothing can be reconciled.
+        status.signed_in = true;
+        assert_eq!(portal_line(&status).text, "No Portal address yet: add one above.");
+        assert!(portal_line(&status).failed);
+
+        status.signed_in = false;
+        status.url = "https://portal.example.com".to_string();
+        assert_eq!(portal_line(&status).text, "No access token yet: paste one above and press Save.");
+        assert!(portal_line(&status).failed);
+
+        // Configured, and never run: no numbers to claim yet.
+        status.signed_in = true;
+        let words = portal_line(&status);
+        assert_eq!(words.text, "Configured. Portal has not been checked yet.");
+        assert!(!words.failed);
+
+        // A reconcile in flight says so.
+        status.running = true;
+        assert_eq!(portal_line(&status).text, "Reconciling…");
+
+        // One link, one folder, nothing removed: singular words, and skipped
+        // links named when there are any.
+        let done = PortalView {
+            running: false,
+            last_at: NOW - 1000,
+            links_seen: 1,
+            ensured: 1,
+            removed: 0,
+            skipped: 2,
+            now_ms: NOW,
+            ..status
+        };
+        assert_eq!(
+            portal_line(&done).text,
+            "just now · 1 link, 1 folder kept in step, 0 removed, 2 skipped"
+        );
+    }
+
+    #[test]
+    fn the_relative_time_is_readable_at_a_glance() {
+        assert_eq!(portal_when(0, NOW), "never");
+        assert_eq!(portal_when(NOW - 900, NOW), "just now");
+        assert_eq!(portal_when(NOW - 30_000, NOW), "under a minute ago");
+        assert_eq!(portal_when(NOW - 60_000, NOW), "1 min ago");
+        assert_eq!(portal_when(NOW - 120_000, NOW), "2 min ago");
+        assert_eq!(portal_when(NOW - 3_600_000, NOW), "1 h ago");
+        assert_eq!(portal_when(NOW - 5 * 3_600_000, NOW), "5 h ago");
+        assert_eq!(portal_when(NOW - 86_400_000, NOW), "1 day ago");
+        assert_eq!(portal_when(NOW - 3 * 86_400_000, NOW), "3 days ago");
+        assert_eq!(portal_when(NOW + 60_000, NOW), "just now", "a clock that went backwards is not a negative age");
+    }
+
+    #[test]
+    fn the_token_is_never_rendered_and_never_a_setting() {
+        let mut harness = screen_harness(portal_state());
+        let token = "sekret-token-9f2c1a";
+
+        // Type it into the field: what is drawn is the mask, not the token.
+        harness.get_by_label("Access token").focus();
+        harness.run();
+        harness.get_by_label("Access token").type_text(token);
+        harness.run();
+
+        for word in every_word(&harness) {
+            assert!(!word.contains(token), "a rendered label carries the token: {word:?}");
+        }
+
+        // Saving it asks for the keychain, and the token is nowhere in the
+        // settings that get written to settings.json.
+        harness.get_all_by_label("Save").last().expect("the token's Save").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::SetPortalToken(Secret::new(token))),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        let saved = serde_json::to_string(&harness.state().settings).expect("the settings serialise");
+        assert!(!saved.contains(token), "the token reached the settings: {saved}");
+        // ... and it is not in the request's own Debug either, so a failure
+        // message cannot print it.
+        let printed = format!("{:?}", harness.state().requests);
+        assert!(!printed.contains(token), "a request printed the token: {printed}");
+    }
+
+    #[test]
+    fn forget_asks_the_app_and_save_does_nothing_with_an_empty_field() {
+        let mut harness = screen_harness(portal_state());
+        harness.get_by_label("Forget").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::ForgetPortalToken),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // No token typed: Save is dead, so an empty field cannot overwrite the
+        // token that is already stored.
+        harness.state_mut().requests.clear();
+        let save = harness.get_all_by_label("Save").last().expect("the token's Save");
+        assert!(save.accesskit_node().is_disabled(), "nothing typed, nothing to save");
+        save.click();
+        harness.run();
+        assert!(
+            !harness.state().requests.iter().any(|r| matches!(r, Request::SetPortalToken(_))),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn a_stored_token_says_so_and_an_empty_slot_says_not_set() {
+        // The placeholder is the field's hint: "stored in your keychain" when one
+        // is set, "not set" when not. Neither is ever the token.
+        assert_eq!(TOKEN_STORED, "stored in your keychain");
+        assert_eq!(TOKEN_MISSING, "not set");
+        // `hint_text` is painted, not an accesskit node, so the row says it in
+        // its help line too, which is what a screen reader and these tests read.
+        let harness = screen_harness(portal_state());
+        harness.get_by_label("A token is stored in your keychain, never in settings.json.");
+
+        let harness = screen_harness(state(configured(), true));
+        harness.get_by_label("No token is stored yet. Paste one and press Save.");
+    }
+
+    /// The Portal card is drawn by the same pieces as the cards above it: the
+    /// labels start on the card's own left padding, the fields are the same
+    /// height, and no new colour or font is named. This is the check that the
+    /// section did not drift from the visual language.
+    #[test]
+    fn the_portal_card_is_laid_out_like_the_cards_above_it() {
+        let harness = screen_harness(portal_state());
+
+        let title = harness.get_by_label("Portal").rect();
+        let above = harness.get_by_label("Storage").rect();
+        assert!((title.left() - above.left()).abs() < 0.5, "the section title sits where the others do");
+
+        let url_label = harness.get_by_label("Server URL").rect();
+        let client_label = harness.get_by_label("Adobe Client ID").rect();
+        assert!((url_label.left() - client_label.left()).abs() < 0.5, "the same card padding");
+
+        // Fields: the Portal address, the folder and the token are the height of
+        // the Client ID field (`.input`, 32 px), not a new one.
+        let fields: Vec<f32> = harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .map(|node| node.rect().height())
+            .collect();
+        assert!(fields.len() >= 3, "the Client ID field and the two Portal ones: {}", fields.len());
+        let client = fields[0];
+        assert!(client > 0.0);
+        for height in &fields[1..] {
+            assert!((height - client).abs() < 1.0, "a field is {height} px, the Client ID's is {client}");
+        }
+        let token = harness.get_by_role(egui::accesskit::Role::PasswordInput).rect();
+        assert!((token.height() - client).abs() < 1.0, "the token field is {token:?}");
+    }
+
+
+    #[test]
+    fn the_portal_section_draws_with_populated_status() {
+        let mut harness = screen_harness(portal_state());
+        harness.snapshot("settings_portal");
     }
 
     #[test]
