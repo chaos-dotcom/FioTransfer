@@ -33,6 +33,12 @@ colour and no glyph.
 `chrome.png` (1180 x 780, in `egui-ui/tests/snapshots/`) is the picture: rows 0
 to 31 are the band, row 31 is the rule, row 32 is `--base` `(0, 0, 0)`.
 
+*The rule and the band were both wrong; the next branch removed them —
+`docs/reports/window-corners.md`. The strip now paints `--panel` over the
+sidebar's column and `--base` over the page's, with no rule, so there is no line
+and no step between the strip and the window below it, and `chrome.png` no longer
+reads this way.*
+
 ## What each gesture asks for
 
 The decision is a pure function; drawing and sending are separate, so the tests

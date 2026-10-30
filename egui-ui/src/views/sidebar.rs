@@ -31,7 +31,7 @@
 use crate::model::{Request, UiState, View, fmt_speed};
 use crate::theme;
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2,
+    Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2,
     emath::GuiRounding as _,
 };
 
@@ -252,7 +252,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
     let painter = ui.painter().with_clip_rect(clip);
 
     // `.sidebar { background: var(--panel); border-right: 1px solid var(--border) }`
-    painter.rect_filled(rect, CornerRadius::ZERO, theme::PANEL);
+    //
+    // The panel reaches the window's bottom-left corner, so it rounds it: the
+    // window is undecorated and transparent and the app paints its own shape
+    // (`chrome::WINDOW_RADIUS_PX`). Nowhere else does the sidebar meet a window
+    // corner — the strip's own fill carries the top-left one.
+    painter.rect_filled(rect, crate::chrome::CORNER_SW, theme::PANEL);
     painter.line_segment(
         [
             pos2(rect.right() - BORDER_W * 0.5, rect.top()),

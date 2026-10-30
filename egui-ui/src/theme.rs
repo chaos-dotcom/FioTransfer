@@ -607,9 +607,15 @@ pub fn sidebar_frame() -> Frame {
         .inner_margin(margin(space::SIDEBAR_X as i8, space::SIDEBAR_X as i8, 0, space::SIDEBAR_X as i8))
 }
 
-/// `.main` / `.view`: `--base`, `padding: 0 28px 32px`.
+/// `.main` / `.view`: `padding: 0 28px 32px`, and no fill of its own — the
+/// central panel paints the page.
 pub fn main_frame() -> Frame {
-    Frame::new().fill(BASE).inner_margin(margin(
+    // No fill, though `.view` has one in the stylesheet: `--base` is the same
+    // colour the central panel paints, the page is painted once by the panel
+    // that owns the window's bottom-right corner, and a second fill here would
+    // be a rect that follows the *content* — one that hangs past the window
+    // whenever a screen is taller than the window, squaring that corner off.
+    Frame::NONE.inner_margin(margin(
         space::PAGE_X as i8,
         space::PAGE_X as i8,
         0,

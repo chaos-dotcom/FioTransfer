@@ -40,7 +40,16 @@ fn main() -> eframe::Result<()> {
             // The title stays: the taskbar, the dock and Mission Control still
             // need something to call the window. `WINDOW_WIDTH` x
             // `WINDOW_HEIGHT` is still the whole window, strip included.
-            .with_decorations(false),
+            .with_decorations(false)
+            // An undecorated window is a square rectangle: the platform no
+            // longer rounds its corners. So the app rounds them itself, and for
+            // that the four pixels outside each corner have to be *unpainted*
+            // rather than black — hence a transparent window. `chrome.rs` draws
+            // the shape (`WINDOW_RADIUS_PX`), `app.rs` clears to nothing, and
+            // the window server composites what is left. On macOS the shadow is
+            // kept: AppKit derives it from the window's own alpha, so it follows
+            // the rounded shape instead of the rectangle.
+            .with_transparent(true),
         ..Default::default()
     };
     eframe::run_native(

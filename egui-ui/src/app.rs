@@ -176,10 +176,20 @@ impl FioApp {
 
     /// The central panel: `--base`, the `.view` padding inside the scroll
     /// container, and whatever screen the sidebar selected.
+    ///
+    /// The page's fill is painted here, over the panel's rect, rather than by the
+    /// frame: a `Frame`'s rect follows its contents, so a screen taller than the
+    /// window pushed the frame's bottom-right corner below the window and the
+    /// window's own corner came back square. The panel's rect is the window's
+    /// rect, whatever the screen's length, so it is the one that carries the
+    /// window's bottom-right corner (`chrome::CORNER_SE`, the app's own rounded
+    /// shape). The top-right one belongs to the strip's own fill.
     fn screen(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(theme::BASE))
+            .frame(Frame::NONE)
             .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(ui.max_rect(), crate::chrome::CORNER_SE, theme::BASE);
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
@@ -221,8 +231,14 @@ impl eframe::App for FioApp {
 
     /// `body { background: var(--base) }`: the clear colour is the window's, so
     /// a resize or a slow frame never shows grey behind the panels.
+    ///
+    /// Transparent, not `--base`: the window is undecorated and transparent, and
+    /// the four pixels outside the rounded corners must stay unpainted for the
+    /// corner to be a corner (see `chrome`'s note on the window shape). The
+    /// panels paint `--base` themselves, so nothing else about the window
+    /// changes.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::BASE.to_normalized_gamma_f32()
+        [0.0, 0.0, 0.0, 0.0]
     }
 }
 
