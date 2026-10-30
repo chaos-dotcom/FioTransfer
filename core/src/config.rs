@@ -70,6 +70,14 @@ pub struct Settings {
     /// is never a setting, and the session cookie goes to the Keychain.
     #[serde(default)]
     pub portal_email: String,
+    /// This machine's own id in Portal's list of connected clients: a uuid v4,
+    /// made on the first heartbeat and kept, so a restart is the same client
+    /// rather than a new row. Not a secret — it names the machine, not a
+    /// person — and nothing else uses it. Empty until the first heartbeat, and
+    /// `#[serde(default)]` so a settings file from before heartbeats still
+    /// loads with every other setting intact.
+    #[serde(default)]
+    pub portal_client_id: String,
 }
 
 /// Default for `Settings::portal_root`: ~/Live_Work.
@@ -102,6 +110,7 @@ impl Default for Settings {
             portal_on_change: PORTAL_ON_CHANGE.to_string(),
             portal_every_secs: PORTAL_EVERY_SECS,
             portal_email: String::new(),
+            portal_client_id: String::new(),
         }
     }
 }
@@ -183,6 +192,9 @@ impl Settings {
         // An email address is not a secret, but a password is never written
         // here at all: this field is trimmed and nothing else.
         self.portal_email = self.portal_email.trim().to_string();
+        // Ids are compared as strings by Portal, so a stray space would make
+        // this machine two clients; trim it here, once, on the way in.
+        self.portal_client_id = self.portal_client_id.trim().to_string();
     }
 }
 

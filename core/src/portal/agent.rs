@@ -692,8 +692,22 @@ fn mapping(
 /// It reads the settings each time round, so a changed interval or a portal that
 /// was switched off takes effect within one interval. One reconcile at a time is
 /// `App::portal_reconcile`'s job, not this loop's.
+///
+/// Its first act is one heartbeat shortly after startup
+/// ([`crate::portal::heartbeat::STARTUP_DELAY`]): a freshly launched app shows in
+/// Portal's connected clients before the first interval is up. That is its own
+/// task, so a slow POST cannot delay the first reconcile, and it says nothing
+/// when Portal is off. Every tick after it sends one too, through the reconcile
+/// it runs — see `App::portal_reconcile`.
 pub fn spawn(app: Arc<App>) {
     tokio::spawn(async move {
+        {
+            let early = Arc::clone(&app);
+            tokio::spawn(async move {
+                tokio::time::sleep(crate::portal::heartbeat::STARTUP_DELAY).await;
+                let _ = crate::portal::heartbeat::send(&early, "startup").await;
+            });
+        }
         loop {
             tokio::time::sleep(app.settings().portal_interval()).await;
             let s = app.settings();
