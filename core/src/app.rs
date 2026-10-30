@@ -1180,6 +1180,15 @@ impl App {
         Ok(self.portal_status())
     }
 
+    /// Forgets the stored bearer token, and the cached "a token is stored" flag
+    /// with it, so the Settings screen's status line says so at once instead of
+    /// after the next reconcile.
+    pub fn forget_portal_token(&self) -> portal::agent::PortalStatus {
+        portal::clear_token();
+        self.portal_signed_in.store(portal::signed_in(), Ordering::Relaxed);
+        self.portal_status()
+    }
+
     // ---------- Shutdown ----------
 
     pub fn shutdown(&self) {
