@@ -127,11 +127,26 @@ pub fn pre_exec_detach(cmd: &mut std::process::Command) {
 #[cfg(not(unix))]
 pub fn pre_exec_detach(_cmd: &mut std::process::Command) {}
 
+/// One lock around `strerror`: for a code it does not know, the C library
+/// formats the message into a single process-wide static buffer, so two threads
+/// reading two different codes see each other's text unless the call and the
+/// copy both happen under this lock.
+#[cfg(unix)]
+static STRERROR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The `strerror` text for an OS error code, which is what Go printed. Empty
 /// when `strerror` has nothing to say.
+///
+/// Thread-safe: `strerror` is not, for a code it does not know (see
+/// [`STRERROR_LOCK`]), so the call and the copy are made under the lock.
+/// `strerror_r` is not the portable answer here — Darwin's XSI variant answers
+/// non-zero for an unknown code, so `-1` and `1000` would lose their
+/// "Unknown error: N" text.
 #[cfg(unix)]
 pub fn strerror_text(code: i32) -> String {
-    // SAFETY: strerror returns a static string for any int.
+    let _guard = STRERROR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: strerror returns a static string for any int, and the copy below
+    // is made while the lock that protects that buffer is held.
     let p = unsafe { libc::strerror(code) };
     if p.is_null() {
         return String::new();
