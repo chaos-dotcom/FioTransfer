@@ -94,6 +94,7 @@ impl Options {
 fn view_from_param(value: &str) -> Option<View> {
     match value.to_ascii_lowercase().as_str() {
         "transfers" => Some(View::Transfers),
+        "space" => Some(View::Space),
         "watch" => Some(View::Watch),
         "history" => Some(View::History),
         "settings" => Some(View::Settings),

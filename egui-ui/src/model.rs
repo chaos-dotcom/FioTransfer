@@ -11,7 +11,7 @@
 //! shapes from [`crate::model_browser`] instead. The re-export below is the whole
 //! of the difference; everything else in this file is one file for both targets.
 //!
-//! What stays here is what only a screen has an opinion about: which of the four
+//! What stays here is what only a screen has an opinion about: which of the five
 //! screens is showing, the toast stack, the composer's text, and [`Request`] —
 //! what a screen asks the app to do.
 
@@ -33,13 +33,14 @@ pub use fiotransfer_core::xfer::{FileView, JobView, Snapshot, Status};
 #[cfg(target_arch = "wasm32")]
 pub use crate::model_browser::*;
 
-/// Which of the four screens is showing.
+/// Which of the five screens is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum View {
     #[default]
     Transfers,
     Watch,
     History,
+    Space,
     Settings,
 }
 
@@ -49,10 +50,19 @@ impl View {
             View::Transfers => "Transfers",
             View::Watch => "Watch Folders",
             View::History => "History",
+            View::Space => "Space",
             View::Settings => "Settings",
         }
     }
-    pub const ALL: [View; 4] = [View::Transfers, View::Watch, View::History, View::Settings];
+    /// `View::ALL` is the sidebar's order, which is `index.html`'s: Space sits
+    /// between History and Settings.
+    pub const ALL: [View; 5] = [
+        View::Transfers,
+        View::Watch,
+        View::History,
+        View::Space,
+        View::Settings,
+    ];
 }
 
 // ---------- what a screen asks for ----------
@@ -120,6 +130,12 @@ pub enum Request {
     RemoveWatch(String),
     RequeueCanceled(String),
 
+    /// Walk every account, workspace and project again (`RefreshSpace`).
+    RefreshSpace,
+    /// Delete one project on Frame.io (`DeleteProject(account, project)`).
+    /// `name` is for the toast; the two ids are what the call takes.
+    DeleteProject { account_id: String, project_id: String, name: String },
+
     /// Read everything again (the first frame, and after an event).
     Refresh,
     /// The user closed the window (the shell asks before quitting).
@@ -137,6 +153,14 @@ pub struct UiState {
     pub snapshot: Snapshot,
     pub history: Vec<HistoryRow>,
     pub watches: Vec<WatchRow>,
+    /// What the last Frame.io storage reading found, one row per project.
+    pub space: Vec<SpaceRow>,
+    /// One row per account: how much it uses against its limit, for the Space
+    /// screen's headline. Empty until `Space` has answered.
+    pub space_accounts: Vec<SpaceAccount>,
+    /// True while `RefreshSpace` is walking: the Space screen says so instead of
+    /// pretending the figures are current.
+    pub space_walking: bool,
     pub toasts: Vec<Toast>,
     /// Frame.io destination the composer will upload to.
     pub destination: String,
@@ -248,6 +272,110 @@ impl UpdateState {
     }
 }
 
+/// One project's footprint on Frame.io, as `App::Space` reports it.
+///
+/// The field names are the payload's, minus `root_folder_id` and
+/// `workspace_id`: the screen never names a folder, only the project it would
+/// delete. `bytes` is what Frame.io reported for the project, or what the walk
+/// added up when it reported nothing; `walked` says which, and `files` is only
+/// counted by a walk (0 means "not counted", drawn as a dash). `error` is set
+/// when a walk could not finish (permissions, a folder deleted mid-walk).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SpaceRow {
+    pub account_id: String,
+    pub account_name: String,
+    pub workspace_name: String,
+    pub project_id: String,
+    pub name: String,
+    pub bytes: i64,
+    pub files: i64,
+    /// True when `bytes` came from walking the project's folders, false when
+    /// Frame.io reported it. The row says which.
+    pub walked: bool,
+    pub error: String,
+}
+
+/// One account's storage, as `Account.storage_limit` and `Account.storage_usage`
+/// report it. `limit: None` is Frame.io's `null`, which means "no limit".
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SpaceAccount {
+    pub account_id: String,
+    pub name: String,
+    pub limit: Option<i64>,
+    pub used: Option<i64>,
+}
+
+/// The `Space` payload: the project rows to chart and the per-account headline
+/// above them. `App::Space` answers this object, not a bare list of projects.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SpacePayload {
+    pub projects: Vec<SpaceRow>,
+    pub accounts: Vec<SpaceAccount>,
+}
+
+impl SpaceRow {
+    /// This project's part of `total`, 0.0–1.0. A total of zero is no share
+    /// rather than a divide by zero.
+    pub fn share(&self, total: i64) -> f32 {
+        if total <= 0 || self.bytes <= 0 {
+            0.0
+        } else {
+            (self.bytes as f64 / total as f64) as f32
+        }
+    }
+
+    /// True when the last walk could not finish, so the figures are not whole.
+    pub fn incomplete(&self) -> bool {
+        !self.error.trim().is_empty()
+    }
+}
+
+/// The core's `SpaceProject`, as this screen wants it: the two fields the screen
+/// never names (`workspace_id`, `root_folder_id`) are dropped.
+///
+/// Native only: the browser capture is given its rows by `src/fixture.rs`.
+#[cfg(not(target_arch = "wasm32"))]
+impl From<fiotransfer_core::app::SpaceProject> for SpaceRow {
+    fn from(p: fiotransfer_core::app::SpaceProject) -> SpaceRow {
+        SpaceRow {
+            account_id: p.account_id,
+            account_name: p.account_name,
+            workspace_name: p.workspace_name,
+            project_id: p.project_id,
+            name: p.name,
+            bytes: p.bytes,
+            files: p.files,
+            walked: p.walked,
+            error: p.error,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<fiotransfer_core::app::SpaceAccount> for SpaceAccount {
+    fn from(a: fiotransfer_core::app::SpaceAccount) -> SpaceAccount {
+        SpaceAccount {
+            account_id: a.account_id,
+            name: a.name,
+            limit: a.limit,
+            used: a.used,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<fiotransfer_core::app::SpacePayload> for SpacePayload {
+    fn from(p: fiotransfer_core::app::SpacePayload) -> SpacePayload {
+        SpacePayload {
+            projects: p.projects.into_iter().map(SpaceRow::from).collect(),
+            accounts: p.accounts.into_iter().map(SpaceAccount::from).collect(),
+        }
+    }
+}
+
 /// One row of the Watch Folders screen, from the app's `WatchView`.
 #[derive(Debug, Clone, Default)]
 pub struct WatchRow {
@@ -293,6 +421,14 @@ pub struct Toast {
 }
 
 impl UiState {
+    /// Take a `Space` payload: the rows the chart draws and the accounts the
+    /// headline names. Both lists are replaced together, so a refresh that
+    /// finds no projects does not leave last week's accounts on screen.
+    pub fn apply_space(&mut self, payload: SpacePayload) {
+        self.space = payload.projects;
+        self.space_accounts = payload.accounts;
+    }
+
     pub fn active_jobs(&self) -> usize {
         self.snapshot.jobs.iter().filter(|j| !j.terminal()).count()
     }
@@ -372,5 +508,111 @@ mod tests {
         assert_eq!(fmt_bytes(1_500_000), "1.50 MB");
         assert_eq!(fmt_dur(65.0), "1m 05s");
         assert_eq!(fmt_speed(0.0), "—");
+    }
+
+    #[test]
+    fn a_space_row_from_the_app_parses_and_knows_its_share() {
+        // The payload `App::Space` returns, with the two fields the screen does
+        // not need (`workspace_id`, `root_folder_id`) still in it.
+        let json = r#"{"account_id":"acct-1","account_name":"Farbhaus",
+            "workspace_id":"ws-1","workspace_name":"Shows","project_id":"proj-1",
+            "name":"Nightfall","root_folder_id":"root-1","bytes":750,"files":3,
+            "error":""}"#;
+        let row: SpaceRow = serde_json::from_str(json).expect("space row parses");
+        assert_eq!(row.account_name, "Farbhaus");
+        assert_eq!(row.workspace_name, "Shows");
+        assert_eq!(row.project_id, "proj-1");
+        assert_eq!(row.name, "Nightfall");
+        assert_eq!((row.bytes, row.files), (750, 3));
+        assert!(!row.incomplete());
+        assert_eq!(row.share(3000), 0.25);
+        // A zero total is no share, not a divide by zero.
+        assert_eq!(row.share(0), 0.0);
+        assert_eq!(SpaceRow { bytes: 0, ..row.clone() }.share(3000), 0.0);
+
+        let failed = SpaceRow {
+            error: "403 forbidden".into(),
+            ..row
+        };
+        assert!(failed.incomplete());
+    }
+
+    /// The `Space` payload is `{ projects, accounts }`, and the account figures
+    /// are nullable: `storage_limit: null` is "no limit", not a limit of 0.
+    #[test]
+    fn the_space_payload_parses_projects_and_accounts() {
+        let json = r#"{
+            "projects":[
+                {"account_id":"acct-1","project_id":"proj-1","name":"Nightfall",
+                 "bytes":750,"files":3,"walked":false,"error":""}
+            ],
+            "accounts":[
+                {"account_id":"acct-1","name":"Farbhaus","limit":2000,"used":750},
+                {"account_id":"acct-2","name":"Archive","limit":null,"used":640},
+                {"account_id":"acct-3","name":"Quiet","limit":500,"used":null}
+            ]
+        }"#;
+        let payload: SpacePayload = serde_json::from_str(json).expect("space payload parses");
+        assert_eq!(payload.projects.len(), 1);
+        assert_eq!(payload.projects[0].name, "Nightfall");
+        assert!(!payload.projects[0].walked, "a reported size was not walked");
+        assert_eq!(payload.accounts.len(), 3);
+        assert_eq!(payload.accounts[0].limit, Some(2000));
+        assert_eq!(payload.accounts[1].limit, None, "null is no limit");
+        assert_eq!(payload.accounts[1].used, Some(640));
+        assert_eq!(payload.accounts[2].used, None, "a null usage is not reported");
+
+        let mut state = UiState::default();
+        state.apply_space(payload.clone());
+        assert_eq!(state.space.len(), 1);
+        assert_eq!(state.space_accounts.len(), 3);
+
+        // A bare list is not this payload. serde reads a sequence into a struct
+        // as positional fields, so an empty one is the empty payload rather than
+        // an error — no rows, no accounts, nothing drawn.
+        let bare: SpacePayload = serde_json::from_str("[]").expect("an empty sequence parses");
+        assert!(bare.projects.is_empty() && bare.accounts.is_empty());
+        // Both lists may be absent, and then both are empty.
+        let empty: SpacePayload = serde_json::from_str("{}").expect("an empty payload parses");
+        assert!(empty.projects.is_empty() && empty.accounts.is_empty());
+    }
+
+    /// The core's own payload converts into the rows the screen draws, minus the
+    /// two fields the screen never names.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_cores_space_payload_becomes_the_screens_rows() {
+        let core = fiotransfer_core::app::SpacePayload {
+            projects: vec![fiotransfer_core::app::SpaceProject {
+                account_id: "acct-1".into(),
+                account_name: "Farbhaus".into(),
+                workspace_id: "ws-1".into(),
+                workspace_name: "Shows".into(),
+                project_id: "proj-1".into(),
+                name: "Nightfall".into(),
+                root_folder_id: "root-1".into(),
+                bytes: 750,
+                files: 3,
+                walked: true,
+                error: String::new(),
+            }],
+            accounts: vec![fiotransfer_core::app::SpaceAccount {
+                account_id: "acct-1".into(),
+                name: "Farbhaus".into(),
+                limit: None,
+                used: Some(750),
+            }],
+        };
+        let ours: SpacePayload = core.into();
+        assert_eq!(ours.projects.len(), 1);
+        assert_eq!(ours.projects[0].project_id, "proj-1");
+        assert_eq!(ours.projects[0].bytes, 750);
+        assert!(ours.projects[0].walked);
+        assert_eq!(ours.accounts[0].limit, None);
+        assert_eq!(ours.accounts[0].used, Some(750));
+        // The two dropped fields have no home on this side.
+        assert_eq!(ours.projects[0].workspace_name, "Shows");
+        assert_eq!(ours.projects[0].name, "Nightfall");
+        assert_eq!(ours.projects[0].files, 3);
     }
 }

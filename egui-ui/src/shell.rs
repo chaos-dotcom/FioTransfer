@@ -2,7 +2,7 @@
 //!
 //! `crate::app::FioApp` draws; this runs. It owns the tokio runtime, hands the
 //! app its [`Host`] (`crate::platform::DesktopHost`), drains the requests the
-//! four screens pushed (`model::Request`), calls the app and puts the answers
+//! five screens pushed (`model::Request`), calls the app and puts the answers
 //! back into [`UiState`]. Every call here is the same call the webview front end
 //! made through `window.go.main.App[...]` — `tests/contract/app.js` is the
 //! script it follows, and the wording of every toast is that script's.
@@ -10,8 +10,9 @@
 //! ## Who owns which field
 //!
 //! The app owns `logged_in`, `user`, `settings`, `snapshot`, `history`,
-//! `watches`, `destination`, `version`, `open_at_login`, `log_dir`, `home` and
-//! `update`: they are read back from it on every tick or event. The screen owns
+//! `watches`, `space`, `space_accounts`, `space_walking`, `destination`,
+//! `version`, `open_at_login`, `log_dir`, `home` and `update`: they are read
+//! back from it on every tick or event. The screen owns
 //! `view`, `link`, `passphrase`, `new_folder`, `download_dir`, `expanded`,
 //! `files`, `toasts` and `requests`: nothing here overwrites them from app state,
 //! because a keystroke is not something the engine knows about. (`files` is the
@@ -137,6 +138,10 @@ pub struct Shell {
     /// read.
     files_for: Option<String>,
     files_at: Option<Instant>,
+    /// A Space walk has been started (or one was already running) since this
+    /// window opened: the first visit starts the first walk, and only the first
+    /// (`openSpace` in the webview).
+    space_asked: bool,
     /// This machine's offset from UTC, and when it was asked.
     zone: i64,
     zone_at: Instant,
@@ -191,6 +196,7 @@ impl Shell {
             watch_folder: None,
             files_for: None,
             files_at: None,
+            space_asked: false,
             zone: platform::local_offset_secs(),
             zone_at: Instant::now(),
             focus: false,
@@ -245,6 +251,7 @@ impl Shell {
         if self.last_tick.elapsed() >= interval {
             self.tick(ui);
         }
+        self.drive_space(ui);
     }
 
     /// How long the window may wait before the next frame: the tick's interval,
@@ -520,6 +527,23 @@ impl Shell {
                 self.read_watches(ui);
             }
 
+            // ---- space ----
+            Request::RefreshSpace => self.refresh_space(),
+            Request::DeleteProject { account_id, project_id, name } => {
+                let (app, tx) = (self.app.clone(), self.tx.clone());
+                self.spawn_task(async move {
+                    // The webview's `deleteSpaceProject`: one call, its own two
+                    // toasts, and the row gone from the chart once it answered.
+                    match app.delete_project(&account_id, &project_id).await {
+                        Ok(()) => {
+                            toast(&tx, format!("Deleted {name} on Frame.io"), ToastKind::Ok);
+                            let _ = tx.send(Update::Done(Done::Changed));
+                        }
+                        Err(err) => toast(&tx, err, ToastKind::Err),
+                    }
+                });
+            }
+
             // ---- the window ----
             Request::Refresh => self.read_all(ui),
             Request::Quit => {
@@ -672,6 +696,16 @@ impl Shell {
         self.active = ui.snapshot.jobs.iter().any(|job| !job.terminal());
         self.read_watches(ui);
         self.read_files(ui);
+        self.read_space(ui);
+    }
+
+    /// `Space` and `SpaceWalking`: what the last reading found and whether a
+    /// walk is running. Both are cheap reads of the app's own cache, so this
+    /// runs on the tick with everything else — a walk that ends is picked up on
+    /// the next frame rather than by a channel of its own.
+    fn read_space(&mut self, ui: &mut UiState) {
+        ui.apply_space(self.app.space().into());
+        ui.space_walking = self.app.space_walking();
     }
 
     fn read_watches(&mut self, ui: &mut UiState) {
@@ -736,6 +770,41 @@ impl Shell {
             self.zone_at = Instant::now();
         }
         self.zone
+    }
+
+    // ---------- space ----------
+
+    /// `RefreshSpace`: the walk runs on the runtime, and the tick picks the
+    /// figures up when it ends — `space_walking` says it is running until then,
+    /// so the screen says "Walking Frame.io…" instead of implying the numbers
+    /// are current.
+    fn refresh_space(&mut self) {
+        self.space_asked = true;
+        let (app, tx) = (self.app.clone(), self.tx.clone());
+        self.spawn_task(async move {
+            app.refresh_space().await;
+            let _ = tx.send(Update::Done(Done::Changed));
+        });
+    }
+
+    /// The webview's `openSpace`: the first time the Space screen is shown, walk
+    /// Frame.io rather than making the user press Refresh to see anything.
+    ///
+    /// A walk already running (one started before this window opened) is adopted
+    /// instead of doubled, and nothing is started while signed out — the screen
+    /// offers Settings then, and asks again once the user is signed in.
+    fn drive_space(&mut self, ui: &mut UiState) {
+        if ui.view != View::Space || self.space_asked {
+            return;
+        }
+        if ui.space_walking {
+            self.space_asked = true;
+            return;
+        }
+        if !ui.space.is_empty() || !ui.logged_in {
+            return;
+        }
+        self.refresh_space();
     }
 
     // ---------- the app's own asks ----------

@@ -23,7 +23,7 @@
 //!     `--card` with a 7 px dot in the kind's accent.
 //!
 //! Colours, radii, type sizes and frames all come from [`crate::theme`], so this
-//! shell and the four screens cannot drift apart.
+//! shell and the five screens cannot drift apart.
 //!
 //! The page head (`h1` plus the screen's own buttons) belongs to the screen, the
 //! same as `index.html` puts `<header class="page-head">` inside each
@@ -226,6 +226,7 @@ impl eframe::App for FioApp {
 pub fn show_screen(ui: &mut egui::Ui, state: &mut UiState) {
     match state.view {
         View::Transfers => crate::views::transfers::show(ui, state),
+        View::Space => crate::views::space::show(ui, state),
         View::Watch => crate::views::watch::show(ui, state),
         View::History => crate::views::history::show(ui, state),
         View::Settings => crate::views::settings::show(ui, state),

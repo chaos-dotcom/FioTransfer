@@ -1,6 +1,6 @@
 //! FioTransfer's front end, rebuilt with egui.
 //!
-//! This is the app: the four screens and the shell around them, over
+//! This is the app: the five screens and the shell around them, over
 //! `fiotransfer-core`'s `App`. `model.rs` holds what a screen needs to draw and
 //! what a screen asks for; a view only draws and pushes
 //! [`model::Request`]s, and [`shell::Shell`] (native only) answers them by calling
