@@ -31,6 +31,26 @@ Settings → **Portal**:
 | **Local folder** | Where the project folders live. Default `~/Live_Work`. |
 | **Enabled** | Off by default: nothing is contacted until you turn it on. |
 
+### If the token is refused
+
+`PORTAL_API_TOKEN` is **optional in Portal itself**: `deploy.sh` writes a `.env` without it, and
+while it is unset every `/api` endpoint accepts only a browser session cookie — a bearer token
+cannot work, however correct it is. Even then Portal answers `401 Authentication required`, which
+looks identical to a wrong token.
+
+So if the status line says *"Portal refused the token"*, first make sure the deployment has one:
+
+```sh
+ssh you@your-portal-host
+cd /path/to/portal            # where deploy.sh and .env live
+grep -c '^PORTAL_API_TOKEN=' .env || echo 'PORTAL_API_TOKEN=…' >> .env
+./deploy.sh --update          # pulls, recreates; data and transfers survive
+```
+
+Generate the value with `openssl rand -base64 32 | tr '+/' '-_' | tr -d '='`. That same string goes
+into FioTransfer's **Access token** field. There is no admin screen that mints one: the bearer token
+is the single value in Portal's `.env`, on purpose.
+
 Then press **Reconcile now**. The status line tells you what happened:
 
     2 min ago · 2 links, 3 folders kept in step, 1 removed
