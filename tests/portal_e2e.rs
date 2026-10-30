@@ -105,6 +105,16 @@ impl Window {
     /// its `refresh_portal_credential`, which is what says the history store and
     /// the watcher are open too (see [`Window::wait_for_the_app`]).
     fn new(url: &str, token: &str) -> Window {
+        Window::build(url, Some(token))
+    }
+
+    /// The same window with **no** credential stored, so the card draws its
+    /// "Sign in instead" row — the path a person takes, as opposed to a token.
+    fn unsigned(url: &str) -> Window {
+        Window::build(url, None)
+    }
+
+    fn build(url: &str, token: Option<&str>) -> Window {
         let home = tempfile::tempdir().expect("a temporary HOME");
         std::env::set_var("HOME", home.path());
         std::env::set_var("FIO_NO_KEYCHAIN", "1");
@@ -121,7 +131,9 @@ impl Window {
             s.portal_enabled = false;
         })
         .expect("settings.json in the temporary HOME");
-        fiotransfer::portal::set_token(token).expect("the token is stored under the temporary HOME");
+        if let Some(t) = token {
+            fiotransfer::portal::set_token(t).expect("the token is stored under the temporary HOME");
+        }
 
         // The screen the window opens on, before any of the app has been read.
         let state = UiState { view: View::Settings, ..Default::default() };
@@ -534,4 +546,101 @@ fn the_card_reads_the_credential_without_the_user_touching_anything() {
         !button.accesskit_node().is_disabled(),
         "the card read the credential but Reconcile now is still disabled"
     );
+}
+
+/// The path a person takes: no token, no command line — type the admin's email and
+/// password into the card, press Sign in, and then press Reconcile now. It is the
+/// credential route `docs/PORTAL.md` recommends wherever the deployment has no
+/// `PORTAL_API_TOKEN`, and until this case existed it had only ever been driven
+/// through the core, never through the window.
+#[test]
+fn signing_in_on_the_card_creates_the_folders() {
+    let Some(url) = live_url() else { return };
+    let (email, password) = match (
+        std::env::var("PORTAL_LIVE_EMAIL"),
+        std::env::var("PORTAL_LIVE_PASSWORD"),
+    ) {
+        (Ok(e), Ok(p)) if !e.trim().is_empty() && !p.trim().is_empty() => (e, p),
+        _ => {
+            eprintln!("skipped: PORTAL_LIVE_EMAIL / PORTAL_LIVE_PASSWORD not set");
+            return;
+        }
+    };
+    let _g = one_at_a_time();
+    let mut w = Window::unsigned(&url);
+
+    // The card has to have read the app before the rows are there to type into.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let words = w.screen_words();
+        if words.iter().any(|s| s.contains("Sign in instead")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the card never drew its sign-in row: {:?}", words);
+        w.frame();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The masked fields are not in the accessibility tree (egui does not expose a
+    // password field's node as a text input), so the keystrokes into them are the
+    // view's own kittest cases' business. What is *not* covered anywhere else is the
+    // hop the button makes: the view pushes `Request::SignInPortal`, the shell
+    // answers it against the app, and the card re-reads. That is what this pushes.
+    {
+        let state = &mut w.harness.state_mut().state;
+        state.ask(fiotransfer_egui::model::Request::SignInPortal {
+            email: email.clone(),
+            password: fiotransfer_egui::model::Secret::new(password.clone()),
+        });
+    }
+    w.frame();
+
+    assert!(
+        w.screen_words().iter().any(|s| s == "Sign in"),
+        "the card drew no Sign in button at all"
+    );
+
+    // The app's own sign-in runs on the shell's runtime; wait for the card to say so.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let words = w.screen_words();
+        if words.iter().any(|s| s.starts_with("Signed in as ")) {
+            assert!(
+                words.iter().any(|s| s.contains(&email)),
+                "signed in, but not as the address that was typed: {:?}",
+                words
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the card never reported a session after Sign in: {:?}",
+            words
+        );
+        w.frame();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // And the password is nowhere on screen.
+    assert!(
+        !w.screen_words().iter().any(|s| s.contains(&password)),
+        "the password was rendered"
+    );
+
+    // Now the button, with a session instead of a token.
+    w.press_reconcile_now();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if w.watch_paths().iter().any(|p| p.ends_with("Farbhaus")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a session-authenticated reconcile created no watch: {:?}",
+            w.line().text
+        );
+        w.frame();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(farbhaus(&w.root).is_dir(), "the mirrored folder is not on disk");
 }
