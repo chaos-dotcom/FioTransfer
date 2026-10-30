@@ -1600,13 +1600,24 @@ mod tests {
             )
     }
 
-    /// The whole window at the size the app opens: [`crate::WINDOW_WIDTH`] by
-    /// [`crate::WINDOW_HEIGHT`], with the 224 px sidebar and the shell around the
-    /// screen. A picture of a screen is the app's own picture, so it is drawn the
-    /// size the app is drawn and nothing of it is cropped.
-    fn window_harness(state: UiState) -> Harness<'static, crate::FioApp> {
+    /// The height the Settings picture's window is drawn at.
+    ///
+    /// The screen is 1709.7 px tall at [`crate::WINDOW_WIDTH`]: the 64 px page
+    /// head, the four sections above Portal (the card's title sits 930.7 px
+    /// down), the Portal card to its "Reconcile now", the footer, and the 32 px
+    /// `.view` bottom padding. The window the app opens (780) holds less than
+    /// half of that, so the picture is drawn in a window tall enough for the whole
+    /// screen rather than scrolled to show one card — that keeps the sidebar and
+    /// the page head in the same frame as the Portal card.
+    const SETTINGS_PICTURE_HEIGHT: f32 = 1720.0;
+
+    /// The window a picture of a screen is drawn in: [`crate::WINDOW_WIDTH`] by
+    /// `height`, with the 224 px sidebar and the shell around the screen. A
+    /// picture of a screen is the app's own picture, so it is drawn the size the
+    /// app draws and nothing of it is cropped.
+    fn window_harness(height: f32, state: UiState) -> Harness<'static, crate::FioApp> {
         Harness::builder()
-            .with_size(vec2(crate::WINDOW_WIDTH, crate::WINDOW_HEIGHT))
+            .with_size(vec2(crate::WINDOW_WIDTH, height))
             .with_pixels_per_point(1.0)
             .build_state(
                 |ctx, app: &mut crate::FioApp| app.draw(ctx),
@@ -2835,85 +2846,81 @@ mod tests {
         harness.snapshot("settings_portal");
     }
 
-    /// The Settings screen as the app shows it scrolled to the Portal card: the
-    /// whole 1180x780 window, the panel wheeled down the way a user scrolls it,
-    /// and every row of the card — the address, the credential, the local folder,
-    /// the on/off switch, the status line and "Reconcile now" — in frame.
+    /// The Settings screen as a picture: the whole window — the 224 px sidebar,
+    /// the page head with its "Settings" title, every section down to the footer
+    /// — and the Portal card whole at the bottom: the address, the credential, the
+    /// local folder, the on/off switch, the status line and "Reconcile now".
     ///
-    /// The card is below the fold at that size (the four sections above it are
-    /// taller than the window), so the picture is the scrolled window rather than
-    /// a taller render that no screen shows.
+    /// Nothing is scrolled and nothing is cropped: the frame is taller than the
+    /// window the app opens at ([`SETTINGS_PICTURE_HEIGHT`]), which is what it
+    /// takes to hold the chrome and the last card at once.
     #[test]
-    fn the_settings_screen_scrolled_to_the_portal_card_renders_to_png() {
-        let mut harness = window_harness(crate::fixture::fixture_state(crate::model::View::Settings));
+    fn the_settings_screen_with_the_portal_card_renders_to_png() {
+        let mut harness = window_harness(
+            SETTINGS_PICTURE_HEIGHT,
+            crate::fixture::fixture_state(crate::model::View::Settings),
+        );
         harness.run_steps(2);
 
-        // The pointer over the central panel, clear of the sidebar: a wheel
-        // scrolls the panel it is over, which is how the screen scrolls at all.
-        harness.hover_at(egui::pos2(crate::app::SIDEBAR_WIDTH + 200.0, 200.0));
-        harness.run_steps(1);
-        let (unscrolled, _) = label_span(&harness, "Portal");
+        // The chrome, in the frame: the sidebar's account block at the foot of
+        // its column, and the screen's own item beside the page head's title.
+        let height = SETTINGS_PICTURE_HEIGHT;
+        let account = harness.get_by_label("Account").rect();
         assert!(
-            unscrolled > crate::WINDOW_HEIGHT,
-            "the Portal card is already in frame unscrolled, at {unscrolled}: the scroll proves nothing"
+            account.max.x <= crate::app::SIDEBAR_WIDTH && account.max.y <= height,
+            "the sidebar's account block is at {account:?}, outside the {height} px window"
+        );
+        let titled: Vec<egui::Rect> = harness.get_all_by_label("Settings").map(|node| node.rect()).collect();
+        assert_eq!(titled.len(), 2, "the sidebar's item and the screen's own page head");
+        assert!(
+            titled.iter().any(|rect| {
+                rect.max.x <= crate::app::SIDEBAR_WIDTH && rect.min.y >= 0.0 && rect.max.y <= height
+            }),
+            "the sidebar's item is not in the frame: {titled:?}"
+        );
+        assert!(
+            titled.iter().any(|rect| {
+                rect.min.x > crate::app::SIDEBAR_WIDTH
+                    && rect.min.y >= 0.0
+                    && rect.max.y <= crate::app::PAGE_HEAD_HEIGHT
+            }),
+            "the page head's title is not in the frame: {titled:?}"
         );
 
-        // One notch is four points of wheel, one frame at a time: the size a
-        // trackpad reports, and under egui's 8 px smoothing threshold, so it is
-        // spent in the frame it is given instead of smeared over the next few.
-        // The wheel turns until the panel cannot scroll any further — the end of
-        // the screen, where the card's last row has the `.view` bottom padding
-        // under it rather than the window's edge.
-        let mut frames = 0;
-        let mut previous = f32::INFINITY;
-        loop {
-            let (_, bottom) = label_span(&harness, "Reconcile now");
-            if (bottom - previous).abs() < 0.5 {
-                break; // the last notch moved nothing: the panel is at its end
-            }
-            previous = bottom;
-            assert!(
-                frames < 120,
-                "the wheel never reached the end of the screen: {bottom} after {frames} frames"
-            );
-            for _ in 0..4 {
-                harness.event(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: vec2(0.0, -4.0),
-                    modifiers: egui::Modifiers::NONE,
-                });
-            }
-            harness.run_steps(1);
-            frames += 1;
-        }
-        assert!(frames > 1, "the wheel moved nothing: {frames} frame(s)");
-        // The cursor is not part of the picture: nothing is left hovered.
-        harness.remove_cursor();
-        harness.run_steps(1);
-
-        // Measured on the frame that is rendered: the card's title and its last
-        // row are inside the window, the status line between them is the
-        // fixture's, and the sidebar the panel scrolled beside is still there.
-        let (title_top, _) = label_span(&harness, "Portal");
+        // The Portal card, whole: its title, its first row, the status line and
+        // its last row, each below the page head and inside the window.
+        let (portal_top, _) = label_span(&harness, "Portal");
         let (first_top, _) = label_span(&harness, "Server URL");
         let (_, last_bottom) = label_span(&harness, "Reconcile now");
-        assert!(title_top >= 0.0, "the Portal title is {title_top} px above the window");
-        assert!(first_top > title_top, "the card's first row is at {first_top}, above its title");
         assert!(
-            last_bottom + 8.0 <= crate::WINDOW_HEIGHT,
-            "the card's last row ends at {last_bottom}, on the {} px window's edge",
-            crate::WINDOW_HEIGHT
+            portal_top > crate::app::PAGE_HEAD_HEIGHT,
+            "the Portal title is at {portal_top}, inside the page head"
+        );
+        assert!(first_top > portal_top, "the card's first row is at {first_top}, above its title");
+        assert!(
+            last_bottom + 8.0 <= height,
+            "the card's last row ends at {last_bottom}, on the {height} px window's edge"
         );
         let status = portal_line(&harness.state().state.portal.status).text;
         harness.get_by_label(&status);
-        assert_eq!(
-            harness.get_all_by_label("Settings").count(),
-            2,
-            "the sidebar's item and the screen's own page head"
-        );
-        harness.get_by_label("Account");
-        assert!(harness.query_by_label("Sign in to Frame.io").is_none(), "signed in, as the app is");
+        harness.get_by_label("FioTransfer dev"); // the footer, the screen's last line
 
+        // The render is the artefact, and nothing in it is cut: the window is the
+        // size the harness drew, and its last row is background from the sidebar's
+        // edge to the window's — so no card, no text and no scrollbar reaches it.
+        let image = harness.render().expect("render");
+        assert_eq!(
+            (image.width(), image.height()),
+            (crate::WINDOW_WIDTH as u32, height as u32)
+        );
+        let last_row = image.height() - 1;
+        let drawn = (crate::app::SIDEBAR_WIDTH as u32..image.width())
+            .filter(|x| {
+                let pixel = image.get_pixel(*x, last_row);
+                (pixel[0], pixel[1], pixel[2]) != (0, 0, 0)
+            })
+            .count();
+        assert_eq!(drawn, 0, "{drawn} columns reach the picture's last row");
         harness.snapshot("settings_portal_window");
     }
 
