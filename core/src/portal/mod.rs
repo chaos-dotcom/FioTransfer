@@ -59,12 +59,46 @@ pub enum PortalErr {
     Json(String),
 }
 
+/// The human part of a Portal error body: `{"detail": "…"}` when it is that shape,
+/// otherwise the body trimmed. Never the whole JSON document.
+fn detail_of(body: &str) -> String {
+    let t = body.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        if let Some(d) = v.get("detail").and_then(|d| d.as_str()) {
+            return d.trim().to_string();
+        }
+    }
+    crate::netx::trim_body(t.as_bytes())
+}
+
 impl std::fmt::Display for PortalErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PortalErr::NoUrl => write!(f, "no Portal URL is set"),
             PortalErr::NoToken => write!(f, "no Portal token is stored"),
-            PortalErr::Status { status, body } => write!(f, "Portal API error {}: {}", status, body),
+            PortalErr::Status { status, body } => {
+                // The user reads this in the settings status line, so it says what
+                // to do rather than repeating a JSON error document.
+                match *status {
+                    401 | 403 => write!(
+                        f,
+                        "Portal refused the token ({}). Paste the PORTAL_API_TOKEN from Portal's .env and press Save",
+                        status
+                    ),
+                    404 => write!(f, "Portal has no /api/upload-links ({}): is that the Portal address?", status),
+                    _ => {
+                        let body = detail_of(body);
+                        if body.is_empty() {
+                            write!(f, "Portal answered {} (no detail)", status)
+                        } else {
+                            write!(f, "Portal answered {}: {}", status, body)
+                        }
+                    }
+                }
+            }
             PortalErr::Http(e) => write!(f, "can't reach Portal: {}", e),
             PortalErr::Json(e) => write!(f, "Portal sent something else: {}", e),
         }
@@ -524,4 +558,25 @@ mod tests {
         assert_eq!(c.url("/api/upload-links"), "https://portal.example.com/api/upload-links");
         assert_eq!(c.token, "t");
     }
+    #[test]
+    fn an_error_reads_as_advice_not_as_a_json_document() {
+        let refused = PortalErr::Status { status: 401, body: r#"{"detail":"Authentication required"}"#.into() };
+        let text = refused.to_string();
+        assert!(text.contains("refused the token"), "{text}");
+        assert!(text.contains("401"), "{text}");
+        assert!(!text.contains("detail"), "the JSON wrapper must not reach the user: {text}");
+
+        let wrong_host = PortalErr::Status { status: 404, body: r#"{"detail":"Not Found"}"#.into() };
+        assert!(wrong_host.to_string().contains("is that the Portal address"), "{}", wrong_host);
+
+        let broken = PortalErr::Status { status: 502, body: r#"{"detail":"bad gateway upstream"}"#.into() };
+        assert_eq!(broken.to_string(), "Portal answered 502: bad gateway upstream");
+
+        let bare = PortalErr::Status { status: 503, body: "  ".into() };
+        assert_eq!(bare.to_string(), "Portal answered 503 (no detail)");
+
+        let html = PortalErr::Status { status: 500, body: "<html>oops</html>".into() };
+        assert!(html.to_string().contains("oops"), "{}", html);
+    }
+
 }
