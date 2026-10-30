@@ -38,7 +38,7 @@ pub const ENDPOINT: &str =
 /// replaced by hand (download and drag across). If it ever has to change, ship a
 /// release signed with the old key first, then start signing with the new one.
 /// Treat this value as write-once.
-pub const PUB_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZGRTZEQ0E0Q0Q1NjM5MjUKUldRbE9WYk5wTnptYjhlZ0pEck52Y3VvaHY1M0drUE1tUDhXT2dyUHdyUWNNbDBXdFZCY3N4bmoK";
+pub const PUB_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZGRTZEQ0E0Q0Q1NjM5MjUKUldRbE9WYk5wTnptYjhlZ1pEck52Y3VvaHY1M0drUE1tUDhXT2dyUHdyUWNNbDBXdFZCY3N4bmoK";
 
 /// The app's bundle identifier; an update must have the same one.
 pub const BUNDLE_ID: &str = "com.farbhaus.fiotransfer";
@@ -1071,4 +1071,23 @@ mod tests {
         let marker = std::fs::read_to_string(app.join("Contents/Resources/marker.txt")).expect("the marker");
         assert_eq!(marker, "the copy that is running", "nothing was swapped in");
     }
+    /// A typo in [`PUB_KEY`] is invisible at compile time and fatal at runtime: every
+    /// download fails "signature verification failed" and nobody can ever update. It
+    /// shipped that way once. This verifies a fixture signed by the release key, so
+    /// the constant is checked against the key rather than against itself.
+    #[test]
+    fn the_embedded_public_key_verifies_a_signature_made_by_the_release_key() {
+        use base64::Engine as _;
+        let dec = |s: &str| {
+            String::from_utf8(base64::engine::general_purpose::STANDARD.decode(s.trim()).expect("base64"))
+                .expect("utf8")
+        };
+        let key = minisign_verify::PublicKey::decode(&dec(PUB_KEY)).expect("PUB_KEY is a minisign key");
+        let sig_b64 = include_str!("../../tests/data/updater-keycheck.txt.sig");
+        let sig = minisign_verify::Signature::decode(&dec(sig_b64)).expect("signature decodes");
+        let data = include_bytes!("../../tests/data/updater-keycheck.txt");
+        key.verify(data, &sig, true)
+            .expect("PUB_KEY must be the public half of the release signing key");
+    }
+
 }
