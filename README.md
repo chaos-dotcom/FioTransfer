@@ -1,44 +1,55 @@
 # FioTransfer in Rust
 
-This repository is the Rust application. The original Go app is kept under
-`legacy-go/` for reference and for the before/after measurements; it is not
-built and not shipped.
+A port of [FioTransfer](../FioTransfer) (Go + Wails) to Rust: the same Frame.io
+V4 API, the same transfer engine, the same history store, the same share-link
+providers, the same updater.
 
-A port of [FioTransfer](../FioTransfer) (Go + Wails) to Rust. The window, the
-frontend, the menu bar item, the download panel and the Finder services are the
-same as the Go app's — the same bytes, the same WebKit engine, the same
-Objective-C — and the transfer engine, the history store, the share-link
-providers, the updater and the app itself are Rust.
+**One app.** `FioTransfer` is an egui application (`egui-ui/`, package
+`fiotransfer-egui`) drawing the same four screens, and it runs the real engine
+through `fiotransfer-core` (`core/`). There is no webview: the WKWebView shell
+that used to be the macOS bundle, its AppKit menu bar item, its download panel
+and its Finder services are retired, and so is the HTML/CSS/JS front end they
+rendered. The root package is now only the command line (`fio`) and the
+measuring harness (`fio-bench`).
 
 ```
-make app          # build FioTransfer.app (ad-hoc signed)
-make cli          # build bin/fio      (the command-line front end)
-make bench        # build bin/fio-bench (the measuring harness)
-make test         # cargo test
+cargo run -p fiotransfer-egui          # the app
+make app                               # build FioTransfer.app (ad-hoc signed)
+make cli                               # build bin/fio
+make bench                             # build bin/fio-bench
+make test                              # cargo test --workspace
 ```
 
-## What is byte-identical, and what is Rust
+## Where the pieces live now
 
-| Piece | Go app | This port |
-| --- | --- | --- |
-| `frontend/dist/{index.html,style.css,app.js,fonts/*}` | served by Wails | **the same files, unmodified** (sha256 verified), served to the same WKWebView |
-| `Info.plist`, icon, `LICENSE`, `THIRD_PARTY_NOTICES.txt` | Wails template | **the same bytes** |
-| `tray_darwin.m`, `quick_darwin.m`, `services_darwin.m` | cgo + Go callbacks | **the same files**, compiled as-is, calling into Rust |
-| main menu, panels and alerts | Wails | new Objective-C (`mac/window.m`, `mac/dialogs.m`) doing what Wails did |
-| engine, app, history, share providers, updater | Go | Rust |
+| Piece | Where |
+| --- | --- |
+| Frame.io API, auth, history, share links, the engine, watch folders, updates, the `App` | `core/` (`fiotransfer-core`) |
+| the four screens, the shell and its platform seam | `egui-ui/` (`fiotransfer-egui`) |
+| `fio` (upload, download, watch, history, export) and `fio-bench` | `src/bin/` |
+| the `libc` calls and the AppKit shims the CLI needs | `sys/` |
+| the frozen webview front end, kept only as the bridge test's contract | `tests/contract/app.js` |
 
-The frontend talks to `window.go.main.App[method](...)` and
-`window.runtime.EventsOn(...)`, so `src/gui.rs` injects a small script that
-provides exactly those, backed by IPC. `app.js` is not modified in any way.
+`fiotransfer-core` has no window and no webview dependency — no `wry`, no `tao`,
+no Objective-C — which is what makes one app possible: `egui-ui` depends on it
+directly, and so do the CLI and the bench. Every `window.go.main.App[method]`
+call the old front end made is a plain Rust method on `core::App`; the JSON
+dispatch that answered those names is still in `src/app.rs`, because
+`tests/prop_bridge.rs` holds it to the frozen `app.js` call list.
 
 ## Verification
 
 ### The user interface: pixel for pixel
 
-Screen capture is not available to a background session, so both builds
-photograph **their own webview** (`takeSnapshotWithConfiguration:`): a build
-with `-tags shot` for Go, `FIO_SHOT_FILE` for Rust. Both are driven to the same
-view with the same JavaScript, in a 1180×780 window, under the same `HOME`.
+This was measured while the port still had a webview, and it is kept because it
+is what the current screens were laid out from. Screen capture is not available
+to a background session, so both builds photographed **their own webview**
+(`takeSnapshotWithConfiguration:`): a build with `-tags shot` for Go, `FIO_SHOT`
+for Rust. Both were driven to the same view with the same JavaScript, in a
+1180×780 window, under the same `HOME`. The webview shell has since been
+retired; the egui app draws the same measurements, and
+`cargo test -p fiotransfer-egui --test snapshots` renders its four screens
+headlessly at 1180×780 into `/tmp/egui-shots`.
 
 `shasum` of the four views, Go versus Rust, 1,180 × 780 = 920,400 pixels each:
 
@@ -107,9 +118,12 @@ sink; its numbers are not quoted above.
   that do not need a real account were exercised.
 * Anything against the real Frame.io API: every request path was exercised
   against the stand-in servers only.
-* The menu bar item, the download panel, the file panels and notifications were
-  compiled and unit-harnessed, but never shown on a real screen from this
-  session; their Objective-C is the Go app's own code.
+* The menu bar item, the download panel and the Finder services were retired
+  with the webview shell: the egui app has a window and nothing else. The file
+  and folder panels it does use go through the OS (`osascript`, `zenity`,
+  PowerShell) and were exercised as far as a background session can.
+* The app was never signed in against Adobe from this session, so the screens
+  were rendered from the fixture state, not from a live account.
 * The Go test suite (4,655 lines) was not ported. 53 cheap unit tests were
   (paths, timings, escaping, naming, the CSV shape, resume sidecars).
 
@@ -187,19 +201,27 @@ upload ledger records parts and the download ledger records blocks.
 ## Layout
 
 ```
-src/api.rs        Frame.io V4 client (same routes, limits and retry rules)
-src/auth.rs       Adobe IMS PKCE, localhost https callback
-src/localcert.rs  the local CA macOS trusts, name-constrained to localhost
-src/config.rs     settings.json under ~/Library/Application Support/FioTransfer
-src/history/      SQLite history, watch rows, unfinished uploads, monthly log
-src/share/        Frame.io shares and review links, Smash, WeTransfer, Dropbox,
-                  Google Drive, Portal
-src/xfer/         the transfer engine: manager, upload, download, watch folders
-src/update.rs     GitHub releases, checksums, bundle swap, relaunch
-src/app.rs        the object the frontend binds to (every app.js call)
-src/gui.rs        window, webview, asset server, JS bridge
-src/tray.rs etc.  the AppKit side panels
-src/bin/fio.rs    the CLI
-src/bin/bench.rs  the measuring harness
-mac/              the Go app's .m files, plus windows/menus and panels
+core/src/api.rs        Frame.io V4 client (same routes, limits and retry rules)
+core/src/auth.rs       Adobe IMS PKCE, localhost https callback
+core/src/localcert.rs  the local CA macOS trusts, name-constrained to localhost
+core/src/config.rs     settings.json under ~/Library/Application Support/FioTransfer
+core/src/host.rs       what a front end must supply: panels, clipboard, window, quit
+core/src/history/      SQLite history, watch rows, unfinished uploads, monthly log
+core/src/share/        Frame.io shares and review links, Smash, WeTransfer, Dropbox,
+                       Google Drive, Portal
+core/src/portal/        the Portal client and the watch-folder reconciler its
+                       .turbosort markers drive (mirrored watch folders)
+core/src/xfer/         the transfer engine: manager, upload, download, watch folders
+core/src/update.rs     GitHub releases, checksums, bundle swap, relaunch
+core/src/app.rs        the object every front end drives (every app.js call, as Rust)
+egui-ui/src/app.rs     the shell: sidebar, central panel, toasts
+egui-ui/src/shell.rs   the App on a tokio runtime, and the channels to the screens
+egui-ui/src/platform.rs the file panels, the clipboard and the dialogs, per OS
+egui-ui/src/views/     the four screens
+egui-ui/src/model.rs   UiState, and Request — what a screen asks the app to do
+src/app.rs             the JSON bridge the old front end called (contract test only)
+src/bin/fio.rs         the CLI
+src/bin/bench.rs       the measuring harness
+sys/                   the libc calls the CLI and the platform seam need
+tests/contract/app.js  the webview front end, frozen as the bridge contract
 ```

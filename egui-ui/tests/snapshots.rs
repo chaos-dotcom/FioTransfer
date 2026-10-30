@@ -6,8 +6,10 @@
 //! `/tmp/egui-shots/{transfers,space,watch,history,settings}.png` — plus
 //! `space-empty.png`, the Space screen with no projects, which is the state the
 //! fixture's other five never take.
-//! Those files are the artefact that gets compared against the webview's own
-//! screenshots of `frontend/dist`.
+//! Those files are the artefact: they are what the webview front end's own
+//! screenshots were compared against while both existed (see the README's
+//! pixel table). The webview is retired, so this is now the app's own render of
+//! the same five screens.
 //!
 //! The renderer is wgpu through `egui_kittest` (the crate's `wgpu` feature), so
 //! no window is needed. The fixture (`src/fixture.rs`, shared with the wasm
@@ -120,11 +122,7 @@ fn the_five_screens_render_to_png() {
 #[test]
 fn the_empty_space_screen_renders_to_png() {
     let dir = ensure_shots_dir().expect("create /tmp/egui-shots");
-    let mut state = UiState::default();
-    state.view = View::Space;
-    // Signed in, with no projects counted yet — the state the empty block is
-    // written for (signed out, it offers Settings instead).
-    state.logged_in = true;
+    let state = fiotransfer_egui::fixture::fixture_state_empty_space();
 
     let mut harness = Harness::builder()
         .with_size(egui::vec2(WINDOW_WIDTH, WINDOW_HEIGHT))
@@ -269,6 +267,7 @@ fn a_tall_screen_scrolls_instead_of_widening() {
     let mut state = fixture_state(View::Watch);
     state.watches = (0..60)
         .map(|i| WatchRow {
+            id: format!("w-reel-{i:03}"),
             local: format!("/Users/editor/Renders/Reel_{i:03}"),
             label: format!("Shows / Nightfall / Ep 04 / Renders/Reel_{i:03}"),
             direction: "upload".into(),

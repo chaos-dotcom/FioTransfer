@@ -21,9 +21,12 @@
 //!   accessible node is the row itself, labelled with the job title. That is
 //!   what a screen reader should read, and it makes the row clickable in tests.
 //!
-//! Nothing here talks to Frame.io. A click becomes one [`Action`] and is
-//! reported as a toast (`state.push_toast`) because `model::UiState` has no
-//! request channel to the host yet.
+//! Nothing here talks to Frame.io. A click becomes one [`Action`]; [`report`]
+//! turns it into one [`Request`] on `state.requests`, and the shell
+//! (`crate::shell`) hands that request to the real `App` — the same call the
+//! webview front end made through `window.go.main.App[...]`. The only toast this
+//! screen still raises is the one the destination chip has to give: the
+//! webview's destination modal has not been ported to this window yet.
 
 use std::sync::Arc;
 
@@ -33,7 +36,10 @@ use egui::{
     UiBuilder, Vec2, WidgetInfo, WidgetType, pos2, vec2,
 };
 
-use crate::model::{FileView, JobView, ToastKind, UiState, fmt_bytes, fmt_dur, fmt_speed};
+use crate::model::{
+    FileView, JobView, LinkInfo, Request, ToastKind, UiState, View, fmt_bytes, fmt_dur, fmt_speed,
+};
+use crate::model::Status;
 
 // ---------- the design tokens ----------
 
@@ -239,18 +245,18 @@ pub fn file_count(job: &JobView) -> String {
 /// The status pill's text, exactly as `updateJob()` builds it.
 pub fn status_text(job: &JobView) -> String {
     let terminal = job.terminal();
-    let preparing = job.status == "resolving" || job.status == "queued";
-    let mut text = status_label(&job.status, &job.kind);
+    let preparing = matches!(job.status, Status::Resolving | Status::Queued);
+    let mut text = status_label(job.status.as_str(), &job.kind);
     if !terminal && job.eta > 0.0 && !preparing {
         text = format!("{} left", fmt_dur(job.eta));
     }
     if !terminal && job.kind == "upload" && job.total > 0 && job.done >= job.total {
         text = "Verifying".to_string();
     }
-    if job.status == "partial" {
+    if job.status == Status::Partial {
         text = format!("{} of {} failed", job.files_failed, job.files_total);
     }
-    if job.status == "done" {
+    if job.status == Status::Done {
         let files = if job.files_total == 1 {
             "1 file".to_string()
         } else {
@@ -280,14 +286,14 @@ pub fn speed_text(job: &JobView) -> String {
 
 /// The `pct` next to the bar; empty while the size is unknown, as in `app.js`.
 pub fn percent_text(job: &JobView) -> String {
-    let preparing = job.status == "resolving" || job.status == "queued";
+    let preparing = matches!(job.status, Status::Resolving | Status::Queued);
     if preparing {
         return String::new();
     }
     match job.progress() {
         Some(p) => format!("{}%", (p * 100.0).floor() as i64),
         None => {
-            if job.status == "done" { "100%".to_string() } else { String::new() }
+            if job.status == Status::Done { "100%".to_string() } else { String::new() }
         }
     }
 }
@@ -296,7 +302,7 @@ pub fn percent_text(job: &JobView) -> String {
 pub fn bar_fraction(job: &JobView) -> Option<f32> {
     match job.progress() {
         Some(p) => Some(p),
-        None if job.status == "done" => Some(1.0),
+        None if job.status == Status::Done => Some(1.0),
         None => None,
     }
 }
@@ -324,7 +330,7 @@ pub fn track_fill(status: &str) -> Color32 {
 
 /// The track colour while a job's size is unknown: `--raised` with no fill.
 pub fn track_fill_fraction(job: &JobView) -> Option<f32> {
-    if job.status == "resolving" { None } else { bar_fraction(job) }
+    if job.status == Status::Resolving { None } else { bar_fraction(job) }
 }
 
 /// One file row's status word (`fileRows()` in `app.js`).
@@ -339,7 +345,7 @@ pub fn file_status_text(file: &FileView, kind: &str) -> String {
         "done" | "running" if !file.note.is_empty() => file.note.clone(),
         other => status_label(other, kind),
     };
-    let terminal = matches!(file.status.as_str(), "done" | "partial" | "failed" | "canceled" | "interrupted" | "skipped");
+    let terminal = file.status.terminal();
     if file.retries > 0 && !terminal {
         let word = if file.retries == 1 { "retry" } else { "retries" };
         text = format!("{} · {} {}", text, file.retries, word);
@@ -364,7 +370,7 @@ pub fn file_track_fill(status: &str) -> Color32 {
 /// A file row's own fraction.
 pub fn file_fraction(file: &FileView) -> f32 {
     if file.size <= 0 {
-        return if file.status == "done" { 1.0 } else { 0.0 };
+        return if file.status == Status::Done { 1.0 } else { 0.0 };
     }
     (file.done as f32 / file.size as f32).clamp(0.0, 1.0)
 }
@@ -385,7 +391,7 @@ pub fn file_rank(status: &str) -> u8 {
 /// The files a job shows, in the webview front end's order.
 pub fn ordered_files(files: &[FileView]) -> Vec<&FileView> {
     let mut v: Vec<&FileView> = files.iter().collect();
-    v.sort_by_key(|f| file_rank(&f.status)); // stable: keeps the host's order
+    v.sort_by_key(|f| file_rank(f.status.as_str())); // stable: keeps the host's order
     v
 }
 
@@ -410,7 +416,7 @@ pub fn actions_for(job: &JobView) -> Actions {
     let terminal = job.terminal();
     Actions {
         cancel: !terminal,
-        retry: terminal && job.status != "done",
+        retry: terminal && job.status != Status::Done,
         copy_link: !job.link.is_empty(),
         open: !job.link.is_empty(),
         reveal: job.kind == "download" && !job.dest.is_empty(),
@@ -429,24 +435,43 @@ pub struct Actions {
     pub files: bool,
 }
 
-/// What a click on the screen asks for. The screen reports one per frame.
+/// What a click on the screen asks for. The screen reports one per frame, and
+/// [`report`] turns it into the [`Request`] (or the view state) it means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Show or hide this job's files.
     Toggle(String),
+    /// `Cancel` on the row (`call('Cancel', id)`).
     Cancel(String),
+    /// `Retry` on the row.
     Retry(String),
-    /// Put the job's share link on the clipboard; `None` when it has none yet.
-    CopyLink(Option<String>),
+    /// `Copy share link`: the app fetches the job's public link, copies it and
+    /// says so (`copyShare(id)` → `ShareLink`).
+    Share(String),
+    /// `Show in Finder` (`.a-reveal`): the job's destination, found in the
+    /// snapshot by this id.
     Reveal(String),
     /// Open a Frame.io page in the browser (`.a-open`, "Open in Frame.io").
     Open(String),
     /// The composer's Download button: start the download of the typed link.
-    StartDownload,
+    StartDownload { link: String, passphrase: String, subfolder: bool },
     /// `.head-actions`' "Clear finished".
     ClearFinished,
-    /// A button whose host call has no channel in [`UiState`] yet.
-    NotConnected(&'static str),
+    /// `.comp-body`'s "Files…" (`PickFiles`): a panel, then the upload starts.
+    PickFiles,
+    /// `.comp-body`'s "Folder…" (`PickFolder`).
+    PickFolder,
+    /// The link field's `Paste` (`ClipboardText`, then `InspectLink`).
+    Paste,
+    /// The download folder button (`PickDownloadDir`).
+    PickDownloadDir,
+    /// `.dest-pick`: the upload destination. The webview's destination modal is
+    /// not ported to this window, so this one only says so.
+    ChooseDestination,
+    /// `#cta-signin` in the composer (`login()`).
+    SignIn,
+    /// `#cta-setup`: the webview shows Settings, where the client id is typed.
+    SetUp,
 }
 
 /// `j.phase && !terminal` in `updateJob()`: a phase is only news while it runs.
@@ -462,29 +487,33 @@ pub fn phase_is_showing(job: &JobView) -> bool {
 /// `theme::main_frame`) and the scroll container, so this draws the three blocks
 /// `index.html` draws — `.page-head`, `.composer`, `.list` — and nothing else.
 pub fn show(ui: &mut Ui, state: &mut UiState) {
-    let mut composer = Composer::load(ui);
+    let mut composer = Composer::load(ui, state);
     ui.scope_builder(UiBuilder::new().layout(Layout::top_down(Align::Min)), |ui| {
         // Rows are separated by their own 1 px border, not by egui's item spacing.
         ui.spacing_mut().item_spacing.y = 0.0;
         head(ui, state);
         if let Some(action) = composer_block(ui, state, &mut composer) {
-            report(ui, state, action);
+            report(state, action);
         }
         if composer.wants_paste {
             composer.wants_paste = false;
-            report(ui, state, Action::NotConnected("Paste from clipboard"));
+            report(state, Action::Paste);
         }
         ui.add_space(LIST_GAP);
         list(ui, state);
     });
-    composer.store(ui);
+    composer.store(ui, state);
 }
 
 /// What a typed link, a passphrase and the "New folder" box hold.
 ///
-/// `model::UiState` has no fields for them yet, so the buffers live in egui's
-/// own memory — they are view state until the host can read them back. See the
-/// module note: the wanted `UiState` fields are listed in the report.
+/// The buffers live in egui's own memory — egui's text widgets edit a `&mut
+/// String`, and a `UiState` field cannot be split-borrowed across a frame — but
+/// `UiState::link`, `UiState::passphrase` and `UiState::new_folder` are the
+/// record of them: [`Composer::store`] writes the buffers back every frame, and
+/// [`Composer::load`] adopts the state when this window has no buffer yet or when
+/// the shell wrote it (that is how `Paste` fills the field). The shell reads what
+/// the user typed from `UiState`, never from here.
 #[derive(Debug, Clone, Default)]
 pub struct Composer {
     /// The text of `#link`.
@@ -499,25 +528,98 @@ pub struct Composer {
     pub preview: String,
     /// The preview is a warning (`--notice`) rather than an error (`--error-text`).
     pub preview_warn: bool,
+    /// The preview is an error (`--error-text`).
+    pub preview_error: bool,
     /// `Paste` was pressed: the screen has no clipboard to read, so it asks the
-    /// host for `ClipboardText` and the request is reported once, then cleared.
+    /// shell for it (`Request::Paste`) and the ask is made once, then cleared.
     pub wants_paste: bool,
+    /// The link this window last gave to `UiState`: a state link that differs
+    /// from it came from the shell, and is newer than the buffer.
+    pub seen_link: String,
 }
 
 impl Composer {
     fn id() -> Id {
         Id::new("fiotransfer-transfers-composer")
     }
-    fn load(ui: &Ui) -> Self {
-        ui.data(|d| d.get_temp::<Composer>(Self::id())).unwrap_or_default()
+    fn load(ui: &Ui, state: &UiState) -> Self {
+        let stored = ui.data(|d| d.get_temp::<Composer>(Self::id()));
+        let first_frame = stored.is_none();
+        let mut composer = stored.unwrap_or_default();
+        if first_frame {
+            // No buffer in this window yet: `UiState` is the record of it.
+            composer.adopt_link_and_fields(state);
+        } else if composer.seen_link != state.link {
+            // The shell wrote the link (Paste): it is newer than the buffer.
+            composer.link = state.link.clone();
+            composer.seen_link = state.link.clone();
+        }
+        composer.adopt_link_info(state);
+        composer
     }
-    fn store(&self, ui: &Ui) {
-        ui.data_mut(|d| d.insert_temp(Self::id(), self.clone()));
+    fn store(&self, ui: &Ui, state: &mut UiState) {
+        state.link = self.link.clone();
+        state.passphrase = self.passphrase.clone();
+        state.new_folder = self.new_folder;
+        let mut saved = self.clone();
+        saved.seen_link = self.link.clone();
+        ui.data_mut(|d| d.insert_temp(Self::id(), saved));
     }
-    /// `updateDownloadBtn()`: a download needs a link that inspection did not reject.
+    fn adopt_link_and_fields(&mut self, state: &UiState) {
+        self.link = state.link.clone();
+        self.passphrase = state.passphrase.clone();
+        self.new_folder = state.new_folder;
+        self.seen_link = state.link.clone();
+    }
+    /// The preview line, the passphrase field and Download's liveness all come
+    /// from what `InspectLink` said (`ui.link_info`), when the shell has it.
+    fn adopt_link_info(&mut self, state: &UiState) {
+        match &state.link_info {
+            Some(info) if info.needs_passphrase => {
+                // The passphrase is the news, and the app's reason with it.
+                self.needs_passphrase = true;
+                self.preview = info.error.clone();
+                self.preview_warn = true;
+                self.preview_error = false;
+            }
+            Some(info) if !info.error.is_empty() => {
+                self.needs_passphrase = false;
+                self.preview = info.error.clone();
+                self.preview_warn = false;
+                self.preview_error = true;
+            }
+            Some(info) => {
+                self.needs_passphrase = false;
+                self.preview = preview_line(info);
+                self.preview_warn = info.unavailable > 0;
+                self.preview_error = false;
+            }
+            None => {
+                self.needs_passphrase = false;
+                self.preview.clear();
+                self.preview_warn = false;
+                self.preview_error = false;
+            }
+        }
+    }
+    /// `updateDownloadBtn()`: a download needs a link that inspection did not
+    /// reject — a rejected link that wants a passphrase is still downloadable.
     fn can_download(&self) -> bool {
-        !self.link.trim().is_empty() && !self.preview_warn
+        !self.link.trim().is_empty() && !(self.preview_error && !self.needs_passphrase)
     }
+}
+
+/// `setPreview()`'s good case, as one line: name, file count, size, and any
+/// files the app could not offer.
+fn preview_line(info: &LinkInfo) -> String {
+    let name = if info.name.is_empty() { "Shared files".to_string() } else { info.name.clone() };
+    let files =
+        if info.files == 1 { "1 file".to_string() } else { format!("{} files", info.files) };
+    let mut line = format!("{} · {} · {}", name, files, fmt_bytes(info.total_bytes));
+    if info.unavailable > 0 {
+        line = format!("{} · {} unavailable", line, info.unavailable);
+    }
+    line
 }
 
 // ---------- `.page-head` ----------
@@ -545,7 +647,7 @@ fn head(ui: &mut Ui, state: &mut UiState) {
             vec2(w, size::CONTROL_H),
         );
         if subtle_button(ui, button_rect, label).clicked() {
-            report(ui, state, Action::ClearFinished);
+            report(state, Action::ClearFinished);
         }
     }
     // A `put` at an absolute rect rewinds the cursor to that rect, so the head
@@ -698,9 +800,11 @@ fn upload_body(ui: &mut Ui, state: &mut UiState) -> Option<Action> {
     if !state.logged_in {
         let set_up = !state.settings.client_id.is_empty();
         let (notice, label, primary, ask) = if set_up {
-            ("Not signed in", "Sign in", true, Action::NotConnected("Sign in"))
+            ("Not signed in", "Sign in", true, Action::SignIn)
         } else {
-            ("Not set up", "Set up", false, Action::NotConnected("Set up"))
+            // `$('#cta-setup').onclick = () => showView('settings')`: the client
+            // id is typed on the Settings screen, so that is where this goes.
+            ("Not set up", "Set up", false, Action::SetUp)
         };
         let w = text_width(ui, label, T_BODY) + 24.0;
         let btn = Rect::from_min_size(pos2(right - w, left.y), vec2(w, height));
@@ -731,10 +835,10 @@ fn upload_body(ui: &mut Ui, state: &mut UiState) -> Option<Action> {
 
     let mut action = dest_pick(ui, pick_rect, state);
     if button(ui, files_rect, files, false, true).clicked() {
-        action = Some(Action::NotConnected("Files…"));
+        action = Some(Action::PickFiles);
     }
     if button(ui, folder_rect, folder, false, true).clicked() {
-        action = Some(Action::NotConnected("Folder…"));
+        action = Some(Action::PickFolder);
     }
     ui.advance_cursor_after_rect(Rect::from_min_max(left, pos2(right, left.y + height)));
     action
@@ -804,7 +908,7 @@ fn dest_pick(ui: &mut Ui, rect: Rect, state: &UiState) -> Option<Action> {
     resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &title));
     let resp = resp.on_hover_text(title);
     if resp.clicked() {
-        return Some(Action::NotConnected("Choose destination"));
+        return Some(Action::ChooseDestination);
     }
     None
 }
@@ -862,15 +966,19 @@ fn download_body(ui: &mut Ui, state: &UiState, composer: &mut Composer) -> Optio
 
     // `.btn` with a folder glyph and the download folder's own name (`#dl-dest`).
     if dir_button(ui, dir_rect, &dir_label, state).clicked() {
-        action = Some(Action::NotConnected("Choose download folder"));
+        action = Some(Action::PickDownloadDir);
     }
 
     let enabled = composer.can_download();
     if button(ui, dl_rect, download, true, enabled).clicked() && enabled {
-        // `startDownload()`: the host starts the transfer, the field empties.
+        // `startDownload()`: the app starts the transfer, the fields empty.
+        let link = composer.link.trim().to_string();
+        let passphrase = composer.passphrase.clone();
+        let subfolder = composer.new_folder;
         composer.link.clear();
         composer.passphrase.clear();
-        action = Some(Action::StartDownload);
+        composer.needs_passphrase = false;
+        action = Some(Action::StartDownload { link, passphrase, subfolder });
     }
     ui.advance_cursor_after_rect(Rect::from_min_max(left, pos2(right, left.y + height)));
     action
@@ -932,7 +1040,8 @@ fn link_field(ui: &mut Ui, rect: Rect, composer: &mut Composer) -> egui::Respons
         .on_hover_text("Paste from clipboard");
     if resp.clicked() {
         // egui has no clipboard *read* API: the button puts the caret in the field
-        // so a real paste (⌘V) lands there, and the host is asked for the text.
+        // so a real paste (⌘V) lands there, and the shell is asked for the text
+        // (`Request::Paste`), which adopts `UiState::link` back into this buffer.
         ui.memory_mut(|m| m.request_focus(field_id));
         composer.wants_paste = true;
     }
@@ -961,13 +1070,23 @@ fn dir_button(ui: &mut Ui, rect: Rect, label: &str, state: &UiState) -> egui::Re
     let painter = ui.painter().clone();
     let icon = Rect::from_center_size(pos2(rect.left() + 16.0, rect.center().y), vec2(16.0, 16.0));
     draw_folder(&painter, icon, theme::TEXT_2);
-    let save_to = state.settings.download_dir.clone();
+    let save_to = download_dir(state);
     resp.on_hover_text(if save_to.is_empty() { "Save to Downloads".to_string() } else { format!("Save to {save_to}") })
+}
+
+/// `S.dlDest || s.download_dir`: the folder this download will be written to —
+/// the one chosen for it when the shell has recorded one, else the setting.
+pub fn download_dir(state: &UiState) -> String {
+    if !state.download_dir.is_empty() {
+        return state.download_dir.clone();
+    }
+    state.settings.download_dir.clone()
 }
 
 /// `baseName(S.dlDest || s.download_dir)` — `#dl-dest-label` shows the folder's name.
 pub fn download_dir_label(state: &UiState) -> String {
-    let dir = state.settings.download_dir.trim_end_matches('/');
+    let dir = download_dir(state);
+    let dir = dir.trim_end_matches('/');
     match dir.rsplit('/').next() {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "Downloads".to_string(),
@@ -995,7 +1114,14 @@ fn comp_foot(ui: &mut Ui, composer: &mut Composer) -> Option<Action> {
                     let (rect, _) = ui.allocate_exact_size(vec2(preview_w, size::COMP_FOOT_H), Sense::hover());
                     if !composer.preview.is_empty() {
                         let painter = ui.painter().clone();
-                        let color = if composer.preview_warn { theme::NOTICE } else { theme::TEXT_2 };
+                        // `.link-preview .err` is `--error-text`, `.warn` is `--notice`.
+                        let color = if composer.preview_error {
+                            theme::ERROR_TEXT
+                        } else if composer.preview_warn {
+                            theme::NOTICE
+                        } else {
+                            theme::TEXT_2
+                        };
                         line_left(ui, &painter, &composer.preview, T_NOTE, color, rect.left(), rect.center().y, rect.width());
                     }
                     ui.scope(|ui| {
@@ -1036,7 +1162,7 @@ fn list(ui: &mut Ui, state: &mut UiState) {
         }
     }
     if let Some(a) = action {
-        report(ui, state, a);
+        report(state, a);
     }
 }
 
@@ -1120,7 +1246,7 @@ fn row(ui: &mut Ui, job: &JobView, is_open: bool, files: &[FileView]) -> Option<
 
     // The error line, indented to the title, like `.error-line`.
     let mut below = row_rect.bottom();
-    let error_h = if job.status == "failed" && !job.error.is_empty() {
+    let error_h = if job.status == Status::Failed && !job.error.is_empty() {
         let h = 22.0;
         line_left(
             ui,
@@ -1179,7 +1305,7 @@ fn name_cell(ui: &Ui, painter: &Painter, rect: Rect, job: &JobView, title: &str)
 
 fn progress_cell(ui: &mut Ui, painter: &Painter, rect: Rect, job: &JobView) {
     // A resolving job says what it is doing instead of pretending to have a bar.
-    if job.status == "resolving" {
+    if job.status == Status::Resolving {
         let text = if job.phase.is_empty() {
             status_label("resolving", &job.kind)
         } else {
@@ -1197,7 +1323,7 @@ fn progress_cell(ui: &mut Ui, painter: &Painter, rect: Rect, job: &JobView) {
         pos2(rect.left() + track_w / 2.0, rect.center().y),
         vec2(track_w, size::TRACK_H),
     );
-    track_bar(painter, track, track_fill_fraction(job), track_fill(&job.status));
+    track_bar(painter, track, track_fill_fraction(job), track_fill(job.status.as_str()));
     let pct = percent_text(job);
     if !pct.is_empty() {
         line_right(ui, painter, &pct, T_DETAIL, theme::TEXT_2, rect.right(), rect.center().y, pct_w);
@@ -1223,16 +1349,16 @@ fn track_bar(painter: &Painter, rect: Rect, fraction: Option<f32>, fill: Color32
 fn pill(ui: &mut Ui, painter: &Painter, rect: Rect, job: &JobView) {
     let text = status_text(job);
     let dot = pos2(rect.left() + 3.5, rect.center().y);
-    if let Some(halo) = status_halo(&job.status) {
+    if let Some(halo) = status_halo(job.status.as_str()) {
         painter.circle_stroke(dot, 5.0, Stroke::new(3.0_f32, halo));
     }
-    painter.circle_filled(dot, 3.5, status_dot_color(&job.status));
+    painter.circle_filled(dot, 3.5, status_dot_color(job.status.as_str()));
     line_left(
         ui,
         painter,
         &text,
         T_NOTE,
-        status_text_color(&job.status),
+        status_text_color(job.status.as_str()),
         rect.left() + 14.0,
         rect.center().y,
         (rect.width() - 14.0).max(0.0),
@@ -1265,11 +1391,10 @@ fn actions_cell(ui: &mut Ui, rect: Rect, job: &JobView, is_open: bool) -> Option
         icons.push((Glyph::Retry, "Retry", Action::Retry(job.id.clone())));
     }
     if shown.reveal {
-        icons.push((Glyph::Reveal, "Show in Finder", Action::NotConnected("Show in Finder")));
+        icons.push((Glyph::Reveal, "Show in Finder", Action::Reveal(job.id.clone())));
     }
     if shown.copy_link {
-        let link = if job.link.is_empty() { None } else { Some(job.link.clone()) };
-        icons.push((Glyph::Copy, "Copy share link", Action::CopyLink(link)));
+        icons.push((Glyph::Copy, "Copy share link", Action::Share(job.id.clone())));
     }
     if shown.open {
         icons.push((Glyph::Open, "Open in Frame.io", Action::Open(job.link.clone())));
@@ -1451,12 +1576,12 @@ fn file_row(ui: &mut Ui, file: &FileView, kind: &str, last: bool) {
     x += cols.size + GRID_GAP;
 
     let track = Rect::from_center_size(pos2(x + cols.track / 2.0, cy), vec2(cols.track, 3.0));
-    track_bar(&painter, track, Some(file_fraction(file)), file_track_fill(&file.status));
+    track_bar(&painter, track, Some(file_fraction(file)), file_track_fill(file.status.as_str()));
     x += cols.track + GRID_GAP;
 
     let status = file_status_text(file, kind);
     let status_w = (rect.right() - ROW_PAD_X - x).max(0.0);
-    line_left(ui, &painter, &status, T_DETAIL, file_status_color(&file.status), x, cy, status_w);
+    line_left(ui, &painter, &status, T_DETAIL, file_status_color(file.status.as_str()), x, cy, status_w);
     let id = ui.make_persistent_id(("transfers-file-status", &file.rel_path, &file.name));
     ui.interact(Rect::from_min_size(pos2(x, cy - 8.0), vec2(status_w, 16.0)), id, Sense::hover())
         .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &status));
@@ -1464,34 +1589,52 @@ fn file_row(ui: &mut Ui, file: &FileView, kind: &str, last: bool) {
 
 // ---------- reporting a click ----------
 
-fn report(ui: &Ui, state: &mut UiState, action: Action) {
+fn report(state: &mut UiState, action: Action) {
     match action {
+        // The two clicks that are the screen's own state and nothing else.
         Action::Toggle(id) => {
             state.expanded =
                 if state.expanded.as_deref() == Some(id.as_str()) { None } else { Some(id) };
         }
-        Action::CopyLink(Some(link)) => {
-            ui.ctx().copy_text(link);
-            state.push_toast("Share link copied", ToastKind::Ok);
+        Action::SetUp => state.view = View::Settings,
+
+        // Everything else is one thing the app does (`fiotransfer_core::App`).
+        Action::Cancel(id) => state.ask(Request::Cancel(id)),
+        Action::Retry(id) => state.ask(Request::Retry(id)),
+        Action::Share(id) => state.ask(Request::ShareLink(id)),
+        Action::Reveal(id) => {
+            // `.a-reveal` reveals the job's destination: `call('Reveal', el.dataset.dest)`.
+            let dest = state
+                .snapshot
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .map(|job| job.dest.clone())
+                .filter(|dest| !dest.is_empty());
+            if let Some(dest) = dest {
+                state.ask(Request::Reveal(dest));
+            }
         }
-        Action::CopyLink(None) => {
-            state.push_toast("This transfer has no share link yet", ToastKind::Err);
+        Action::Open(link) => state.ask(Request::OpenUrl(link)),
+        Action::StartDownload { link, passphrase, subfolder } => {
+            let dest_dir = state.download_dir.clone();
+            state.ask(Request::StartDownload { link, passphrase, dest_dir, subfolder });
+            // The typed link is spent: `S.linkInfo = null` in `startDownload()`.
+            state.link_info = None;
         }
-        Action::Open(link) => {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(link));
-        }
-        Action::StartDownload => {
-            ui.ctx().copy_text(String::new()); // no clipboard write; the host starts the transfer
-            state.push_toast("Download is not connected in the egui front end yet", ToastKind::Info);
-        }
-        Action::Cancel(_)
-        | Action::Retry(_)
-        | Action::Reveal(_)
-        | Action::ClearFinished
-        | Action::NotConnected(_) => {
-            // `model::UiState` carries no host request channel, so the screen says
-            // what it would have done instead of pretending it happened.
-            state.push_toast("Not connected in the egui front end yet", ToastKind::Info);
+        Action::ClearFinished => state.ask(Request::ClearFinished),
+        Action::PickFiles => state.ask(Request::PickFiles),
+        Action::PickFolder => state.ask(Request::PickFolder),
+        Action::Paste => state.ask(Request::Paste),
+        Action::PickDownloadDir => state.ask(Request::PickDownloadDir),
+        Action::SignIn => state.ask(Request::Login),
+        Action::ChooseDestination => {
+            // The webview's destination modal (`openDest`) has not been ported to
+            // this window: say that, rather than that the app is disconnected.
+            state.push_toast(
+                "Choosing a destination is not built in this window yet",
+                ToastKind::Info,
+            );
         }
     }
 }
@@ -1675,12 +1818,12 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
-    fn stamp_job(id: &str, kind: &str, title: &str, status: &str, started_at: i64) -> JobView {
+    fn stamp_job(id: &str, kind: &str, title: &str, status: Status, started_at: i64) -> JobView {
         JobView {
             id: id.to_string(),
             kind: kind.to_string(),
             title: title.to_string(),
-            status: status.to_string(),
+            status,
             started_at,
             dest: "Delivery / Reel 1".to_string(),
             ..JobView::default()
@@ -1690,7 +1833,7 @@ mod tests {
     /// Three jobs in three states, exactly what the screen has to keep apart:
     /// one uploading, one failed, one finished.
     fn three_jobs() -> Vec<JobView> {
-        let mut running = stamp_job("a", "upload", "clip-a.mov", "running", 300);
+        let mut running = stamp_job("a", "upload", "clip-a.mov", Status::Running, 300);
         running.total = 100;
         running.done = 25;
         running.speed = 10_485_760.0;
@@ -1699,7 +1842,7 @@ mod tests {
         running.files_done = 1;
         running.files_active = 1;
 
-        let mut failed = stamp_job("b", "download", "clip-b.mov", "failed", 200);
+        let mut failed = stamp_job("b", "download", "clip-b.mov", Status::Failed, 200);
         failed.source = "https://acme.frame.io/s/abc123/".to_string();
         failed.dest = "~/Movies/Reel 1".to_string();
         failed.total = 50;
@@ -1707,7 +1850,7 @@ mod tests {
         failed.error = "The share link has expired".to_string();
         failed.files_total = 1;
 
-        let mut done = stamp_job("c", "upload", "clip-c.mov", "done", 100);
+        let mut done = stamp_job("c", "upload", "clip-c.mov", Status::Done, 100);
         done.total = 200;
         done.done = 200;
         done.elapsed = 65.0;
@@ -1726,7 +1869,7 @@ mod tests {
                 rel_path: "scene/one.mov".to_string(),
                 size: 100,
                 done: 40,
-                status: "running".to_string(),
+                status: Status::Running,
                 ..FileView::default()
             },
             FileView {
@@ -1734,7 +1877,7 @@ mod tests {
                 rel_path: "scene/two.mov".to_string(),
                 size: 100,
                 done: 100,
-                status: "done".to_string(),
+                status: Status::Done,
                 ..FileView::default()
             },
         ]
@@ -1805,7 +1948,7 @@ mod tests {
 
     #[test]
     fn every_status_says_what_the_webview_front_end_says() {
-        let mut job = stamp_job("x", "upload", "clip.mov", "running", 0);
+        let mut job = stamp_job("x", "upload", "clip.mov", Status::Running, 0);
         job.eta = 65.0;
         assert_eq!(status_text(&job), "1m 05s left");
 
@@ -1818,12 +1961,12 @@ mod tests {
         job.done = 100;
         assert_eq!(status_text(&job), "Verifying");
 
-        let mut done = stamp_job("x", "upload", "clip.mov", "done", 0);
+        let mut done = stamp_job("x", "upload", "clip.mov", Status::Done, 0);
         done.files_total = 12;
         done.elapsed = 65.0;
         assert_eq!(status_text(&done), "12 files · 1m 05s");
 
-        let mut partial = stamp_job("x", "upload", "clip.mov", "partial", 0);
+        let mut partial = stamp_job("x", "upload", "clip.mov", Status::Partial, 0);
         partial.files_total = 4;
         partial.files_failed = 2;
         assert_eq!(status_text(&partial), "2 of 4 failed");
@@ -1836,7 +1979,7 @@ mod tests {
 
     #[test]
     fn the_cells_word_the_sizes_speeds_and_file_counts_like_the_webview() {
-        let mut running = stamp_job("x", "upload", "clip.mov", "running", 0);
+        let mut running = stamp_job("x", "upload", "clip.mov", Status::Running, 0);
         running.total = 1_500_000;
         running.done = 750_000;
         running.files_total = 4;
@@ -1846,7 +1989,7 @@ mod tests {
         assert_eq!(percent_text(&running), "50%");
         assert_eq!(bar_fraction(&running), Some(0.5));
 
-        let mut done = stamp_job("x", "upload", "clip.mov", "done", 0);
+        let mut done = stamp_job("x", "upload", "clip.mov", Status::Done, 0);
         done.total = 1_500_000;
         done.done = 1_500_000;
         done.files_total = 1;
@@ -1855,7 +1998,7 @@ mod tests {
         assert_eq!(file_count(&done), "1 of 1 file");
         assert_eq!(percent_text(&done), "100%");
 
-        let unknown = stamp_job("x", "upload", "clip.mov", "resolving", 0);
+        let unknown = stamp_job("x", "upload", "clip.mov", Status::Resolving, 0);
         assert_eq!(size_text(&unknown), "—");
         assert_eq!(speed_text(&unknown), "—");
         assert_eq!(percent_text(&unknown), "");
@@ -1864,7 +2007,7 @@ mod tests {
         assert_eq!(short_link("https://acme.frame.io/s/abc/"), "acme.frame.io/s/abc");
         assert_eq!(short_link("acme.frame.io/s/abc"), "acme.frame.io/s/abc");
 
-        let mut download = stamp_job("x", "download", "clip.mov", "running", 0);
+        let mut download = stamp_job("x", "download", "clip.mov", Status::Running, 0);
         download.source = "https://acme.frame.io/s/abc/".to_string();
         download.dest = "~/Movies".to_string();
         download.files_total = 2;
@@ -1874,21 +2017,21 @@ mod tests {
 
     #[test]
     fn the_file_rows_word_and_colour_their_states_like_the_webview() {
-        let mut failed = FileView { status: "failed".to_string(), error: "disk full".to_string(), ..FileView::default() };
+        let mut failed = FileView { status: Status::Failed, error: "disk full".to_string(), ..FileView::default() };
         assert_eq!(file_status_text(&failed, "upload"), "disk full");
         failed.error.clear();
         assert_eq!(file_status_text(&failed, "upload"), "Failed");
         assert_eq!(file_status_color("failed"), theme::ERROR_TEXT);
 
-        let skipped = FileView { status: "skipped".to_string(), note: "unchanged".to_string(), ..FileView::default() };
+        let skipped = FileView { status: Status::Skipped, note: "unchanged".to_string(), ..FileView::default() };
         assert_eq!(file_status_text(&skipped, "upload"), "unchanged");
 
-        let retrying = FileView { status: "running".to_string(), retries: 1, ..FileView::default() };
+        let retrying = FileView { status: Status::Running, retries: 1, ..FileView::default() };
         assert_eq!(file_status_text(&retrying, "upload"), "Uploading · 1 retry");
-        let retrying = FileView { status: "running".to_string(), retries: 3, ..FileView::default() };
+        let retrying = FileView { status: Status::Running, retries: 3, ..FileView::default() };
         assert_eq!(file_status_text(&retrying, "upload"), "Uploading · 3 retries");
 
-        let mut done = FileView { status: "done".to_string(), size: 200, ..FileView::default() };
+        let mut done = FileView { status: Status::Done, size: 200, ..FileView::default() };
         assert_eq!(file_fraction(&done), 0.0);
         done.done = 50;
         assert!((file_fraction(&done) - 0.25).abs() < 1e-6);
@@ -1926,9 +2069,9 @@ mod tests {
         assert_eq!(ids, ["a", "b", "c"]);
 
         let files = vec![
-            FileView { rel_path: "done.mov".to_string(), status: "done".to_string(), ..FileView::default() },
-            FileView { rel_path: "run.mov".to_string(), status: "running".to_string(), ..FileView::default() },
-            FileView { rel_path: "bad.mov".to_string(), status: "failed".to_string(), ..FileView::default() },
+            FileView { rel_path: "done.mov".to_string(), status: Status::Done, ..FileView::default() },
+            FileView { rel_path: "run.mov".to_string(), status: Status::Running, ..FileView::default() },
+            FileView { rel_path: "bad.mov".to_string(), status: Status::Failed, ..FileView::default() },
         ];
         let order: Vec<&str> = ordered_files(&files).iter().map(|f| f.rel_path.as_str()).collect();
         assert_eq!(order, ["run.mov", "bad.mov", "done.mov"]);
@@ -2010,7 +2153,7 @@ mod tests {
 
     #[test]
     fn a_narrow_window_and_long_text_do_not_panic() {
-        let mut job = stamp_job("long", "upload", &"clip-".repeat(60), "running", 10);
+        let mut job = stamp_job("long", "upload", &"clip-".repeat(60), Status::Running, 10);
         job.dest = "/".repeat(400);
         job.files_total = 2;
         job.files_done = 1;
@@ -2045,7 +2188,7 @@ mod tests {
                 rel_path: format!("Day {}/f{i}.mov", i % 4),
                 size: 1_000_000,
                 done: 500_000,
-                status: if i % 3 == 0 { "done".to_string() } else { "queued".to_string() },
+                status: if i % 3 == 0 { Status::Done } else { Status::Queued },
                 ..FileView::default()
             })
             .collect();
@@ -2094,40 +2237,240 @@ mod tests {
     }
 
     #[test]
-    fn download_is_disabled_until_a_link_is_typed() {
+    fn download_is_disabled_until_a_link_is_typed_and_then_asks_for_the_transfer() {
         use egui::accesskit::Role;
         let mut harness = screen_harness(state_with(three_jobs(), Vec::new()));
 
         // An empty link: the button is inert (`#download-btn` starts disabled).
         harness.get_by_label("Download").click_accesskit();
         harness.run();
-        assert!(harness.state().toasts.is_empty(), "a disabled Download must do nothing");
+        assert!(harness.state().requests.is_empty(), "a disabled Download must do nothing");
 
-        // Type a link, then Download asks the host for the transfer.
+        // Type a link, tick "New folder", then Download asks for the transfer.
         let field = harness.get_by_role(Role::TextInput);
         field.click();
         field.type_text("https://acme.frame.io/s/abc");
         harness.run();
+        harness.get_by_label("New folder").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().link, "https://acme.frame.io/s/abc", "the buffer is the record");
+        harness.state_mut().download_dir = "/Users/chaos/Movies/Incoming".to_string();
+        harness.run();
         harness.get_by_label("Download").click_accesskit();
         harness.run();
-        assert_eq!(harness.state().toasts.len(), 1);
-        assert!(harness.state().toasts[0].text.starts_with("Download is not connected"));
+        assert_eq!(
+            harness.state().requests,
+            vec![Request::StartDownload {
+                link: "https://acme.frame.io/s/abc".to_string(),
+                passphrase: String::new(),
+                dest_dir: "/Users/chaos/Movies/Incoming".to_string(),
+                subfolder: true,
+            }]
+        );
+        assert!(harness.state().toasts.is_empty(), "Download says nothing of its own");
+        // `startDownload()` empties the field, and the state with it.
+        assert!(harness.state().link.is_empty());
     }
 
     #[test]
-    fn the_entry_buttons_report_that_they_are_not_connected_yet() {
-        let harness = screen_harness(state_with(Vec::new(), Vec::new()));
-        let mut harness = harness;
+    fn the_entry_buttons_ask_the_app_for_a_panel() {
+        let mut harness = screen_harness(state_with(Vec::new(), Vec::new()));
         harness.get_by_label("Files…").click_accesskit();
         harness.run();
-        let toasts = &harness.state().toasts;
-        assert_eq!(toasts.len(), 1);
-        assert_eq!(toasts[0].text, "Not connected in the egui front end yet");
+        assert_eq!(harness.state().requests, vec![Request::PickFiles]);
+
+        let mut harness = screen_harness(state_with(Vec::new(), Vec::new()));
+        harness.get_by_label("Folder…").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::PickFolder]);
+
+        // The download folder button is a panel too (`PickDownloadDir`).
+        let mut harness = screen_harness(state_with(Vec::new(), Vec::new()));
+        harness.get_by_label("Movies").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::PickDownloadDir]);
+    }
+
+    #[test]
+    fn the_download_folder_button_names_the_folder_that_will_be_written() {
+        // A folder chosen for this download (`S.dlDest`) wins over the setting.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.download_dir = "/Users/chaos/Movies/Incoming/Dailies".to_string();
+        let harness = screen_harness(state);
+        harness.get_by_label("Dailies");
+        assert_eq!(download_dir(harness.state()), "/Users/chaos/Movies/Incoming/Dailies");
+
+        // Nothing chosen: the setting is what the button names, as before.
+        let harness = screen_harness(state_with(Vec::new(), Vec::new()));
+        harness.get_by_label("Movies");
+        assert_eq!(download_dir(harness.state()), "/Users/chaos/Movies");
+    }
+
+    #[test]
+    fn the_composer_asks_for_the_clipboard_and_takes_what_the_shell_puts_back() {
+        let mut harness = screen_harness(state_with(Vec::new(), Vec::new()));
+        harness.get_by_label("Paste").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::Paste]);
+
+        // The shell answers by writing `UiState::link`; the field shows it, and
+        // the composer hands it back rather than overwriting it with its buffer.
+        harness.state_mut().link = "https://acme.frame.io/s/abc".to_string();
+        harness.run();
+        assert_eq!(harness.state().link, "https://acme.frame.io/s/abc");
+        harness.run();
+        assert_eq!(harness.state().link, "https://acme.frame.io/s/abc");
+    }
+
+    #[test]
+    fn a_link_the_state_already_holds_is_the_one_the_field_starts_with() {
+        // A fresh window with a link already in the state: the composer adopts it
+        // instead of starting empty and wiping it (`Composer::load`).
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.link = "https://acme.frame.io/s/abc".to_string();
+        state.passphrase = "secret".to_string();
+        state.new_folder = true;
+        let harness = screen_harness(state);
+        assert_eq!(harness.state().link, "https://acme.frame.io/s/abc");
+        assert_eq!(harness.state().passphrase, "secret");
+        assert!(harness.state().new_folder);
+        // A link in the state enables Download, so the passphrase field is drawn
+        // only when `InspectLink` asks for it — here it does not.
+        harness.get_by_label("Download");
+    }
+
+    #[test]
+    fn the_row_actions_ask_the_app_for_what_they_draw() {
+        // One click, one request: each harness answers a single row action.
+        let mut harness = screen_harness(state_with(three_jobs(), Vec::new()));
+        harness.get_by_label("Cancel").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::Cancel("a".to_string())]);
+
+        let mut harness = screen_harness(state_with(three_jobs(), Vec::new()));
+        harness.get_by_label("Retry").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::Retry("b".to_string())]);
+
+        let mut harness = screen_harness(state_with(three_jobs(), Vec::new()));
+        harness.get_by_label("Copy share link").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::ShareLink("c".to_string())]);
+
+        // `.a-reveal` reveals the job's destination, found by its id.
+        let mut harness = screen_harness(state_with(three_jobs(), Vec::new()));
+        harness.get_by_label("Show in Finder").click_accesskit();
+        harness.run();
+        assert_eq!(
+            harness.state().requests,
+            vec![Request::Reveal("~/Movies/Reel 1".to_string())]
+        );
+
+        let mut harness = screen_harness(state_with(three_jobs(), Vec::new()));
+        harness.get_by_label("Open in Frame.io").click_accesskit();
+        harness.run();
+        assert_eq!(
+            harness.state().requests,
+            vec![Request::OpenUrl("https://acme.frame.io/share/xyz".to_string())]
+        );
+
+        // `.head-actions`' "Clear finished".
+        let mut harness = screen_harness(state_with(three_jobs(), Vec::new()));
+        harness.get_by_label("Clear finished").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::ClearFinished]);
+    }
+
+    #[test]
+    fn the_destination_chip_says_the_picker_is_not_built_here() {
+        let mut harness = screen_harness(state_with(Vec::new(), Vec::new()));
+        harness.get_by_label("Delivery / Reel 1").click_accesskit();
+        harness.run();
+        // No request: the webview's destination modal is not in this window, and
+        // the toast says exactly that rather than that the app is disconnected.
+        assert!(harness.state().requests.is_empty());
+        assert_eq!(harness.state().toasts.len(), 1);
+        assert_eq!(
+            harness.state().toasts[0].text,
+            "Choosing a destination is not built in this window yet"
+        );
+    }
+
+    #[test]
+    fn the_signed_out_composer_asks_to_sign_in_or_opens_settings() {
+        // `#cta-signin` is `login()`.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.logged_in = false;
+        state.settings.client_id = "abc".to_string();
+        let mut harness = screen_harness(state);
+        harness.get_by_label("Sign in").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().requests, vec![Request::Login]);
+
+        // `#cta-setup` is `showView('settings')`: the client id is typed there.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.logged_in = false;
+        state.settings.client_id = String::new();
+        let mut harness = screen_harness(state);
+        harness.get_by_label("Set up").click_accesskit();
+        harness.run();
+        assert_eq!(harness.state().view, View::Settings);
+        assert!(harness.state().requests.is_empty());
+    }
+
+    #[test]
+    fn the_preview_line_is_the_one_set_preview_builds() {
+        let info = LinkInfo {
+            name: "Nightfall dailies".to_string(),
+            files: 42,
+            total_bytes: 21_500_000_000,
+            ..LinkInfo::default()
+        };
+        assert_eq!(preview_line(&info), "Nightfall dailies · 42 files · 21.5 GB");
+
+        let mut one = LinkInfo { files: 1, ..LinkInfo::default() };
+        assert_eq!(preview_line(&one), "Shared files · 1 file · 0 B");
+        one.unavailable = 2;
+        assert_eq!(preview_line(&one), "Shared files · 1 file · 0 B · 2 unavailable");
+    }
+
+    #[test]
+    fn the_passphrase_field_appears_when_the_link_needs_one() {
+        use egui::accesskit::Role;
+        // A typed link with no answer yet: one field, Download live.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.link = "https://acme.frame.io/s/abc".to_string();
+        let harness = screen_harness(state);
+        assert_eq!(harness.query_all_by_role(Role::TextInput).count(), 1);
+        assert!(harness.query_by_role(Role::PasswordInput).is_none());
+
+        // `InspectLink` says the link needs a passphrase: the second field appears.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.link = "https://acme.frame.io/s/abc".to_string();
+        state.link_info = Some(LinkInfo {
+            needs_passphrase: true,
+            error: "This link needs a passphrase".to_string(),
+            ..LinkInfo::default()
+        });
+        let harness = screen_harness(state);
+        harness.get_by_role(Role::PasswordInput); // `#passphrase`, now visible
+
+        // A link the app rejected outright leaves Download dim.
+        let mut state = state_with(Vec::new(), Vec::new());
+        state.link = "https://acme.frame.io/s/nope".to_string();
+        state.link_info = Some(LinkInfo {
+            error: "That link is not a share".to_string(),
+            ..LinkInfo::default()
+        });
+        let mut harness = screen_harness(state);
+        harness.get_by_label("Download").click_accesskit();
+        harness.run();
+        assert!(harness.state().requests.is_empty(), "a rejected link cannot download");
     }
 
     #[test]
     fn a_resolving_job_shows_its_phase_instead_of_a_bar() {
-        let mut job = stamp_job("r", "download", "portal-drop", "resolving", 10);
+        let mut job = stamp_job("r", "download", "portal-drop", Status::Resolving, 10);
         job.phase = "Reading the folder tree".to_string();
         job.files_total = 12;
         let state = screen_harness(state_with(vec![job], Vec::new()));

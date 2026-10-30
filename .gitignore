@@ -5,3 +5,5 @@ FioTransfer.app/
 # the wasm capture build output (egui-ui/bench/wasm-shots.sh builds it)
 egui-ui/web/dist/
 __pycache__/
+# cargo-packager output for the app (the release workflow builds it)
+dist-egui/

@@ -1,7 +1,7 @@
 //! The Space screen: what Frame.io is holding, per project.
 //!
-//! The egui reading of the webview's `#view-space` — `frontend/dist/index.html`,
-//! the Space section of `app.js`, and the `.space-*` block of `style.css`: a
+//! The egui reading of the webview's `#view-space` — the Space section of its
+//! `index.html` and `app.js`, and the `.space-*` block of `style.css`: a
 //! donut of the space each project takes, then a legend row per project with its
 //! colour, its name, the workspace and account it lives under, its size, its
 //! file count and a Delete button. The page head carries the total and Refresh,
@@ -29,7 +29,7 @@
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and the
 //! page head; the tokens come from [`crate::theme`].
 
-use crate::model::{fmt_bytes, SpaceAccount, SpaceRow, UiState, View};
+use crate::model::{fmt_bytes, Request, SpaceAccount, SpaceRow, UiState, View};
 use crate::theme;
 use egui::{
     Align, Color32, CornerRadius, Id, Label, Layout, Margin, Painter, Pos2, Rect, Response, RichText,
@@ -159,9 +159,24 @@ pub enum Action {
     },
 }
 
-/// The screen, for a shell that does not wire the actions yet.
+/// The screen, wired to the shell: every [`Action`] becomes the [`Request`] the
+/// shell knows the call for, the way `views::watch` and `views::history` ask.
 pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
-    let _ = show_with_actions(ui, state);
+    if let Some(action) = show_with_actions(ui, state) {
+        ask(state, action);
+    }
+}
+
+/// What an [`Action`] asks the app for. `Refresh` walks Frame.io again;
+/// `Delete` deletes one project there, naming the account as well as the
+/// project — the same project id can exist in a second account.
+fn ask(state: &mut UiState, action: Action) {
+    match action {
+        Action::Refresh => state.ask(Request::RefreshSpace),
+        Action::Delete { account_id, project_id, name } => {
+            state.ask(Request::DeleteProject { account_id, project_id, name })
+        }
+    }
 }
 
 /// The screen, reporting at most one [`Action`] per frame.
@@ -1699,6 +1714,60 @@ mod tests {
             seen.borrow().contains(&Action::Refresh),
             "actions seen: {:?}",
             seen.borrow()
+        );
+    }
+
+    /// `show` is what the shell draws, and on this line a view asks the app for
+    /// things by name: the screen's two `Action`s have to become the two
+    /// `Request`s the shell knows the calls for.
+    fn app_screen(state: UiState) -> Harness<'static, UiState> {
+        Harness::builder()
+            .with_size(vec2(956.0, 780.0))
+            .build_state(
+                |ctx, state: &mut UiState| {
+                    crate::app::apply_style_once(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| show(ui, state));
+                },
+                state,
+            )
+    }
+
+    #[test]
+    fn refresh_asks_the_shell_for_a_walk() {
+        let mut harness = app_screen(state_with(three_projects()));
+
+        harness
+            .get_all_by_label("Refresh")
+            .next()
+            .expect("the head's Refresh")
+            .click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::RefreshSpace),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_confirmed_delete_asks_the_shell_for_the_delete() {
+        let mut harness = app_screen(state_with(three_projects()));
+
+        harness.get_by_label("Delete Nightfall on Frame.io").click();
+        harness.run();
+        harness.run();
+        harness.get_by_label(CONFIRM_DELETE).click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::DeleteProject {
+                account_id: "acct-1".into(),
+                project_id: "proj-nightfall".into(),
+                name: "Nightfall".into(),
+            }),
+            "requests: {:?}",
+            harness.state().requests
         );
     }
 

@@ -1005,6 +1005,7 @@ proptest! {
                     direction: DIR_MIRROR.into(),
                     ignore_remote: false,
                     on_change: ON_CHANGE_KEEP.into(),
+                    origin: String::new(),
                 })
                 .expect("watch");
             let wf: Vec<WatchFile> = watch_files

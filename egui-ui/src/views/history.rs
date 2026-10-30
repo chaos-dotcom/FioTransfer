@@ -8,7 +8,7 @@
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`].
 
-use crate::model::{HistoryRow, UiState};
+use crate::model::{HistoryRow, Request, UiState};
 use crate::theme;
 use egui::{
     Align, Color32, CornerRadius, Id, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind,
@@ -67,6 +67,16 @@ impl KindFilter {
             KindFilter::Downloads => kind == "download",
         }
     }
+
+    /// The filter as the app spells it (`History(query, kind, 500)`): "" for
+    /// every kind, "upload" or "download" for one.
+    pub fn query(self) -> &'static str {
+        match self {
+            KindFilter::All => "",
+            KindFilter::Uploads => "upload",
+            KindFilter::Downloads => "download",
+        }
+    }
 }
 
 /// What the screen asks the shell to do.
@@ -82,9 +92,30 @@ pub enum Action {
     Filter { query: String, kind: KindFilter },
 }
 
-/// The screen, for a shell that does not wire the actions yet.
+/// How long the search box waits for typing to stop before it asks the app
+/// again: `$('#history-q').addEventListener('input', debounce(loadHistory, 250))`
+/// in app.js. The local filter narrows the rows already held on every keystroke,
+/// so nothing on screen waits for the round trip.
+const SEARCH_DEBOUNCE: f64 = 0.25;
+
+/// The screen, wired to the app: whatever [`show_with_actions`] reports is
+/// handed to the shell as a [`Request`].
 pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
-    let _ = show_with_actions(ui, state);
+    if let Some(action) = show_with_actions(ui, state) {
+        ask(state, action);
+    }
+}
+
+/// Hands one [`Action`] to the app, in the app's terms.
+fn ask(state: &mut UiState, action: Action) {
+    match action {
+        Action::OpenLogs => state.ask(Request::OpenLogs),
+        Action::ExportCsv => state.ask(Request::ExportCsv),
+        Action::Filter { query, kind } => state.ask(Request::History {
+            query,
+            kind: kind.query().to_string(),
+        }),
+    }
 }
 
 /// The screen, reporting at most one [`Action`] per frame.
@@ -114,28 +145,71 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
         .data(|data| data.get_temp::<KindFilter>(kind_id))
         .unwrap_or_default();
 
-    let mut filter_changed = false;
+    // When the field was last typed in, and the (query, kind) the app was last
+    // asked for: together they are the webview's `debounce(loadHistory, 250)`.
+    let pending_id = Id::new("fiotransfer-egui.history.pending");
+    let sent_id = Id::new("fiotransfer-egui.history.sent");
+
+    let mut query_changed = false;
+    let mut kind_changed = false;
     let filters_width = ui.available_width();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = theme::space::L;
 
         let search_width = (filters_width * 0.4).clamp(SEARCH_MIN_WIDTH, SEARCH_MAX_WIDTH);
-        filter_changed |= search_field(ui, search_width, &mut query);
-        filter_changed |= segmented(ui, &mut kind);
+        query_changed = search_field(ui, search_width, &mut query);
+        kind_changed = segmented(ui, &mut kind);
     });
 
     // `.list { margin-top: 20px }`
     ui.add_space(theme::space::HUGE);
 
-    if filter_changed {
+    // A kind button reloads the table on the click (`#history-kind button`), and
+    // cancels a query that was still waiting.
+    let now = ui.input(|input| input.time);
+    let mut wanted: Option<(String, KindFilter)> = None;
+    if query_changed {
         ui.data_mut(|data| {
             data.insert_temp(query_id, query.clone());
+            data.insert_temp(pending_id, now);
+        });
+    }
+    if kind_changed {
+        ui.data_mut(|data| {
             data.insert_temp(kind_id, kind);
+            data.remove_temp::<f64>(pending_id);
         });
-        action = Some(Action::Filter {
-            query: query.clone(),
-            kind,
-        });
+        wanted = Some((query.clone(), kind));
+    }
+
+    // The query is asked once the field has been quiet for the debounce.
+    if let Some(at) = ui.data(|data| data.get_temp::<f64>(pending_id)) {
+        let waited = now - at;
+        if waited >= SEARCH_DEBOUNCE {
+            ui.data_mut(|data| {
+                data.remove_temp::<f64>(pending_id);
+            });
+            wanted.get_or_insert_with(|| (query.clone(), kind));
+        } else {
+            // No keystroke will come: ask for the frame that does the asking.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(SEARCH_DEBOUNCE - waited));
+        }
+    }
+
+    if let Some((wanted_query, wanted_kind)) = wanted {
+        let asked = ui.data(|data| data.get_temp::<(String, KindFilter)>(sent_id));
+        if asked != Some((wanted_query.clone(), wanted_kind)) {
+            ui.data_mut(|data| {
+                data.insert_temp(query_id, wanted_query.clone());
+                data.insert_temp(kind_id, wanted_kind);
+                data.insert_temp(sent_id, (wanted_query.clone(), wanted_kind));
+            });
+            action = Some(Action::Filter {
+                query: wanted_query,
+                kind: wanted_kind,
+            });
+        }
     }
 
     // ---------- table ----------
@@ -702,6 +776,97 @@ mod tests {
             seen.borrow().contains(&Action::ExportCsv),
             "actions seen: {:?}",
             seen.borrow()
+        );
+    }
+
+    #[test]
+    fn the_kind_filter_is_spelled_the_way_the_app_takes_it() {
+        assert_eq!(KindFilter::All.query(), "");
+        assert_eq!(KindFilter::Uploads.query(), "upload");
+        assert_eq!(KindFilter::Downloads.query(), "download");
+    }
+
+    #[test]
+    fn open_log_folder_asks_the_app() {
+        let mut harness = screen_harness(UiState {
+            history: three_rows(),
+            ..UiState::default()
+        });
+
+        harness.get_by_label("Open log folder").click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::OpenLogs),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn export_csv_asks_the_app() {
+        let mut harness = screen_harness(UiState {
+            history: three_rows(),
+            ..UiState::default()
+        });
+
+        harness.get_by_label("Export CSV").click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::ExportCsv),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_kind_filter_asks_the_app_at_once() {
+        let mut harness = screen_harness(UiState {
+            history: three_rows(),
+            ..UiState::default()
+        });
+
+        // A segmented button reloads the table on the click, undebounced.
+        harness.get_by_label("Downloads").click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::History {
+                query: String::new(),
+                kind: "download".to_string(),
+            }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn typing_asks_the_app_once_the_debounce_elapses() {
+        let mut harness = screen_harness(UiState {
+            history: three_rows(),
+            ..UiState::default()
+        });
+
+        {
+            let field = harness.get_by_role(egui::accesskit::Role::TextInput);
+            field.focus();
+            field.type_text("reel");
+        }
+        harness.run();
+        // The rows already held are narrowed at once; the app is asked later.
+        harness.get_by_label("Reel A.mov");
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::History {
+                query: "reel".to_string(),
+                kind: String::new(),
+            }),
+            "requests: {:?}",
+            harness.state().requests
         );
     }
 

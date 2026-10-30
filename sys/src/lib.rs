@@ -1,27 +1,23 @@
 //! FioTransfer's C boundary.
 //!
 //! Everything the app cannot write without `unsafe` lives here, and only here:
-//! the `extern "C"` declarations for the AppKit shims in `mac/` (compiled and
-//! linked by the app crate's `build.rs`; this crate only declares them) and the
-//! handful of `libc` calls the app needs. The app crate is
-//! `#![forbid(unsafe_code)]`, so this is the one crate in the workspace allowed
-//! to write it.
+//! the handful of `libc` calls the engine needs — the hostname, the machine's
+//! time zone, a mount's flags, a write permission, a `setsid()` that outlives the
+//! app, `strerror`, `isatty` and the process' SIGINT disposition. The app crate
+//! and `fiotransfer-core` are `#![forbid(unsafe_code)]`, so this is the one crate
+//! in the workspace allowed to write it.
 //!
-//! Everything public in this crate is a safe function: `&str` and `String` go
-//! in and out, and the `CString`/`CStr`/`fioFree` work stays inside. The
-//! AppKit code is macOS-only, gated on `target_os = "macos"`; the same
-//! functions exist elsewhere and do nothing, so the crate still type-checks on
-//! a platform that has no `mac/` shims to call.
+//! It used to hold the AppKit shims too — the menu bar item, the download panel,
+//! the Finder services, the file panels and the webview's window. All of that
+//! went with the WKWebView shell; what is left is `std`-shaped and links into any
+//! binary, on all three platforms.
+//!
+//! Everything public in this crate is a safe function: `&str` and `String` go in
+//! and out, and the `CString`/`CStr` work stays inside. The macOS-only pieces are
+//! gated on the target; the same functions exist elsewhere and answer "no", so
+//! the crate still type-checks on a platform with no `libc` to call.
 
-#![allow(unsafe_code)] // the workspace's C boundary: the shim declarations, the pointer reads they need, and the libc calls
+#![allow(unsafe_code)] // the workspace's C boundary: the pointer reads the libc calls need
 
-pub mod dialogs;
-pub mod gui;
+pub mod fs;
 pub mod platform;
-pub mod quick;
-pub mod services;
-pub mod strings;
-pub mod tray;
-
-pub use dialogs::take_string;
-pub use strings::{cstr, from_c_str};

@@ -1,5 +1,12 @@
-//! The shell: the window, the sidebar, the active screen, and the toasts.
-//! WORKER E owns this file.
+//! The window: the sidebar, the active screen, the toasts, and the app behind
+//! them.
+//!
+//! [`FioApp`] is the whole frame. With a [`Shell`] installed (`with_shell`) it
+//! pumps the real `fiotransfer_core::App` before it draws — requests out, state
+//! in — and hands the shell the two verdicts egui owns: whether the window may
+//! close, and the window's own repaint schedule. Without one (`new`, which is
+//! what the snapshot tests and `--fixture` build) it is a renderer over a
+//! `UiState` and nothing else: no runtime, no engine, no I/O.
 //!
 //! Everything here is furniture *around* a screen, mirroring the webview's
 //! `index.html` / `style.css`:
@@ -16,7 +23,7 @@
 //!     `--card` with a 7 px dot in the kind's accent.
 //!
 //! Colours, radii, type sizes and frames all come from [`crate::theme`], so this
-//! shell and the four screens cannot drift apart.
+//! shell and the five screens cannot drift apart.
 //!
 //! The page head (`h1` plus the screen's own buttons) belongs to the screen, the
 //! same as `index.html` puts `<header class="page-head">` inside each
@@ -56,11 +63,32 @@ pub const TOAST_DOT: f32 = theme::size::DOT;
 /// The window, with the state every screen draws from.
 pub struct FioApp {
     pub state: UiState,
+    /// The app behind the window: the runtime, the engine and the channel the
+    /// two talk over (`crate::shell`). `None` when there is no backend at all —
+    /// the snapshot tests, `--fixture`, and the browser capture.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub shell: Option<crate::shell::Shell>,
 }
 
 impl FioApp {
+    /// A window with no backend: what the snapshot tests, `--fixture` and the
+    /// browser capture build.
     pub fn new(state: UiState) -> Self {
-        FioApp { state }
+        FioApp {
+            state,
+            #[cfg(not(target_arch = "wasm32"))]
+            shell: None,
+        }
+    }
+
+    /// A window over the real app: `shell` answers every request the screens push
+    /// and keeps `state` current.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_shell(state: UiState, shell: crate::shell::Shell) -> Self {
+        FioApp {
+            state,
+            shell: Some(shell),
+        }
     }
 
     /// Draw one frame: sidebar, the active screen, then the toasts on top.
@@ -69,11 +97,57 @@ impl FioApp {
     /// harness, which is why it takes a plain `&egui::Context` and no frame.
     pub fn draw(&mut self, ctx: &egui::Context) {
         apply_style_once(ctx);
+        // The shell goes first: requests out, answers in, the app read on its
+        // tick — all before a single pixel of this frame.
+        self.drive_shell(ctx);
         self.tick_toasts(ctx);
         self.sidebar(ctx);
         self.screen(ctx);
         draw_toasts(ctx, &self.state.toasts);
     }
+
+    /// Pump the app, then act on what it asked egui for.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drive_shell(&mut self, ctx: &egui::Context) {
+        let Some(shell) = self.shell.as_mut() else { return };
+        shell.pump(&mut self.state);
+        if shell.take_focus() {
+            // `Host::show_window`: a Finder service or a sign-in brought the app
+            // back to the front.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if shell.take_close() {
+            // `Host::quit`, or the question answered with Quit.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // egui only draws when something asks it to; the shell's tick is what
+        // moves a transfer's progress, so it sets the pace.
+        ctx.request_repaint_after(shell.repaint_in());
+    }
+
+    /// No backend, no shell to pump: the browser capture and `--fixture` draw the
+    /// state they were given.
+    #[cfg(target_arch = "wasm32")]
+    fn drive_shell(&mut self, _ctx: &egui::Context) {}
+
+    /// A close was requested. With transfers running the shell asks first
+    /// (`Host::question`) and cancels this close; otherwise the app's
+    /// `shutdown()` runs here, before the window goes.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn on_close_requested(&mut self, ctx: &egui::Context) {
+        let Some(shell) = self.shell.as_mut() else { return };
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if shell.on_close_request() {
+            shell.shutdown();
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn on_close_requested(&mut self, _ctx: &egui::Context) {}
 
     /// The left panel: exactly [`SIDEBAR_WIDTH`] wide, no frame of its own.
     ///
@@ -134,6 +208,7 @@ impl FioApp {
 
 impl eframe::App for FioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.on_close_requested(ctx);
         self.draw(ctx);
     }
 

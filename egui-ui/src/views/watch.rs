@@ -9,7 +9,7 @@
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`].
 
-use crate::model::{UiState, WatchRow};
+use crate::model::{Request, ToastKind, UiState, WatchRow};
 use crate::theme;
 use egui::{
     Align, Color32, CornerRadius, Layout, Painter, Rect, RichText, Sense, Shape, Stroke, StrokeKind,
@@ -59,9 +59,45 @@ pub enum Action {
     Reveal(usize),
 }
 
-/// The screen, for a shell that does not wire the actions yet.
+/// The screen, wired to the app: whatever [`show_with_actions`] reports is
+/// handed to the shell as a [`Request`].
 pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
-    let _ = show_with_actions(ui, state);
+    if let Some(action) = show_with_actions(ui, state) {
+        ask(state, action);
+    }
+}
+
+/// Hands one [`Action`] to the app, in the app's terms.
+///
+/// A watch call is addressed by the app's watch id, which every row carries: the
+/// index the row reported is looked up on the state the click was drawn from, so
+/// the id is that row's and no other.
+fn ask(state: &mut UiState, action: Action) {
+    match action {
+        Action::AddWatch => state.ask(Request::AddWatch),
+        Action::SetEnabled { index, enabled } => {
+            if let Some(id) = state.watches.get(index).map(|watch| watch.id.clone()) {
+                state.ask(Request::SetWatchEnabled { id, on: enabled });
+            }
+        }
+        Action::Remove(index) => {
+            if let Some(id) = state.watches.get(index).map(|watch| watch.id.clone()) {
+                state.ask(Request::RemoveWatch(id));
+            }
+        }
+        Action::Reveal(index) => {
+            if let Some(local) = state.watches.get(index).map(|watch| watch.local.clone()) {
+                state.ask(Request::Reveal(local));
+            }
+        }
+        // The webview's watch editor (`.w-edit`, the folder + destination
+        // picker) was not ported to this window. The pencil stays where the
+        // webview draws it, and says so instead of pretending to open a dialog.
+        Action::Edit(_) => state.push_toast(
+            "The watch folder editor is not built in this window yet",
+            ToastKind::Info,
+        ),
+    }
 }
 
 /// The screen, reporting at most one [`Action`] per frame.
@@ -619,6 +655,9 @@ mod tests {
 
     fn watch(local: &str, label: &str, direction: &str, enabled: bool, pending: i64) -> WatchRow {
         WatchRow {
+            // The app's watch id, kept distinct from the path so a test can tell
+            // which one the screen used.
+            id: format!("id:{local}"),
             local: local.to_string(),
             label: label.to_string(),
             direction: direction.to_string(),
@@ -726,6 +765,109 @@ mod tests {
 
         assert!(!harness.state().watches[0].enabled);
         harness.get_by_label("Resume");
+    }
+
+    #[test]
+    fn the_pause_button_asks_the_app_with_the_rows_id() {
+        let mut harness = screen_harness(state_with(vec![
+            watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 0),
+            watch("/Users/chaos/Movies/In", "Inbox", "download", true, 7),
+        ]));
+
+        // The second row's pause, so the id has to be looked up, not guessed.
+        {
+            let buttons: Vec<_> = harness.get_all_by_label("Pause").collect();
+            if let Some(second) = buttons.last() {
+                second.click();
+            }
+        }
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::SetWatchEnabled {
+                id: "id:/Users/chaos/Movies/In".to_string(),
+                on: false,
+            }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn remove_and_reveal_ask_the_app() {
+        let mut harness = screen_harness(state_with(vec![watch(
+            "/Users/chaos/Movies/Rushes",
+            "Rushes 2026",
+            "upload",
+            true,
+            0,
+        )]));
+
+        harness.get_by_label("Remove").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::RemoveWatch("id:/Users/chaos/Movies/Rushes".to_string())),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        harness.get_by_label("Show in Finder").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::Reveal("/Users/chaos/Movies/Rushes".to_string())),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn add_asks_the_app_for_a_watch() {
+        let mut harness = screen_harness(state_with(Vec::new()));
+
+        harness.get_by_label("Add").click();
+        harness.run();
+
+        assert!(
+            harness.state().requests.contains(&Request::AddWatch),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_pencil_says_the_editor_is_not_built() {
+        let mut harness = screen_harness(state_with(vec![watch(
+            "/Users/chaos/Movies/Rushes",
+            "Rushes 2026",
+            "upload",
+            true,
+            0,
+        )]));
+
+        harness.get_by_label("Edit").click();
+        harness.run();
+
+        // Nothing is asked of the app: there is no editor to open yet.
+        assert!(
+            harness.state().requests.is_empty(),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        assert!(
+            harness
+                .state()
+                .toasts
+                .iter()
+                .any(|toast| toast.text.contains("not built in this window")),
+            "toasts: {:?}",
+            harness.state().toasts
+        );
     }
 
     #[test]

@@ -3,25 +3,25 @@ name: package
 # Builds unsigned binaries for macOS, Linux and Windows, and cuts a release when
 # the version in Cargo.toml is new.
 #
+# ONE APP. FioTransfer is the egui application (`egui-ui`, package
+# `fiotransfer-egui`). It is the only thing packaged, and it is packaged
+# everywhere: an unsigned .app, a .deb and an AppImage, and an NSIS installer.
+# The Wails-compatible WKWebView shell that used to be the macOS bundle is gone;
+# the root package is a CLI (`fio`) and a bench (`fio-bench`) and ships nothing.
+#
 # THE VERSION LIVES IN ONE PLACE: `[package] version` in Cargo.toml (currently
 # 1.3.0, the version the original app is at). Everything else follows it:
-#   * `APP_VERSION` below is read from the manifest, not written here;
-#   * both crates' packager metadata omit `version`, so the bundles take the
-#     crate version;
-#   * `src/lib.rs` reports `env!("CARGO_PKG_VERSION")` unless a build overrides
-#     it with FIO_VERSION (development builds);
+#   * the version job below reads the manifest, not this file;
+#   * every crate's packager metadata omits `version`, so each bundle takes the
+#     crate version — and the three crates are at the same one;
+#   * `fiotransfer_core::VERSION` reports `env!("CARGO_PKG_VERSION")` unless a
+#     build overrides it with FIO_VERSION (development builds);
 #   * a release is cut only when the tag for that version does not exist yet.
 # Bump Cargo.toml, push to main, and a release appears. Nothing else to edit.
 #
-# What is packaged where, and why it differs:
-#   * macOS   - the app as it ships: the Wails-compatible webview shell
-#               (`fiotransfer`), which is AppKit code and builds only there,
-#               plus the egui front end beside it.
-#   * Linux   - the egui front end only (`fiotransfer-egui`): eframe runs there,
-#               the AppKit shell does not exist.
-#   * Windows - the egui front end, same reason.
-#
-# Nothing is signed: no certificate, no notarisation, no Authenticode.
+# Nothing is signed: no certificate, no notarisation, no Authenticode. The macOS
+# bundle is ad-hoc signed, which is not a signature you can trust either — it
+# only stops Gatekeeper calling an unsigned download "damaged".
 
 on:
   push:
@@ -32,6 +32,7 @@ on:
   pull_request:
     paths:
       - "Cargo.toml"
+      - "core/Cargo.toml"
       - "egui-ui/Cargo.toml"
       - ".github/workflows/packager.yml"
       - "build/icons/**"
@@ -42,6 +43,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The one crate that produces an application.
+  APP: fiotransfer-egui
 
 jobs:
   version:
@@ -73,6 +76,7 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # macOS: the app as it ships, one bundle.
   macos:
     needs: version
     runs-on: macos-latest
@@ -83,28 +87,23 @@ jobs:
         with:
           tool: cargo-packager@0.11.8
       - uses: Swatinem/rust-cache@v2
-      # Both workspace members carry packager metadata, so this makes the AppKit
-      # app (dist/) and the egui app (dist-egui/), each stamped with the version.
+      # `egui-ui` carries the packager metadata; the bundle lands in dist-egui/.
       - name: Package (unsigned)
-        run: cargo packager --formats app
+        run: cargo packager -p "$APP" --formats app
       # An unsigned .app that arrives in a zip is quarantined by Gatekeeper and
       # macOS says it is "damaged". An ad-hoc signature makes it a normal
       # unidentified-developer app instead, which opens after right-click -> Open.
       - name: Ad-hoc sign (no certificate, no notarisation)
         run: |
           set -euo pipefail
-          codesign --force --deep -s - dist/FioTransfer.app
           codesign --force --deep -s - dist-egui/FioTransfer.app
-          codesign --verify --deep --strict dist/FioTransfer.app
           codesign --verify --deep --strict dist-egui/FioTransfer.app
-
-      - name: Name the bundles with the version
+      - name: Name the bundle with the version
         run: |
           set -euo pipefail
           V="${{ needs.version.outputs.version }}"
           mkdir -p out
-          ditto -c -k --keepParent dist/FioTransfer.app "out/FioTransfer-$V-macos-app.zip"
-          ditto -c -k --keepParent dist-egui/FioTransfer.app "out/FioTransfer-$V-macos-egui-app.zip"
+          ditto -c -k --keepParent dist-egui/FioTransfer.app "out/FioTransfer-$V-macos-app.zip"
           ls -l out
       - uses: actions/upload-artifact@v4
         with:
@@ -112,6 +111,7 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # Linux: the same app, as a .deb and an AppImage.
   linux:
     needs: version
     runs-on: ubuntu-latest
@@ -133,8 +133,8 @@ jobs:
             libgl1-mesa-dev libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libwayland-dev libudev-dev libssl-dev \
             fuse libfuse2 file
-      - name: Package the egui front end (unsigned)
-        run: cargo packager -p fiotransfer-egui --formats deb,appimage
+      - name: Package (unsigned)
+        run: cargo packager -p "$APP" --formats deb,appimage
       - name: Collect with the version in the name
         run: |
           set -euo pipefail
@@ -152,6 +152,7 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # Windows: the same app, as an NSIS installer.
   windows:
     needs: version
     runs-on: windows-latest
@@ -162,8 +163,8 @@ jobs:
         with:
           tool: cargo-packager@0.11.8
       - uses: Swatinem/rust-cache@v2
-      - name: Package the egui front end (unsigned)
-        run: cargo packager -p fiotransfer-egui --formats nsis
+      - name: Package (unsigned)
+        run: cargo packager -p "$env:APP" --formats nsis
       - name: Collect with the version in the name
         shell: bash
         run: |
@@ -207,8 +208,10 @@ jobs:
             --title "FioTransfer $VERSION" \
             --notes "Unsigned builds of FioTransfer $VERSION, from Cargo.toml.
 
-          macOS: the application as it ships (webview shell) and the egui front end.
-          Linux: the egui front end (.deb, .AppImage).
-          Windows: the egui front end (NSIS installer).
+          One app, three platforms: the same egui application, built from
+          \`egui-ui\` on the real engine (\`core/\`).
+          macOS: FioTransfer.app, ad-hoc signed.
+          Linux: .deb and .AppImage.
+          Windows: NSIS installer.
 
-          Nothing here is signed or notarised."
+          Nothing here is signed with a certificate or notarised."
