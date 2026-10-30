@@ -34,7 +34,7 @@
 //! The payload, which is the contract Portal's side is built against:
 //!
 //! ```json
-//! { "client_id": "0f0c1c1e-…-…", "name": "studio-mac", "app_version": "1.6.1",
+//! { "client_id": "0f0c1c1e-…-…", "name": "studio-mac", "app_version": "<the crate version>",
 //!   "platform": "macos-aarch64",
 //!   "lanes": [ { "link_id": "L1", "project": "20261028_YML-XMAS-Luc",
 //!                "local": "1_DRIVE", "direction": "download",
@@ -396,7 +396,7 @@ mod tests {
             lanes: lanes(&watches(), Path::new(root)),
         };
         let v: serde_json::Value = serde_json::to_value(&p).expect("it serializes");
-        assert_eq!(v["app_version"], "1.6.1", "the version is the crate's own");
+        assert_eq!(v["app_version"], env!("CARGO_PKG_VERSION"), "the version is the crate's own");
         assert_eq!(v["platform"], format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
         assert_eq!(v["name"], "studio-mac");
         let lane = &v["lanes"][1];
