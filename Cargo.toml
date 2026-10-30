@@ -49,3 +49,12 @@ proptest = "1.12.0"
 # goes through `fiotransfer-sys`.
 libc = "0.2"
 tempfile = "3.27.0"
+# The window `tests/portal_e2e.rs` presses: the app crate itself, and the two
+# crates `egui-ui/Cargo.toml` already tests with. Not a new harness — the same
+# `egui` / `egui_kittest` pair `egui-ui/tests/snapshots.rs` draws with. They are
+# here rather than in `egui-ui` because only this package may move `HOME`
+# (`std::env::set_var` is `unsafe` in edition 2024, which `egui-ui` forbids);
+# see the head of that test for the whole reason.
+egui = "0.33.3"
+egui_kittest = "0.33.3"
+fiotransfer-egui = { path = "egui-ui" }
