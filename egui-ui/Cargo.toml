@@ -25,9 +25,9 @@ path = "src/main.rs"
 required-features = ["native"]
 
 [dependencies]
-# Deliberately no dependency on the app crate: that would drag the webview
-# stack (wry/tao) into this build, and this front end only needs the same JSON
-# the webview front end receives.
+# The real app: this front end drives `fiotransfer_core::App` now, so there is one
+# model, one engine and one set of strings. The core holds no webview code (no
+# wry, no tao, no Objective-C), which is why this dependency is possible at all.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -37,6 +37,11 @@ egui = "0.33.3"
 # Rendering PNGs and the kittest harness are native-only: neither belongs in the
 # wasm build (egui_kittest pulls wgpu, `image` pulls its codec stack).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The engine, the Frame.io API and the platform seam. Native only: it is tokio,
+# rustls and rusqlite underneath, none of which build for wasm32 — the browser
+# capture is a renderer of the fixture and has no backend (see `src/wasm.rs`).
+fiotransfer-core = { path = "../core" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 egui_kittest = { version = "0.33.3", features = ["wgpu", "snapshot"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
@@ -52,13 +57,15 @@ web-sys = { version = "0.3", features = [
     "Window",
 ] }
 
-# Unsigned packaging of the cross-platform front end.
+# Unsigned packaging of THE app — this is the only bundle the release workflow
+# builds, on all three platforms.
 #   cargo packager -p fiotransfer-egui                       (platform defaults)
-#   cargo packager -p fiotransfer-egui --formats deb appimage
+#   cargo packager -p fiotransfer-egui --formats deb,appimage
 [package.metadata.packager]
 product-name = "FioTransfer"
 # version is taken from [package] above.
-identifier = "com.farbhaus.fiotransfer.egui"
+# The one app: the identifier the macOS bundle has carried since the Go version.
+identifier = "com.farbhaus.fiotransfer"
 out-dir = "../dist-egui"
 binaries-dir = "../target/release"
 icons = ["../build/icons/icon.icns", "../build/icons/icon_1024.png", "../build/icons/icon_512.png"]

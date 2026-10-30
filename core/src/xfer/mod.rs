@@ -465,7 +465,10 @@ pub const VERIFY_DELAYS: [u64; 6] = [3, 6, 12, 24, 45, 90];
 
 // ---------- Views sent to the frontend ----------
 
-#[derive(Debug, Clone, Serialize, Default)]
+/// `#[serde(default)]` is for the one reader that is not the app: a snapshot
+/// written by hand (`--snapshot`) may name only the fields it cares about.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
 pub struct JobView {
     pub id: String,
     pub kind: String,
@@ -492,7 +495,8 @@ pub struct JobView {
     pub watch: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
 pub struct FileView {
     pub name: String,
     pub rel_path: String,
@@ -506,12 +510,34 @@ pub struct FileView {
     pub retries: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
 pub struct Snapshot {
     pub jobs: Vec<JobView>,
     pub speed: f64,
     pub active_streams: i64,
     pub stream_limit: i64,
+}
+
+impl JobView {
+    /// Done, one way or another: `status.terminal()`.
+    pub fn terminal(&self) -> bool {
+        self.status.terminal()
+    }
+
+    /// 0.0–1.0, or `None` while the size isn't known yet.
+    pub fn progress(&self) -> Option<f32> {
+        if self.total <= 0 {
+            None
+        } else {
+            Some((self.done as f32 / self.total as f32).clamp(0.0, 1.0))
+        }
+    }
+
+    /// Whether this job is sending files to Frame.io.
+    pub fn is_upload(&self) -> bool {
+        self.kind == "upload"
+    }
 }
 
 /// A link as the composer shows it before downloading.

@@ -7,13 +7,20 @@
 //!
 //! Nothing here does I/O or touches a screen: it builds a [`UiState`] and stops.
 
-use crate::model::{FileView, HistoryRow, JobView, Settings, Snapshot, Toast, ToastKind, UiState, UpdateState, User, View, WatchRow, Crumb};
+use crate::model::{
+    Crumb, FileView, HistoryRow, JobView, Settings, Snapshot, Toast, ToastKind, UiState, UpdateState, User, View,
+    WatchRow,
+};
+
+/// The status a job carries, spelled the way the app spells it — the
+/// engine's type on native, the browser copy on wasm (`crate::model` picks).
+use crate::model::Status;
 
 fn job(
     id: &str,
     kind: &str,
     title: &str,
-    status: &str,
+    status: Status,
     total: i64,
     done: i64,
 ) -> JobView {
@@ -21,7 +28,7 @@ fn job(
         id: id.to_string(),
         kind: kind.to_string(),
         title: title.to_string(),
-        status: status.to_string(),
+        status,
         total,
         done,
         ..JobView::default()
@@ -34,7 +41,7 @@ pub fn fixture_state(view: View) -> UiState {
         "up-1",
         "upload",
         "A007_C012_sh010_v003.mov",
-        "running",
+        Status::Running,
         8_400_000_000,
         3_150_000_000,
     );
@@ -52,7 +59,7 @@ pub fn fixture_state(view: View) -> UiState {
         "dn-1",
         "download",
         "Nightfall_Ep04_Dailies",
-        "done",
+        Status::Done,
         21_500_000_000,
         21_500_000_000,
     );
@@ -70,7 +77,7 @@ pub fn fixture_state(view: View) -> UiState {
             rel_path: "A007_C012_sh010_v003.mov".into(),
             size: 2_100_000_000,
             done: 2_100_000_000,
-            status: "done".into(),
+            status: Status::Done,
             note: "Verified".into(),
             ..FileView::default()
         },
@@ -79,7 +86,7 @@ pub fn fixture_state(view: View) -> UiState {
             rel_path: "A007_C012_sh010_v003.mxf".into(),
             size: 6_300_000_000,
             done: 1_050_000_000,
-            status: "running".into(),
+            status: Status::Running,
             retries: 1,
             ..FileView::default()
         },
@@ -114,6 +121,7 @@ pub fn fixture_state(view: View) -> UiState {
 
     let watches = vec![
         WatchRow {
+            id: "w-renders".into(),
             local: "/Users/dana/Renders".into(),
             label: "Shows / Nightfall / Ep 04 / Renders".into(),
             direction: "upload".into(),
@@ -121,6 +129,7 @@ pub fn fixture_state(view: View) -> UiState {
             pending: 3,
         },
         WatchRow {
+            id: "w-dailies".into(),
             local: "/Users/dana/Downloads/Dailies".into(),
             label: "Shows / Nightfall / Ep 04 / Dailies".into(),
             direction: "download".into(),
@@ -135,6 +144,7 @@ pub fn fixture_state(view: View) -> UiState {
         user: Some(User {
             name: "Dana Whitfield".into(),
             email: "dana@nightfall.tv".into(),
+            ..User::default()
         }),
         settings: Settings {
             client_id: "9f2c1a4e".into(),
@@ -145,6 +155,7 @@ pub fn fixture_state(view: View) -> UiState {
             no_folder_logs: false,
             no_update_check: false,
             last_folder_label: "Shows / Nightfall / Ep 04 / Renders".into(),
+            ..Settings::default()
         },
         // The composer starts empty, as it does in the web front end: no link
         // typed, so no preview and Download stays dim.
@@ -193,5 +204,7 @@ pub fn fixture_state(view: View) -> UiState {
         },
         expanded: Some("up-1".into()),
         files,
+        // Nothing asked of the app: the fixture is a picture, not a session.
+        requests: Vec::new(),
     }
 }

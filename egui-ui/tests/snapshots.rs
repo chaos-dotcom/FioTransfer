@@ -3,8 +3,10 @@
 //! `cargo test -p fiotransfer-egui --test snapshots` renders the egui front end
 //! at 1180x780 (the window the webview gets, see `lib.rs`) for each of the four
 //! screens and writes `/tmp/egui-shots/{transfers,watch,history,settings}.png`.
-//! Those files are the artefact that gets compared against the webview's own
-//! screenshots of `frontend/dist`.
+//! Those files are the artefact: they are what the webview front end's own
+//! screenshots were compared against while both existed (see the README's
+//! pixel table). The webview is retired, so this is now the app's own render of
+//! the same four screens.
 //!
 //! The renderer is wgpu through `egui_kittest` (the crate's `wgpu` feature), so
 //! no window is needed. The fixture (`src/fixture.rs`, shared with the wasm
@@ -232,6 +234,7 @@ fn a_tall_screen_scrolls_instead_of_widening() {
     let mut state = fixture_state(View::Watch);
     state.watches = (0..60)
         .map(|i| WatchRow {
+            id: format!("w-reel-{i:03}"),
             local: format!("/Users/editor/Renders/Reel_{i:03}"),
             label: format!("Shows / Nightfall / Ep 04 / Renders/Reel_{i:03}"),
             direction: "upload".into(),

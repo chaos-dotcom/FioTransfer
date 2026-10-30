@@ -12,7 +12,7 @@
 //! the page head; the tokens come from [`crate::theme`]. `.settings
 //! { max-width: 680px }` is applied here because it is this screen's own measure.
 
-use crate::model::UiState;
+use crate::model::{Request, UiState};
 use crate::theme;
 use egui::{
     Align, Checkbox, CollapsingHeader, Color32, ComboBox, CornerRadius, Frame, Layout, Margin,
@@ -42,15 +42,16 @@ const CHECK_ROW_CONTROL: f32 = 19.0;
 /// draws the round handle without clipping it.
 const SLIDER_CONTROL: f32 = 10.0;
 
-/// `#streams-range { min="1" max="64" }`, widened to 1–128 by the brief.
-const STREAMS_MIN: i64 = 1;
-const STREAMS_MAX: i64 = 128;
+/// `#streams-range { min="1" max="64" }`, widened to 1–128 by the brief. The
+/// core's `Settings` counts streams and segments in `i32`.
+const STREAMS_MIN: i32 = 1;
+const STREAMS_MAX: i32 = 128;
 /// `#segment option` values, widened to 8–512 MiB by the brief.
-const SEGMENT_SIZES: [i64; 7] = [8, 16, 32, 64, 128, 256, 512];
-const SEGMENT_MIN: i64 = 8;
-const SEGMENT_MAX: i64 = 512;
+const SEGMENT_SIZES: [i32; 7] = [8, 16, 32, 64, 128, 256, 512];
+const SEGMENT_MIN: i32 = 8;
+const SEGMENT_MAX: i32 = 512;
 /// The port the local OAuth callback listens on when settings say nothing.
-const DEFAULT_REDIRECT_PORT: i64 = 8765;
+const DEFAULT_REDIRECT_PORT: i32 = 8765;
 
 /// What the screen asks the shell to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,10 +66,10 @@ pub enum Action {
     CopyRedirect(String),
     /// "Change…" for the download folder (`PickDownloadDir`).
     ChooseDownloadFolder,
-    /// The streams slider moved; the shell may debounce and save.
-    Streams(i64),
-    /// "Chunk size" picked a value.
-    Segment(i64),
+    /// The streams slider moved; `settings.streams` already holds the value.
+    Streams(i32),
+    /// "Chunk size" picked a value; `settings.segment_mb` already holds it.
+    Segment(i32),
     /// "Save log with media": the value of `no_folder_logs` it writes.
     FolderLogs(bool),
     /// "Check for updates": the value of `no_update_check` it writes.
@@ -81,9 +82,43 @@ pub enum Action {
     ShowLogs,
 }
 
-/// The screen, for a shell that does not wire the actions yet.
+/// The screen, wired to the app: whatever [`show_with_actions`] reports is
+/// handed to the shell as a [`Request`].
 pub fn show(ui: &mut egui::Ui, state: &mut UiState) {
-    let _ = show_with_actions(ui, state);
+    if let Some(action) = show_with_actions(ui, state) {
+        ask(state, action);
+    }
+}
+
+/// Hands one [`Action`] to the app, in the app's terms.
+///
+/// A setting is written into `state.settings` by the row that draws it, so the
+/// request only says "save this": the app reads the same struct the screen just
+/// wrote. `Update` and `Check now` are one button, and the update state says
+/// which of the two it is.
+fn ask(state: &mut UiState, action: Action) {
+    match action {
+        Action::SignIn => state.ask(Request::Login),
+        Action::SignOut => state.ask(Request::Logout),
+        Action::SaveClientId(client_id) => {
+            state.settings.client_id = client_id;
+            state.ask(Request::SaveSettings);
+        }
+        Action::CopyRedirect(uri) => state.ask(Request::CopyText(uri)),
+        Action::ChooseDownloadFolder => state.ask(Request::PickDownloadDir),
+        Action::Streams(_) | Action::Segment(_) | Action::FolderLogs(_) | Action::UpdateCheck(_) => {
+            state.ask(Request::SaveSettings)
+        }
+        Action::OpenAtLogin(on) => state.ask(Request::SetOpenAtLogin(on)),
+        Action::UpdateClicked => {
+            if state.update.available {
+                state.ask(Request::InstallUpdate);
+            } else {
+                state.ask(Request::CheckUpdate);
+            }
+        }
+        Action::ShowLogs => state.ask(Request::OpenLogs),
+    }
 }
 
 /// The screen, reporting at most one [`Action`] per frame.
@@ -170,17 +205,17 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
 
 /// A stored value clamped to the slider's range, so an out-of-range setting is
 /// shown at the nearest end instead of being dropped.
-pub fn clamped_streams(streams: i64) -> i64 {
+pub fn clamped_streams(streams: i32) -> i32 {
     streams.clamp(STREAMS_MIN, STREAMS_MAX)
 }
 
 /// A stored segment size clamped to the sizes the combo offers.
-pub fn clamped_segment(segment_mb: i64) -> i64 {
+pub fn clamped_segment(segment_mb: i32) -> i32 {
     segment_mb.clamp(SEGMENT_MIN, SEGMENT_MAX)
 }
 
 /// The redirect URI the setup steps ask the user to register.
-pub fn redirect_uri(port: i64) -> String {
+pub fn redirect_uri(port: i32) -> String {
     let port = if (1..=65535).contains(&port) {
         port
     } else {
@@ -874,6 +909,7 @@ mod tests {
             no_folder_logs: false,
             no_update_check: false,
             last_folder_label: String::new(),
+            ..Settings::default()
         }
     }
 
@@ -1044,6 +1080,7 @@ mod tests {
         settings.client_id = "abc123".to_string();
         let mut ui_state = state(settings, true);
         ui_state.user = Some(User {
+            id: "user-1".to_string(),
             name: "Ada Lovelace".to_string(),
             email: "ada@example.com".to_string(),
         });
@@ -1071,12 +1108,14 @@ mod tests {
         assert_eq!(sign_in_words(&ui_state), "Signed in");
 
         ui_state.user = Some(User {
+            id: String::new(),
             name: "  ".to_string(),
             email: "ada@example.com".to_string(),
         });
         assert_eq!(sign_in_words(&ui_state), "Signed in · ada@example.com");
 
         ui_state.user = Some(User {
+            id: String::new(),
             name: "Ada".to_string(),
             email: String::new(),
         });
@@ -1225,8 +1264,145 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_folder_and_log_shows_an_em_dash_for_each() {
+    fn saving_the_client_id_writes_the_field_and_asks_the_app_to_save() {
         let mut ui_state = state(Settings::default(), true);
+        ui_state.settings.client_id = "  abc123  ".to_string();
+        let mut harness = screen_harness(ui_state);
+
+        harness.get_by_label("Save").click();
+        harness.run();
+
+        assert_eq!(harness.state().settings.client_id, "abc123");
+        assert!(
+            harness.state().requests.contains(&Request::SaveSettings),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn copy_and_change_ask_the_app() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+
+        harness.get_by_label("Copy").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .requests
+                .contains(&Request::CopyText(redirect_uri(8765))),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        harness.get_by_label("Change…").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::PickDownloadDir),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        harness.get_by_label("Show in Finder").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::OpenLogs),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn sign_out_and_sign_in_ask_the_app() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+        harness.get_by_label("Sign out").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::Logout),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // Signed out with a client ID: the sign-in button is live.
+        let mut settings = Settings::default();
+        settings.client_id = "abc123".to_string();
+        let mut harness = screen_harness(state(settings, false));
+        harness.get_by_label("Sign in with Adobe").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::Login),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn check_now_checks_and_update_installs() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+
+        harness.get_by_label("Check now").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::CheckUpdate),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // An available release turns the same button into "Update".
+        harness.state_mut().update.available = true;
+        harness.state_mut().update.latest = "9.9.9".to_string();
+        harness.run();
+        harness.get_by_label("Update").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::InstallUpdate),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn the_toggles_ask_the_app_for_what_they_wrote() {
+        let mut harness = screen_harness(state(Settings::default(), true));
+
+        // "Open at login" is its own call, not a settings save.
+        {
+            let boxes = toggle_boxes(&harness);
+            if let Some(boxed) = boxes.first() {
+                boxed.click();
+            }
+        }
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SetOpenAtLogin(true)),
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // "Check for updates" writes `no_update_check` and saves it.
+        harness.state_mut().requests.clear();
+        {
+            let boxes = toggle_boxes(&harness);
+            if let Some(boxed) = boxes.get(1) {
+                boxed.click();
+            }
+        }
+        harness.run();
+        assert!(harness.state().settings.no_update_check);
+        assert!(
+            harness.state().requests.contains(&Request::SaveSettings),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn an_empty_folder_and_log_shows_an_em_dash_for_each() {
+        // The core's `Settings::default()` fills in `~/Downloads`; an unset
+        // folder is the empty string, which is what an em dash stands for.
+        let mut settings = Settings::default();
+        settings.download_dir = String::new();
+        let mut ui_state = state(settings, true);
         ui_state.log_dir = String::new();
         let harness = screen_harness(ui_state);
 

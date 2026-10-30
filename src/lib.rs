@@ -1,46 +1,23 @@
-
-//! FioTransfer — fast uploads to and downloads from Frame.io.
+//! FioTransfer — the CLI and bench host, over `fiotransfer-core`.
 //!
-//! A Rust port of the Go/Wails app of the same name: the same Frame.io V4 API,
-//! the same transfer engine behaviour, the same frontend assets rendered in the
-//! same WebKit view, and the same AppKit menu bar item, download panel and
-//! Finder services.
+//! The app is `fiotransfer-egui`: one binary, the real engine, no webview. This
+//! package keeps what a terminal needs — `fio` (upload, download, watch, history,
+//! export) and `fio-bench` (the transfer benchmarks) — plus the JSON bridge the
+//! webview front end used to call, which is now only a contract test
+//! ([`app::BridgeHost`], `tests/prop_bridge.rs`).
+//!
+//! Everything else is re-exported from the core, so `fiotransfer::xfer::…` and
+//! `fiotransfer::history::…` still name the same modules they always did.
 
 #![forbid(unsafe_code)]
 // Every `unsafe` in this workspace lives in the `fiotransfer-sys` crate: the
-// AppKit shims in `mac/` and the `libc` calls are declared and used there,
-// behind safe functions. This crate can't write `unsafe` at all — `forbid`,
-// not `deny`, so not even an `#[allow(unsafe_code)]` deeper down is possible.
-
-pub mod api;
-pub mod auth;
-pub mod config;
-pub mod limiter;
-pub mod localcert;
-pub mod netx;
-pub mod secret;
-
-pub mod history;
-pub mod share;
-pub mod update;
-pub mod xfer;
+// `libc` calls the platform needs. This crate can't write `unsafe` at all —
+// `forbid`, not `deny`, so not even an `#[allow(unsafe_code)]` deeper down is
+// possible.
 
 pub mod app;
-pub mod dialogs;
-pub mod gui;
-pub mod login;
-pub mod notify;
-pub mod quick;
-pub mod services;
-pub mod shot;
-pub mod tray;
 
-pub use app::App;
-
-/// The version this build reports: `Cargo.toml`'s, unless a build overrides it
-/// (`FIO_VERSION=0.0.0-abc1234` for a development build off a commit). One number,
-/// in one place, and the release workflow reads the same one.
-pub const VERSION: &str = match option_env!("FIO_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
+pub use fiotransfer_core::{
+    api, auth, config, history, host, limiter, localcert, login, netx, notify, secret, services,
+    share, update, xfer, App, Host, VERSION,
 };

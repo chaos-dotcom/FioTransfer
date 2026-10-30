@@ -28,7 +28,7 @@
 //! the two speeds are the sum of the per-job speeds by kind, as
 //! `renderSnapshot` computes `up`/`down` — not `snapshot.speed`.
 
-use crate::model::{fmt_speed, UiState, View};
+use crate::model::{Request, UiState, View, fmt_speed};
 use crate::theme;
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2,
@@ -535,12 +535,9 @@ fn account(ui: &mut egui::Ui, painter: &egui::Painter, l: &Layout, state: &mut U
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
         }
         if response.clicked() {
-            // The webview starts the Frame.io OAuth flow (`login()`); this front
-            // end has no OAuth yet, so say so instead of doing nothing.
-            state.push_toast(
-                "Sign in is not wired up in the egui front end yet",
-                crate::model::ToastKind::Info,
-            );
+            // `$$('#signin-btn, #cta-signin, #side-signin').onclick = login()`: the
+            // app runs the Frame.io OAuth flow and the shell says where it stands.
+            state.ask(Request::Login);
         }
 
         painter.rect_filled(row, theme::R_S, theme::CARD);
@@ -766,6 +763,7 @@ fn polyline(painter: &egui::Painter, points: &[Pos2], stroke: Stroke) {
 mod tests {
     use super::*;
     use crate::model::{JobView, Snapshot, User, WatchRow};
+    use fiotransfer_core::xfer::Status;
     use egui_kittest::{Harness, kittest::Queryable as _};
 
     const PANEL_H: f32 = 780.0;
@@ -773,7 +771,7 @@ mod tests {
     fn job(
         kind: &str,
         title: &str,
-        status: &str,
+        status: Status,
         total: i64,
         done: i64,
         speed: f64,
@@ -782,7 +780,7 @@ mod tests {
             id: title.to_owned(),
             kind: kind.to_owned(),
             title: title.to_owned(),
-            status: status.to_owned(),
+            status,
             total,
             done,
             speed,
@@ -798,14 +796,15 @@ mod tests {
             view: View::Transfers,
             logged_in: true,
             user: Some(User {
+                id: "u-dana".into(),
                 name: "Dana Okonkwo".into(),
                 email: "dana@fiorecut.tv".into(),
             }),
             snapshot: Snapshot {
                 jobs: vec![
-                    job("upload", "A001_C012_0714XY.mov", "running", 412_000_000, 168_000_000, 24_500_000.0),
-                    job("download", "Dailies 2026-10-24", "running", 2_100_000_000, 640_000_000, 8_200_000.0),
-                    job("upload", "B-roll select.mov", "done", 90_000_000, 90_000_000, 0.0),
+                    job("upload", "A001_C012_0714XY.mov", Status::Running, 412_000_000, 168_000_000, 24_500_000.0),
+                    job("download", "Dailies 2026-10-24", Status::Running, 2_100_000_000, 640_000_000, 8_200_000.0),
+                    job("upload", "B-roll select.mov", Status::Done, 90_000_000, 90_000_000, 0.0),
                 ],
                 speed: 32_700_000.0,
                 active_streams: 6,
@@ -813,6 +812,7 @@ mod tests {
             },
             watches: vec![
                 WatchRow {
+                    id: "w-incoming".into(),
                     local: "~/Movies/Incoming".into(),
                     label: "Incoming".into(),
                     direction: "upload".into(),
@@ -820,6 +820,7 @@ mod tests {
                     pending: 0,
                 },
                 WatchRow {
+                    id: "w-archive".into(),
                     local: "~/Movies/Archive".into(),
                     label: "Archive".into(),
                     direction: "download".into(),
@@ -1055,10 +1056,13 @@ mod tests {
     }
 
     #[test]
-    fn the_sign_in_button_says_it_is_not_wired_up() {
+    fn the_sign_in_button_asks_the_app_to_sign_in() {
         let mut harness = harness(UiState::default());
         harness.get_by_label("Sign in to Frame.io").click();
         harness.run();
-        assert!(!harness.state().toasts.is_empty());
+        // `login()` is one request to the shell, and no toast of its own: the app
+        // says where the sign-in stands.
+        assert_eq!(harness.state().requests, vec![Request::Login]);
+        assert!(harness.state().toasts.is_empty());
     }
 }

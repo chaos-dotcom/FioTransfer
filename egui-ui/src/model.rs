@@ -1,11 +1,37 @@
 //! What a screen needs in order to draw, in the terms the views speak.
 //!
-//! The webview front end receives this as JSON from `window.go.main.App[...]`;
-//! these are the typed versions of those payloads, so the two front ends can be
-//! driven by the same snapshot. Field names match `src/app.rs` and what
-//! `frontend/dist/app.js` reads on purpose — a mismatch here is a UI bug.
+//! The data types are the core's, not copies: a `JobView`, a `FileView`, a
+//! `Snapshot`, the `Settings` and the signed-in `User` are what
+//! `fiotransfer_core::xfer` and `fiotransfer_core::config` serialise, and the
+//! same structs the app's own methods answer with. There is one model now — a
+//! mismatch between the two front ends' idea of a job is not possible.
+//!
+//! One exception, and it is a build one: `fiotransfer-core` cannot compile for
+//! `wasm32` (tokio, rustls, rusqlite), so the browser capture gets the same five
+//! shapes from [`crate::model_browser`] instead. The re-export below is the whole
+//! of the difference; everything else in this file is one file for both targets.
+//!
+//! What stays here is what only a screen has an opinion about: which of the four
+//! screens is showing, the toast stack, the composer's text, and [`Request`] —
+//! what a screen asks the app to do.
 
 use serde::Deserialize;
+
+// Two sets of data shapes, one per target. The native build draws what the
+// engine produces, so it uses the core's own structs — there is one model, not a
+// copy that can drift. The browser capture (`src/wasm.rs`) has no engine to ask:
+// `fiotransfer-core` is tokio, rustls and rusqlite underneath and does not build
+// for `wasm32`, so it keeps the same five shapes in `model_browser.rs`, field for
+// field.
+#[cfg(not(target_arch = "wasm32"))]
+pub use fiotransfer_core::api::User;
+#[cfg(not(target_arch = "wasm32"))]
+pub use fiotransfer_core::config::Settings;
+#[cfg(not(target_arch = "wasm32"))]
+pub use fiotransfer_core::xfer::{FileView, JobView, Snapshot, Status};
+
+#[cfg(target_arch = "wasm32")]
+pub use crate::model_browser::*;
 
 /// Which of the four screens is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,89 +55,75 @@ impl View {
     pub const ALL: [View; 4] = [View::Transfers, View::Watch, View::History, View::Settings];
 }
 
-// ---------- the JSON the app already produces ----------
+// ---------- what a screen asks for ----------
 
-#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
-pub struct JobView {
-    #[serde(default)] pub id: String,
-    #[serde(default)] pub kind: String,
-    #[serde(default)] pub title: String,
-    #[serde(default)] pub source: String,
-    #[serde(default)] pub dest: String,
-    #[serde(default)] pub status: String,
-    #[serde(default)] pub phase: String,
-    #[serde(default)] pub error: String,
-    #[serde(default)] pub total: i64,
-    #[serde(default)] pub done: i64,
-    #[serde(default)] pub speed: f64,
-    #[serde(default)] pub eta: f64,
-    #[serde(default)] pub files_total: i64,
-    #[serde(default)] pub files_done: i64,
-    #[serde(default)] pub files_failed: i64,
-    #[serde(default)] pub files_active: i64,
-    #[serde(default)] pub started_at: i64,
-    #[serde(default)] pub finished_at: i64,
-    #[serde(default)] pub elapsed: f64,
-    #[serde(default)] pub avg_speed: f64,
-    #[serde(default)] pub link: String,
-    #[serde(default)] pub watch: bool,
-}
+/// One thing a screen asked the app to do this frame.
+///
+/// A view is a pure renderer over [`UiState`]: it never opens a panel, never
+/// talks to Frame.io and never touches a file. It pushes a `Request` instead,
+/// and the shell (`crate::shell`) hands it to the real `App` — the same call the
+/// webview front end made through `window.go.main.App[...]`, named here in Rust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    /// A file or folder panel; the answer comes back as new state.
+    PickFiles,
+    PickFolder,
+    PickWatchFolder,
+    PickDownloadDir,
 
-impl JobView {
-    pub fn terminal(&self) -> bool {
-        matches!(self.status.as_str(), "done" | "partial" | "failed" | "canceled" | "skipped")
-    }
-    /// 0.0–1.0, or None while the size isn't known yet.
-    pub fn progress(&self) -> Option<f32> {
-        if self.total <= 0 {
-            None
-        } else {
-            Some((self.done as f32 / self.total as f32).clamp(0.0, 1.0))
-        }
-    }
-    pub fn is_upload(&self) -> bool {
-        self.kind == "upload"
-    }
-}
+    /// Upload these paths to the remembered destination (`StartUpload`).
+    StartUpload(Vec<String>),
+    /// What `InspectLink` says about a typed link; the answer fills
+    /// `UiState::link_info`.
+    InspectLink { link: String, passphrase: String },
+    /// The composer's Download button (`StartDownload`).
+    StartDownload { link: String, passphrase: String, dest_dir: String, subfolder: bool },
+    Cancel(String),
+    Retry(String),
+    /// `ClearFinished`.
+    ClearFinished,
+    /// The job's public share link; the shell copies it and says so (`ShareLink`).
+    ShareLink(String),
+    /// Show a path in the file manager (`Reveal`).
+    Reveal(String),
 
-#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
-pub struct FileView {
-    #[serde(default)] pub name: String,
-    #[serde(default)] pub rel_path: String,
-    #[serde(default)] pub local_path: String,
-    #[serde(default)] pub size: i64,
-    #[serde(default)] pub done: i64,
-    #[serde(default)] pub status: String,
-    #[serde(default)] pub error: String,
-    #[serde(default)] pub note: String,
-    #[serde(default)] pub view_url: String,
-    #[serde(default)] pub retries: i64,
-}
+    /// Ask the history store again (`History(query, kind, 500)`).
+    History { query: String, kind: String },
+    /// Write the history to a CSV the user picks (`ExportHistory`).
+    ExportCsv,
+    /// Open the log folder (`OpenLogs`).
+    OpenLogs,
 
-#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
-pub struct Snapshot {
-    #[serde(default)] pub jobs: Vec<JobView>,
-    #[serde(default)] pub speed: f64,
-    #[serde(default)] pub active_streams: i64,
-    #[serde(default)] pub stream_limit: i64,
-}
+    /// Paste the clipboard into the composer's link field (`ClipboardText`,
+    /// then `InspectLink`).
+    Paste,
+    /// Open a URL in the browser (`OpenURL`).
+    OpenUrl(String),
+    /// Put text on the clipboard.
+    CopyText(String),
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct Settings {
-    #[serde(default)] pub client_id: String,
-    #[serde(default)] pub redirect_port: i64,
-    #[serde(default)] pub streams: i64,
-    #[serde(default)] pub segment_mb: i64,
-    #[serde(default)] pub download_dir: String,
-    #[serde(default)] pub no_folder_logs: bool,
-    #[serde(default)] pub no_update_check: bool,
-    #[serde(default)] pub last_folder_label: String,
-}
+    /// `SaveSettings` (and `SetUploadDestination` when the destination is what
+    /// changed).
+    SaveSettings,
+    SetOpenAtLogin(bool),
+    Login,
+    Logout,
+    /// `CheckForUpdate` / `InstallUpdate`.
+    CheckUpdate,
+    InstallUpdate,
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct User {
-    #[serde(default)] pub name: String,
-    #[serde(default)] pub email: String,
+    /// Ask for the watch list again (`Watches`).
+    Watches,
+    /// Pick a folder, then a destination, and watch it (`AddWatch`).
+    AddWatch,
+    SetWatchEnabled { id: String, on: bool },
+    RemoveWatch(String),
+    RequeueCanceled(String),
+
+    /// Read everything again (the first frame, and after an event).
+    Refresh,
+    /// The user closed the window (the shell asks before quitting).
+    Quit,
 }
 
 // ---------- everything a screen draws from ----------
@@ -154,6 +166,9 @@ pub struct UiState {
     /// The expanded job whose files are listed, and its files.
     pub expanded: Option<String>,
     pub files: Vec<FileView>,
+    /// What the screens asked the app to do since the last frame; the shell
+    /// drains it before drawing.
+    pub requests: Vec<Request>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -184,8 +199,27 @@ pub struct LinkInfo {
     pub needs_passphrase: bool,
 }
 
+impl LinkInfo {
+    /// The app's answer, as the composer wants it (`fiotransfer_core::xfer::LinkInfo`).
+    ///
+    /// Native only: the browser capture has no app to ask, so it has no such
+    /// conversion and no `fiotransfer_core` to name.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_core(li: fiotransfer_core::xfer::LinkInfo) -> LinkInfo {
+        LinkInfo {
+            name: li.name,
+            files: li.files,
+            total_bytes: li.total_bytes,
+            unavailable: li.unavailable,
+            error: li.error,
+            needs_passphrase: li.needs_passphrase,
+        }
+    }
+}
+
 /// What Settings and the update card need to know about a release.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct UpdateState {
     pub current: String,
     pub latest: String,
@@ -198,13 +232,50 @@ pub struct UpdateState {
     pub blocker: String,
 }
 
+impl UpdateState {
+    /// The app's `UpdateStatus`, as the views want it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_core(st: &fiotransfer_core::app::UpdateStatus) -> UpdateState {
+        UpdateState {
+            current: st.current.clone(),
+            latest: st.latest.clone(),
+            available: st.available,
+            state: st.state.clone(),
+            progress: st.progress as f32,
+            error: st.error.clone(),
+            blocker: st.blocker.clone(),
+        }
+    }
+}
+
+/// One row of the Watch Folders screen, from the app's `WatchView`.
 #[derive(Debug, Clone, Default)]
 pub struct WatchRow {
+    /// The app's watch id (`SetWatchEnabled`, `RemoveWatch`, …).
+    pub id: String,
     pub local: String,
     pub label: String,
     pub direction: String,
     pub enabled: bool,
     pub pending: i64,
+}
+
+impl WatchRow {
+    /// The app's `WatchView`, as the Watch Folders screen wants it.
+    ///
+    /// Native only, for the same reason as [`LinkInfo::from_core`]: the browser
+    /// capture is given its rows by `src/fixture.rs`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_core(w: &fiotransfer_core::xfer::watch::WatchView) -> WatchRow {
+        WatchRow {
+            id: w.id.clone(),
+            local: w.local_path.clone(),
+            label: if w.dest_label.is_empty() { w.name.clone() } else { w.dest_label.clone() },
+            direction: w.direction.clone(),
+            enabled: w.enabled,
+            pending: w.pending,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +298,10 @@ impl UiState {
     }
     pub fn push_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
         self.toasts.push(Toast { text: text.into(), kind, seconds: 3.5 });
+    }
+    /// Asks the shell for something.
+    pub fn ask(&mut self, request: Request) {
+        self.requests.push(request);
     }
 }
 

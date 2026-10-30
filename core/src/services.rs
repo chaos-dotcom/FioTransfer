@@ -1,19 +1,20 @@
-//! Finder's right-click menu.
+//! Finder's right-click menu: the queue, and the shape the front end reads.
 //!
-//! "Upload with FioTransfer" and "Create Watch Folder in FioTransfer"
-//! (NSServices in `build/darwin/Info.plist`, served by
-//! `mac/services_darwin.m`, unchanged from the Go app). macOS launches the app
-//! to serve one if it isn't running, so requests wait here until the app has
-//! started, and the frontend takes them once it is ready
-//! (`TakeServiceRequests`).
+//! "Upload with FioTransfer" and "Create Watch Folder in FioTransfer" were
+//! NSServices in `build/darwin/Info.plist`, served by `mac/services_darwin.m`.
+//! macOS launches the app to serve one if it isn't running, so a request waits
+//! here until the app has started, and the front end takes it once it is ready
+//! (`TakeServiceRequests`, which the webview front end and the bridge tests both
+//! call).
 //!
-//! Threading: `goService` arrives on the main thread from the AppKit service
-//! provider, and `request` runs the host's callbacks inline on whichever thread
+//! The AppKit provider that produced those requests went with the webview
+//! shell, so nothing in the workspace queues one today. The queue, its
+//! validation and the `TakeServiceRequests` answer stay: they are the bridge
+//! contract, and they are what a platform hook has to call.
+//!
+//! Threading: `request` runs the host's callbacks inline on whichever thread
 //! called it — the Go app used a goroutine for this, here a host must not block
 //! (it posts a window show and an event into the app's loop and returns).
-//!
-//! The C side is `fiotransfer_sys::services`'s: it installs the provider and
-//! declares the `goService` entry point the provider calls back.
 
 use std::sync::{Arc, Mutex};
 
@@ -98,16 +99,12 @@ pub fn take() -> Vec<ServiceRequest> {
     std::mem::take(&mut lock().pending)
 }
 
-/// Installs the Finder services provider; call it before the event loop starts.
-pub fn init() {
-    fiotransfer_sys::services::set_service_hook(service_from_c);
-    fiotransfer_sys::services::services_init();
-}
-
-/// Called from services_darwin.m with the pasteboard's paths as a JSON array
-/// (through `fiotransfer_sys::services::goService`). `kind` is 1 for the
-/// watch-folder service and 0 for upload.
-fn service_from_c(kind: i32, paths: &str) {
+/// Entry point for a platform's service provider: the pasteboard's paths as a
+/// JSON array, and `kind` 1 for the watch-folder service, 0 for upload.
+///
+/// This is what `services_darwin.m` called (`fiotransfer_sys::services::
+/// goService`); a host that has such a provider registers this.
+pub fn service_from_c(kind: i32, paths: &str) {
     let ps: Vec<String> = match serde_json::from_str(paths) {
         Ok(v) => v,
         Err(_) => return,
