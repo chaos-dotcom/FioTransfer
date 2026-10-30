@@ -1405,6 +1405,7 @@ dependencies = [
  "egui_kittest",
  "fiotransfer-core",
  "image",
+ "proptest",
  "serde",
  "serde_json",
  "tokio",
