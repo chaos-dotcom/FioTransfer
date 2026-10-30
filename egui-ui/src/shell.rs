@@ -743,6 +743,15 @@ impl Shell {
     fn tick(&mut self, ui: &mut UiState) {
         self.last_tick = Instant::now();
         self.read_running(ui);
+        // The Portal card is the one screen whose content can change with nothing in
+        // this window doing anything: the app refreshes the stored credential as it
+        // starts, and the poller reconciles in the background. Without a read here a
+        // card that was drawn before the first pump finished would keep saying
+        // "Not signed in yet" until the user touched something. Only while it shows,
+        // so a closed Settings screen costs nothing.
+        if ui.view == View::Settings {
+            self.read_portal(ui);
+        }
     }
 
     /// Everything the app owns: the state, the queue, the watch folders, and the

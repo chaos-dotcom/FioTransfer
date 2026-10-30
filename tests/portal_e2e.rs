@@ -501,3 +501,37 @@ fn the_sentences_the_live_cases_assert_on_are_the_cards_own() {
     assert_eq!(failed.text, "Failed just now: Portal refused the token (401). It may be wrong");
     assert!(!failed.text.contains("kept in step"));
 }
+
+/// The app refreshes the stored credential as it starts, on the shell's own
+/// runtime — not in response to anything the window does. The card has to notice
+/// that by itself: on a real launch its first frame can beat the app's startup, and
+/// a card that then says "Not signed in yet" with the button disabled looks like a
+/// broken connection with a valid credential sitting in the keychain.
+#[test]
+fn the_card_reads_the_credential_without_the_user_touching_anything() {
+    let Some((url, token)) = live() else { return };
+    let _g = one_at_a_time();
+    let mut w = Window::new(&url, &token);
+
+    // No click, no field commit, no reconcile: frames and real time only.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let line = w.line().text.clone();
+        if line.starts_with("Configured") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the card never read the stored credential on its own: it still says {:?}",
+            line
+        );
+        w.frame();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let button = w.harness.get_by_label(RECONCILE);
+    assert!(
+        !button.accesskit_node().is_disabled(),
+        "the card read the credential but Reconcile now is still disabled"
+    );
+}
