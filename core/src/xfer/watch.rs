@@ -2536,6 +2536,19 @@ mod props {
 
     /// Puts one generated entry into the model and on disk, skipping anything
     /// that would make one path both a folder and a file.
+    /// Whether this machine's filesystem treats `probe` and `PROBE` as the same
+    /// file. Asked once, by writing both names in a temporary folder.
+    fn fs_ignores_case() -> bool {
+        static INSENSITIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *INSENSITIVE.get_or_init(|| {
+            let Ok(tmp) = tempfile::tempdir() else { return false };
+            if std::fs::write(tmp.path().join("probe"), b"x").is_err() {
+                return false;
+            }
+            tmp.path().join("PROBE").exists()
+        })
+    }
+
     fn place(model: &mut Model, root: &std::path::Path, segs: &[String], name: &str, size: u8) -> bool {
         {
             let mut n: &Model = model;
@@ -2548,7 +2561,13 @@ mod props {
                     None => return false, // make_parents makes them first
                 };
             }
-            if n.files.contains_key(name) {
+            // Case-insensitive volumes (APFS by default) treat `B` and `b` as one
+            // file, so the second write overwrites the first and the walk — which is
+            // right to — lists one file where the model would hold two. Ask the
+            // filesystem once, and let the model follow the same rule it does.
+            if n.files.contains_key(name)
+                || (fs_ignores_case() && n.files.keys().any(|k| k.eq_ignore_ascii_case(name)))
+            {
                 return false;
             }
         }
@@ -3094,4 +3113,23 @@ mod props {
             rows
         );
     }
+        /// The guard itself, without a seed: on a case-insensitive volume the second
+        /// of two names that differ only by case must not enter the model, because
+        /// the filesystem holds one file, not two.
+        #[test]
+        fn a_name_that_differs_only_by_case_does_not_enter_the_model_twice() {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let root = tmp.path().to_path_buf();
+            let mut model = Model::default();
+            assert!(place(&mut model, &root, &[], "B", 1), "the first name goes in");
+            let second = place(&mut model, &root, &[], "b", 2);
+            if fs_ignores_case() {
+                assert!(!second, "a case-insensitive volume holds one file, so the second name is taken");
+                assert_eq!(model.files.len(), 1, "{:?}", model.files);
+            } else {
+                assert!(second, "a case-sensitive volume holds two files");
+                assert_eq!(model.files.len(), 2);
+            }
+        }
+
 }
