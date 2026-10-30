@@ -8,9 +8,17 @@
 //! Nothing here does I/O or touches a screen: it builds a [`UiState`] and stops.
 
 use crate::model::{
-    Crumb, FileView, HistoryRow, JobView, Settings, Snapshot, SpaceAccount, SpaceRow, Toast, ToastKind, UiState,
-    UpdateState, User, View, WatchRow,
+    Crumb, FileView, HistoryRow, JobView, PortalUi, PortalView, Settings, Snapshot, SpaceAccount, SpaceRow, Toast,
+    ToastKind, UiState, UpdateState, User, View, WatchRow,
 };
+
+/// The moment the fixture is drawn at, so the Portal status line's "2 min ago" is
+/// the same on every run (and in both captures). Real time, 2026-10-29 09:41 UTC.
+const FIXTURE_NOW_MS: i64 = 1_793_266_860_000;
+
+/// What the fixture's Portal section was told: configured, a token in the
+/// keychain, and a reconcile that ran two minutes before the frame.
+const FIXTURE_PORTAL_AGO_MS: i64 = 2 * 60 * 1000;
 
 /// The status a job carries, spelled the way the app spells it — the
 /// engine's type on native, the browser copy on wasm (`crate::model` picks).
@@ -155,7 +163,29 @@ pub fn fixture_state(view: View) -> UiState {
             no_folder_logs: false,
             no_update_check: false,
             last_folder_label: "Shows / Nightfall / Ep 04 / Renders".into(),
+            // Portal: set up and on, so the section has something to show.
+            portal_url: "https://portal.nightfall.tv".into(),
+            portal_root: "/Users/dana/Live_Work".into(),
+            portal_enabled: true,
+            portal_every_secs: 30,
             ..Settings::default()
+        },
+        portal: PortalUi {
+            status: PortalView {
+                enabled: true,
+                signed_in: true,
+                url: "https://portal.nightfall.tv".into(),
+                root: "/Users/dana/Live_Work".into(),
+                running: false,
+                last_at: FIXTURE_NOW_MS - FIXTURE_PORTAL_AGO_MS,
+                links_seen: 4,
+                ensured: 3,
+                removed: 1,
+                skipped: 0,
+                error: String::new(),
+                now_ms: FIXTURE_NOW_MS,
+            },
+            ..PortalUi::default()
         },
         // The composer starts empty, as it does in the web front end: no link
         // typed, so no preview and Download stays dim.

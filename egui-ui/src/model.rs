@@ -136,6 +136,22 @@ pub enum Request {
     /// `name` is for the toast; the two ids are what the call takes.
     DeleteProject { account_id: String, project_id: String, name: String },
 
+    /// Settings' Portal section: the server URL, already checked for its scheme
+    /// by the row that commits it (`App::set_portal`).
+    SetPortalUrl(String),
+    /// The local folder Portal's markers are mirrored under
+    /// (`Settings::portal_root`).
+    SetPortalRoot(String),
+    /// Store the bearer token in the keychain. The token is a [`Secret`], so no
+    /// `{:?}` of this enum can print it, and it is never a setting.
+    SetPortalToken(Secret),
+    /// Forget the stored bearer token.
+    ForgetPortalToken,
+    /// Turn Portal's background poller on or off (`Settings::portal_enabled`).
+    SetPortalEnabled(bool),
+    /// Reconcile the watch folders with Portal now (`App::portal_reconcile`).
+    PortalReconcile,
+
     /// Read everything again (the first frame, and after an event).
     Refresh,
     /// The user closed the window (the shell asks before quitting).
@@ -176,6 +192,9 @@ pub struct UiState {
     pub update: UpdateState,
     /// What the user has typed in the composer's link field.
     pub link: String,
+    /// The Settings screen's Portal section: the last status, the fields being
+    /// typed, and the reason a field's last commit was refused.
+    pub portal: PortalUi,
     /// The composer's passphrase field, shown only when a link needs one.
     pub passphrase: String,
     /// "New folder" under the link field (`#subfolder`).
@@ -268,6 +287,116 @@ impl UpdateState {
             progress: st.progress as f32,
             error: st.error.clone(),
             blocker: st.blocker.clone(),
+        }
+    }
+}
+
+/// What the Settings screen's Portal section knows: the last status the app
+/// gave (`App::portal_status`), the fields the user is typing in, and the reason
+/// a commit was refused. The bearer token is not here either — only a draft the
+/// field masks, and a [`Secret`] on its way to the keychain.
+#[derive(Debug, Clone, Default)]
+pub struct PortalUi {
+    pub status: PortalView,
+    /// The URL being typed, or `None` while the field shows
+    /// `settings.portal_url`. A refused value stays here with its reason under
+    /// the field, so the stored setting is never the one that was rejected.
+    pub url_draft: Option<String>,
+    /// The local folder being typed, or `None` while the field shows
+    /// `settings.portal_root`.
+    pub root_draft: Option<String>,
+    /// The token being typed. It never becomes a setting: Save hands it to the
+    /// keychain and the shell empties this.
+    pub token_draft: String,
+    /// Why the last commit of the URL / the folder was refused.
+    pub url_error: Option<String>,
+    pub root_error: Option<String>,
+}
+
+/// A bearer token on its way from the Settings field to the keychain.
+///
+/// `Debug` prints nothing of it: a token must not be logged, and a request enum
+/// that holds one would otherwise print it the first time somebody wrote
+/// `{:?}` on a `Request`. The one place it is read is the shell's store call.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(secret: impl Into<String>) -> Secret {
+        Secret(secret.into())
+    }
+
+    /// The token itself.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether there is a token to store at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(…)")
+    }
+}
+
+/// What Portal's status line needs, as `App::portal_status` reports it.
+///
+/// A copy, not the core's `PortalStatus`: the browser capture has no core to ask
+/// (the same reason [`UpdateState`] exists), and `now_ms` is added so the
+/// relative time is a pure function of the status rather than of the clock at
+/// draw time.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PortalView {
+    /// The background poller is on (`Settings::portal_enabled`).
+    pub enabled: bool,
+    /// A bearer token is stored. The token itself is never part of a status.
+    pub signed_in: bool,
+    pub url: String,
+    /// The local root, resolved to an absolute path.
+    pub root: String,
+    /// A reconcile is running right now.
+    pub running: bool,
+    /// When the last reconcile ran (unix ms); 0 means it has never run.
+    pub last_at: i64,
+    /// The last reconcile's numbers.
+    pub links_seen: usize,
+    pub ensured: usize,
+    pub removed: usize,
+    pub skipped: usize,
+    /// Why the last reconcile did nothing, when it did nothing.
+    pub error: String,
+    /// When this reading was taken (unix ms), so "2 min ago" is decided by the
+    /// shell that read the status rather than by the frame that draws it.
+    pub now_ms: i64,
+}
+
+impl PortalView {
+    /// A URL and a token are both set: the state the reconcile button needs.
+    pub fn configured(&self) -> bool {
+        !self.url.trim().is_empty() && self.signed_in
+    }
+
+    /// The app's `PortalStatus`, as the screen wants it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_core(st: &fiotransfer_core::portal::agent::PortalStatus) -> PortalView {
+        PortalView {
+            enabled: st.enabled,
+            signed_in: st.signed_in,
+            url: st.url.clone(),
+            root: st.root.clone(),
+            running: st.running,
+            last_at: st.last_at,
+            links_seen: st.links_seen,
+            ensured: st.ensured,
+            removed: st.removed,
+            skipped: st.skipped,
+            error: st.error.clone(),
+            now_ms: 0,
         }
     }
 }

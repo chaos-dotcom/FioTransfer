@@ -176,6 +176,14 @@ pub struct Settings {
     pub last_folder_id: String,
     pub last_folder_label: String,
     pub last_folder_path: Vec<Crumb>,
+    // ---- Portal ----
+    // The bearer token is not here: it lives in the keychain, as on the native
+    // build. Every field is `#[serde(default)]` above, so an older payload reads.
+    pub portal_url: String,
+    pub portal_root: String,
+    pub portal_enabled: bool,
+    pub portal_on_change: String,
+    pub portal_every_secs: i64,
 }
 
 impl Default for Settings {
@@ -199,6 +207,11 @@ impl Default for Settings {
             last_folder_id: String::new(),
             last_folder_label: String::new(),
             last_folder_path: Vec::new(),
+            portal_url: String::new(),
+            portal_root: home.join("Live_Work").to_string_lossy().into_owned(),
+            portal_enabled: false,
+            portal_on_change: "overwrite".to_string(),
+            portal_every_secs: 30,
         }
     }
 }
