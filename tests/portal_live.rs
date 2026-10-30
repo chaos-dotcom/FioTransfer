@@ -119,3 +119,31 @@ fn live_portal_reconciles_into_watch_folders() {
         .collect();
     assert_eq!(before, after, "a second reconcile changed the watch list");
 }
+
+/// The same host, with a token that is not the right one: the status line must say
+/// the token was refused, not print Portal's JSON. Runs against any Portal; skipped
+/// unless PORTAL_LIVE_URL is set.
+#[test]
+fn live_portal_refuses_a_bad_token() {
+    let Ok(url) = std::env::var("PORTAL_LIVE_URL") else {
+        eprintln!("skipped: PORTAL_LIVE_URL not set");
+        return;
+    };
+    if url.trim().is_empty() {
+        return;
+    }
+    let w = world(&url);
+    portal::set_token("definitely-not-the-token").expect("token stored");
+
+    let _g = w.rt.enter();
+    let report = w.rt.block_on(async { w.app.portal_reconcile().await });
+    println!("report error: {}", report.error);
+    assert!(!report.error.is_empty(), "a refused token must be an error, not a quiet success");
+    assert!(report.error.contains("refused the token"), "got: {}", report.error);
+    assert!(!report.error.contains("\"detail\""), "the JSON wrapper reached the user: {}", report.error);
+    assert_eq!(report.ensured, 0, "nothing may be created when the token is refused");
+
+    // And nothing reached the watch list either.
+    let watches = w.app.hist.lock().unwrap().as_ref().unwrap().watches().expect("watches");
+    assert!(watches.is_empty(), "{} watch(es) created without authorisation", watches.len());
+}
