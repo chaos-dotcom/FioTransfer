@@ -128,6 +128,7 @@ of install:
 
 ```sh
 fio portal signin https://portal.shed.gay you@yourdomain     # session only; the password is not stored
+fio portal reconcile --dry-run                                # what it WOULD do, and changes nothing
 fio portal reconcile                                          # what it did, and what it refused
 fio portal status                                             # the sentence the Settings card shows
 fio portal signout

@@ -64,6 +64,10 @@ pub struct Report {
     pub removed: usize,
     /// Links that could not be acted on. An empty list is the normal case.
     pub skipped: Vec<Skip>,
+    /// What a dry run *would* create or bring back in line, as absolute local
+    /// paths. Empty after a real reconcile: it acted instead of planning.
+    #[serde(default)]
+    pub planned: Vec<String>,
     /// Why nothing was done, when the whole run failed (no token, no URL,
     /// Portal unreachable, history closed). Nothing is changed when this is set.
     pub error: String,
@@ -159,6 +163,49 @@ pub async fn reconcile(app: &App) -> Report {
     };
     rep.links_seen = links.len();
     apply(app, &links, &mut rep);
+    rep
+}
+
+
+/// What a reconcile would do, without doing any of it.
+///
+/// Same credential, same request, same plan — then it stops. Nothing is created,
+/// nothing is removed, no watch is touched. This exists because the first time it
+/// runs against a real library the folders it makes are somebody's actual
+/// projects, and "show me first" is a reasonable thing to ask for.
+pub async fn preview(app: &App) -> Report {
+    let s = app.settings();
+    let mut rep = Report { at: crate::xfer::now_ms(), ..Default::default() };
+    let client = match PortalClient::from_settings(&s) {
+        Ok(c) => c,
+        Err(e) => {
+            rep.error = e.to_string();
+            return rep;
+        }
+    };
+    let links = match client.upload_links().await {
+        Ok(l) => l,
+        Err(e) => {
+            rep.error = e.to_string();
+            return rep;
+        }
+    };
+    rep.links_seen = links.len();
+    let root = s.portal_root_path();
+    let targets = plan(&links, &root, &s.portal_change_rule(), &mut rep);
+    rep.ensured = targets.len();
+    rep.planned = targets.iter().map(|t| t.local.clone()).collect();
+    // Removals are knowable too: Portal-owned watches whose link is not in today's
+    // list. Reading the database is not changing it.
+    if let Some(hist) = app.hist() {
+        let wanted: BTreeSet<String> = targets.iter().map(|t| origin_of(&t.link)).collect();
+        rep.removed = hist
+            .watches()
+            .unwrap_or_default()
+            .iter()
+            .filter(|w| link_of(&w.origin).is_some() && !wanted.contains(&w.origin))
+            .count();
+    }
     rep
 }
 
