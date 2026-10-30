@@ -1,5 +1,5 @@
 [workspace]
-members = ["egui-ui", "sys"]
+members = ["egui-ui"]
 resolver = "2"
 
 [package]
@@ -49,7 +49,7 @@ objc2-foundation = "0.3.2"
 objc2-web-kit = "0.3.2"
 wry = "0.57.1"
 tao = "0.37.2"
-fiotransfer-sys = { path = "sys" }
+libc = "0.2"
 async-trait = "0.1.92"
 once_cell = "1"
 x509-parser = "0.18.1"
@@ -68,9 +68,6 @@ strip = "symbols"
 
 [dev-dependencies]
 proptest = "1.12.0"
-# Only a test names an errno (login.rs); everything else that touches libc
-# goes through `fiotransfer-sys`.
-libc = "0.2"
 tempfile = "3.27.0"
 
 # Unsigned packaging through cargo-packager (0.11 reads this table; `--config`
@@ -78,7 +75,7 @@ tempfile = "3.27.0"
 #   cargo packager --formats app        (macOS app bundle; also: dmg)
 [package.metadata.packager]
 product-name = "FioTransfer"
-# version is taken from [package] above, so a bump there is the bump here.
+# version is taken from [package] above.
 identifier = "com.farbhaus.fiotransfer"
 out-dir = "dist"
 binaries-dir = "target/release"
