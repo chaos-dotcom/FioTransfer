@@ -1630,7 +1630,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "fiotransfer"
-version = "1.3.1"
+version = "1.3.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1687,6 +1687,8 @@ name = "fiotransfer-sys"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "proptest",
+ "tempfile",
 ]
 
 [[package]]
