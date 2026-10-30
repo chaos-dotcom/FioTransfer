@@ -75,12 +75,27 @@ identifier = "com.farbhaus.fiotransfer"
 out-dir = "../dist-egui"
 binaries-dir = "../target/release"
 icons = ["../build/icons/icon.icns", "../build/icons/icon_1024.png", "../build/icons/icon_512.png"]
-before-packaging-command = "cargo build --release -p fiotransfer-egui --bin fiotransfer-egui"
+# BOTH binaries, because `docs/PORTAL.md` tells the reader to run `fio portal …`
+# and a documented command the package does not install is a packaging bug. The
+# CLI is the root package's `fio`; the GUI is this one. Both land in the same
+# `binaries-dir` (`../target/release`), so one build of each is enough.
+before-packaging-command = "cargo build --release -p fiotransfer --bin fio && cargo build --release -p fiotransfer-egui --bin fiotransfer-egui"
 resources = ["../LICENSE", "../THIRD_PARTY_NOTICES.txt"]
 
+# The GUI stays `main`: it names the bundle, the desktop entry, the AppImage and
+# the installer, so double-clicking the .app and the menu entry do not change.
 [[package.metadata.packager.binaries]]
 path = "fiotransfer-egui"
 main = true
+
+# `fio` rides along, not main. Per format, cargo-packager 0.11.8 places a
+# non-main binary as follows (read from its source, `src/package/*/mod.rs`):
+#   deb      -> usr/bin/fio, beside usr/bin/fiotransfer-egui   (/usr/bin on PATH)
+#   appimage -> usr/bin/fio inside the AppDir, beside the GUI
+#   app      -> FioTransfer.app/Contents/MacOS/fio
+#   nsis     -> $INSTDIR\fio.exe, beside FioTransfer.exe
+[[package.metadata.packager.binaries]]
+path = "fio"
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"

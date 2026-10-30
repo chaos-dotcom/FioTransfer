@@ -9,13 +9,19 @@ PROFILE=${PROFILE:-release}
 APP=FioTransfer.app
 
 cargo build --profile "$PROFILE" -p fiotransfer-egui --bin fiotransfer-egui
+# The CLI too: `docs/PORTAL.md` tells the reader that `fio` is inside the bundle,
+# at Contents/MacOS/fio. Same as the packaged bundle — `egui-ui/Cargo.toml` lists
+# both binaries for cargo-packager.
+cargo build --profile "$PROFILE" -p fiotransfer --bin fio
 
 BIN=target/$PROFILE/fiotransfer-egui
-[ "$PROFILE" = dev ] && BIN=target/debug/fiotransfer-egui
+CLI=target/$PROFILE/fio
+[ "$PROFILE" = dev ] && BIN=target/debug/fiotransfer-egui && CLI=target/debug/fio
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/FioTransfer"
+cp "$CLI" "$APP/Contents/MacOS/fio"
 # The Info.plist is the Go build's own file, byte for byte (minus the Finder
 # services, which went with the webview shell).
 cp build/darwin/Info.plist "$APP/Contents/Info.plist"

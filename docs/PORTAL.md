@@ -92,7 +92,9 @@ up as a success. While **Enabled** is on, FioTransfer re-checks every 30 seconds
 
 ## From a terminal
 
-The same four steps without opening the window — for a machine reached over ssh, or a cron job:
+The same four steps without opening the window — for a machine reached over ssh, or a cron job.
+Below, `fio` is a plain command; the subsection after it says where that command lives on each kind
+of install:
 
 ```sh
 fio portal signin https://portal.shed.gay you@yourdomain     # session only; the password is not stored
@@ -101,6 +103,26 @@ fio portal status                                             # the sentence the
 fio portal signout
 fio portal token <token>                                      # instead, for a TOTP or passkey deployment
 ```
+
+### Where `fio` comes from
+
+`fio` is the command line front end of the same app and ships in the same package as the window, so
+there is nothing extra to install:
+
+| Installed how | Where `fio` is | On your `PATH`? |
+| --- | --- | --- |
+| Debian package | `/usr/bin/fio`, beside `/usr/bin/fiotransfer-egui` | yes |
+| AppImage | `usr/bin/fio` inside the image — `--appimage-extract` writes it out | no: an AppImage installs nothing |
+| macOS `.app` | `/Applications/FioTransfer.app/Contents/MacOS/fio` | no: a `.app` is not on `PATH` |
+| Windows installer | `fio.exe` in the install folder, beside `FioTransfer.exe` | no: the installer leaves `PATH` alone |
+| A checkout | `target/release/fio`, from `cargo build --release -p fiotransfer --bin fio` | only if you add it |
+
+Only the Debian package puts `fio` on `PATH`. Everywhere else the executable is inside the thing
+you installed — an `.app`, an AppImage, the installer's own folder — so the full path in the table
+is the command; those formats are self-contained and never touch `PATH`. If `fio` is not where the
+table says, the package predates the CLI: build it from a checkout with
+`cargo build --release -p fiotransfer --bin fio`. That is the root package, it links the engine
+without the window, and it needs no GUI dependencies.
 
 `signin` takes the password from `$FIO_PORTAL_PASSWORD` when set, otherwise reads one line — and on a terminal it
 says plainly that the typing is visible, because there is no no-echo helper here.
