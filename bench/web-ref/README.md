@@ -49,12 +49,14 @@ Flags: `--out DIR`, `--dist DIR`, `--chromium PATH`, `--settle MS`,
    the PNGs (`node:zlib`, unfiltered in JS) and checks 1180x780, non-empty,
    drawn content, and that the five differ pairwise.
 6. On the Space screen (after the shots): the legend's lines, the four arcs and
-   their fills, the header total; the geometry (chart left of the legend, arcs
-   inside the SVG box, the ring's hole, the Delete button inside its card, no
-   sideways scroll); the walking and empty states through `renderSpace()`; and
-   the delete dialog - what it says, that Cancel holds the focus and deletes
-   nothing, that Escape deletes nothing, and that a confirmed delete asks for
-   exactly one project and drops its row.
+   their fills, the header total; the headline - one line per account, with the
+   limit, the no-limit case and the no-usage case - and that it sits between the
+   page head and the body and survives a walk; the geometry (chart left of the
+   legend, arcs inside the SVG box, the ring's hole, the Delete button inside
+   its card, no sideways scroll); the walking and empty states through
+   `renderSpace()`; and the delete dialog - what it says, that Cancel holds the
+   focus and deletes nothing, that Escape deletes nothing, and that a confirmed
+   delete asks for exactly one project and drops its row.
 
 ## The bridge (`bridge.js`, served as `/__bridge.js`)
 
@@ -90,21 +92,32 @@ web front end reads. Field names and values are the egui ones:
 | `expanded: Some("up-1")` | the row is opened by clicking its `.a-files` button |
 | `destination` | `settings.last_folder_label` |
 
-### The Space screen has no egui source
+### The Space screen's fixture
 
-`Space()` is new: `src/app.rs` walks the account and `frontend/dist` draws it,
-but the egui shell has no Space screen and `fixture_state()` no projects. So
-`bridge.js` carries an invented walk - five `SpaceProject` rows across three
-workspaces and two accounts, sized to print at every branch of `fmtBytes`
-(92.5 GB, 18.4 GB, 6.20 GB, 1.05 GB, 0 B; 118 GB in total). One row holds
-nothing (so the "0 B" line and the arc-less swatch are drawn) and one carries a
-walk `error` (so the "could not finish" mark is drawn). `RefreshSpace` answers
-`null` and flips `SpaceWalking` for 1.2 s, and `DeleteProject` drops the row and
-appends the arguments it was given to `window.__bridge.deleted`, so the render
-can prove what the one destructive call was asked to delete. The four fills are
-the ramp `app.js` computes from the stylesheet's `--brand`, `--info` and
-`--success`, so the first project is `#5b53ff` and the check pins that.
+`Space()` answers `{ projects, accounts }`: the rows the chart draws and the
+accounts the headline counts (`App::Space` in `src/app.rs`). The egui fixture
+(`src/fixture.rs`) carries three rows and three accounts; `bridge.js` carries a
+bigger invented set — five `SpaceProject` rows across three workspaces and two
+accounts, sized to print at every branch of `fmtBytes` (92.5 GB, 18.4 GB,
+6.20 GB, 1.05 GB, 0 B; 118 GB in total). One row holds nothing (so the "0 B"
+line and the arc-less swatch are drawn), one carries a walk `error` (so the
+"could not finish" mark is drawn), and one has `walked: false` — a size Frame.io
+reported itself, so its Files cell is a dash and its place line ends "from
+Frame.io" rather than "walked".
 
+The three accounts cover the three headline cases: a limit with room left
+("118 GB of 500 GB used · 382 GB left"), `storage_limit: null` ("1.05 GB used ·
+no limit") and an account that reports no usage ("2.00 TB limit · usage not
+reported"). Those strings are Frame.io's own figures — `Account.storage_limit`
+and `Account.storage_usage` — not sums of the rows, which is why the headline
+stays up while a walk runs and does not change when a project is deleted.
+
+`RefreshSpace` answers `null` and flips `SpaceWalking` for 1.2 s, and
+`DeleteProject` drops the row and appends the arguments it was given to
+`window.__bridge.deleted`, so the render can prove what the one destructive call
+was asked to delete. The four fills are the ramp `app.js` computes from the
+stylesheet's `--brand`, `--info` and `--success`, so the first project is
+`#5b53ff` and the check pins that.
 ### Values that had to be invented
 
 The egui model has no equivalent for these; each is also marked `INVENTED` in

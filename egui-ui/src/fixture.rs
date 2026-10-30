@@ -7,7 +7,7 @@
 //!
 //! Nothing here does I/O or touches a screen: it builds a [`UiState`] and stops.
 
-use crate::model::{FileView, HistoryRow, JobView, Settings, Snapshot, SpaceRow, Toast, ToastKind, UiState, UpdateState, User, View, WatchRow, Crumb};
+use crate::model::{FileView, HistoryRow, JobView, Settings, Snapshot, SpaceAccount, SpaceRow, Toast, ToastKind, UiState, UpdateState, User, View, WatchRow, Crumb};
 
 fn job(
     id: &str,
@@ -167,9 +167,10 @@ pub fn fixture_state(view: View) -> UiState {
         },
         history,
         watches,
-        // What the last walk found: a big project, a small one, and one whose
-        // walk failed part way with a permission error (so the row carries the
-        // figures it did count plus the reason they are not whole).
+        // What the last reading found: a big project Frame.io sized, a small one
+        // whose walk failed part way with a permission error (so the row carries
+        // the figures it did count plus the reason they are not whole), and one
+        // Frame.io reported without a walk (so the row shows a dash for files).
         space: vec![
             SpaceRow {
                 account_id: "acct-farbhaus".into(),
@@ -179,6 +180,7 @@ pub fn fixture_state(view: View) -> UiState {
                 name: "Nightfall".into(),
                 bytes: 12_400_000_000,
                 files: 1_284,
+                walked: false,
                 error: String::new(),
             },
             SpaceRow {
@@ -189,6 +191,7 @@ pub fn fixture_state(view: View) -> UiState {
                 name: "Archive 2024".into(),
                 bytes: 2_100_000_000,
                 files: 212,
+                walked: true,
                 error: "403 forbidden: the walk could not read folder 9f2c1a".into(),
             },
             SpaceRow {
@@ -199,7 +202,31 @@ pub fn fixture_state(view: View) -> UiState {
                 name: "Trailer Cutdown".into(),
                 bytes: 640_000_000,
                 files: 38,
+                walked: true,
                 error: String::new(),
+            },
+        ],
+        // The headline's three cases, one per account: a limit with room left, an
+        // account Frame.io says has no limit (`storage_limit: null`), and one
+        // that reports no usage at all.
+        space_accounts: vec![
+            SpaceAccount {
+                account_id: "acct-farbhaus".into(),
+                name: "Farbhaus".into(),
+                limit: Some(2_000_000_000_000),
+                used: Some(1_240_000_000_000),
+            },
+            SpaceAccount {
+                account_id: "acct-archive".into(),
+                name: "Farbhaus Archive".into(),
+                limit: None,
+                used: Some(640_000_000_000),
+            },
+            SpaceAccount {
+                account_id: "acct-quiet".into(),
+                name: "Quiet Account".into(),
+                limit: Some(500_000_000_000),
+                used: None,
             },
         ],
         space_walking: false,
