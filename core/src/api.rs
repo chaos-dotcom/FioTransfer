@@ -569,6 +569,26 @@ pub const ERR_NO_ORIGINAL: &str = "Frame.io offers no download of this file's or
 
 // ---------- Types ----------
 
+/// Decodes an absent field, or a `null`, or the value itself.
+///
+/// `#[serde(default)]` covers a key that is ABSENT; it does not cover a key
+/// that is present and `null` — serde then answers "invalid type: null,
+/// expected a string" and the whole document is lost. Frame.io does send nulls
+/// (`"display_name": null` on an account that has not been named yet), and the
+/// Go original accepted them, because `encoding/json` unmarshals `null` into a
+/// `string` or an `int64` as a no-op. This is that behaviour, per field: a null
+/// is read as if the key were absent, and the field keeps its default.
+///
+/// One null used to fail the whole page, so one unnamed account emptied the
+/// Space screen for every account beside it.
+fn null_as_absent<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct User {
     #[serde(default)]
@@ -581,51 +601,66 @@ pub struct User {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Account {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub display_name: String,
+    /// `storage_limit`: "The number of bytes of non-archived storage in the
+    /// account. Value is nil when there is no [limit]" — so `None` is a real
+    /// answer ("no limit") and not a missing field, and it must not become a 0.
+    #[serde(default)]
+    pub storage_limit: Option<i64>,
+    /// `storage_usage`: the bytes of non-archived storage the account is using.
+    /// `None` when Frame.io does not report it, which the Space headline says
+    /// out loud instead of printing 0 B.
+    #[serde(default)]
+    pub storage_usage: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Workspace {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub root_folder_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub workspace_id: String,
+    /// `storage`: "Storage Usage" — the bytes the project holds, which Frame.io
+    /// sends on the project itself. `None` only when the field is absent, and
+    /// then the Space view falls back to walking the project's folders.
+    #[serde(default)]
+    pub storage: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Asset {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub name: String,
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, deserialize_with = "null_as_absent")]
     pub type_: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub file_size: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub parent_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub project_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub view_url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_absent")]
     pub created_at: String,
     #[serde(default)]
     pub head_version: Option<Box<Asset>>,
@@ -718,5 +753,186 @@ impl SearchHit {
     /// Whether the hit was found by its own name (not only its project's).
     pub fn name_match(&self) -> bool {
         self.matches.iter().any(|m| m.type_ == "name_match")
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frame.io's own example for `storage_limit` is `null` when the account
+    /// has no limit ("Value is nil when there is no [limit]"), so a null must
+    /// arrive as `None` and never as a limit of 0 bytes.
+    #[test]
+    fn an_account_with_a_null_limit_parses_as_no_limit() {
+        let json = r#"{
+            "id": "acct-1",
+            "display_name": "Farbhaus",
+            "storage_limit": null,
+            "storage_usage": 12400000000
+        }"#;
+        let acct: Account = serde_json::from_str(json).expect("account parses");
+        assert_eq!(acct.id, "acct-1");
+        assert_eq!(acct.display_name, "Farbhaus");
+        assert_eq!(acct.storage_limit, None, "null is \"no limit\", not zero");
+        assert_eq!(acct.storage_usage, Some(12_400_000_000));
+    }
+
+    #[test]
+    fn an_account_with_a_limit_parses_the_bytes() {
+        let json = r#"{
+            "id": "acct-2",
+            "display_name": "Archive",
+            "storage_limit": 2000000000000,
+            "storage_usage": 12400000000
+        }"#;
+        let acct: Account = serde_json::from_str(json).expect("account parses");
+        assert_eq!(acct.storage_limit, Some(2_000_000_000_000));
+        assert_eq!(acct.storage_usage, Some(12_400_000_000));
+    }
+
+    /// The old account shape, and any account that omits the fields: both are
+    /// still an account, with nothing known about its storage.
+    #[test]
+    fn an_account_without_the_storage_fields_parses() {
+        let acct: Account = serde_json::from_str(r#"{"id": "acct-3", "display_name": "Old"}"#)
+            .expect("account without storage parses");
+        assert_eq!(acct.id, "acct-3");
+        assert_eq!(acct.storage_limit, None);
+        assert_eq!(acct.storage_usage, None);
+    }
+
+    /// A usage of null is "not reported", which the headline has a case for.
+    #[test]
+    fn an_account_with_a_null_usage_parses_as_not_reported() {
+        let json = r#"{"id": "acct-4", "display_name": "Quiet", "storage_limit": 5, "storage_usage": null}"#;
+        let acct: Account = serde_json::from_str(json).expect("account parses");
+        assert_eq!(acct.storage_limit, Some(5));
+        assert_eq!(acct.storage_usage, None);
+    }
+
+    /// `Project.storage` is "Storage Usage" on the project itself, so a listed
+    /// project carries the number the Space view prints.
+    #[test]
+    fn a_project_carries_its_storage() {
+        let json = r#"{
+            "id": "proj-1",
+            "name": "Nightfall",
+            "root_folder_id": "root-1",
+            "workspace_id": "ws-1",
+            "storage": 6200000000
+        }"#;
+        let p: Project = serde_json::from_str(json).expect("project parses");
+        assert_eq!(p.name, "Nightfall");
+        assert_eq!(p.storage, Some(6_200_000_000));
+    }
+
+    /// An older answer, or a project that omits the field: `None`, which is what
+    /// sends the Space view down the walk.
+    #[test]
+    fn a_project_without_storage_parses() {
+        let p: Project = serde_json::from_str(r#"{"id": "proj-2", "name": "Bare"}"#)
+            .expect("project without storage parses");
+        assert_eq!(p.storage, None);
+        assert_eq!(p.root_folder_id, "");
+    }
+
+    /// A reported zero is a figure, not a missing one: Frame.io says the project
+    /// holds nothing, so there is nothing to walk.
+    #[test]
+    fn a_project_that_reports_zero_storage_is_still_reported() {
+        let p: Project = serde_json::from_str(r#"{"id": "proj-3", "name": "Empty", "storage": 0}"#)
+            .expect("project parses");
+        assert_eq!(p.storage, Some(0));
+    }
+
+    /// `storage` is sent as an integer, but the field is `Option<i64>` and the
+    /// payloads are re-serialised for the front ends, so the round trip has to
+    /// keep both the number and the null.
+    #[test]
+    fn storage_survives_a_round_trip() {
+        let acct = Account {
+            id: "acct-5".into(),
+            display_name: "Round".into(),
+            storage_limit: None,
+            storage_usage: Some(7),
+        };
+        let json = serde_json::to_string(&acct).expect("account serialises");
+        assert!(json.contains("\"storage_limit\":null"), "{json}");
+        let back: Account = serde_json::from_str(&json).expect("account re-parses");
+        assert_eq!(back.storage_limit, None);
+        assert_eq!(back.storage_usage, Some(7));
+
+        let p = Project { id: "p".into(), storage: Some(9), ..Default::default() };
+        let json = serde_json::to_string(&p).expect("project serialises");
+        let back: Project = serde_json::from_str(&json).expect("project re-parses");
+        assert_eq!(back.storage, Some(9));
+    }
+
+    // ---------- F1a: a null is read as if the key were absent ----------
+
+    /// The finding, as a regression test: a present `null` used to reject the
+    /// whole document, because `#[serde(default)]` only covers an absent key.
+    #[test]
+    fn a_null_field_parses_as_if_it_were_absent() {
+        let acct: Account = serde_json::from_str(r#"{"id":"a","display_name":null}"#)
+            .expect("a null display_name parses");
+        assert_eq!(acct.id, "a");
+        assert_eq!(acct.display_name, "");
+        assert_eq!(acct.storage_limit, None);
+    }
+
+    /// Every field of the four types a walk reads: a null in any of them is the
+    /// type's default, not a parse error.
+    #[test]
+    fn a_null_in_any_walked_field_parses() {
+        let ws: Workspace = serde_json::from_str(r#"{"id":null,"name":null}"#).expect("workspace");
+        assert_eq!((ws.id.as_str(), ws.name.as_str()), ("", ""));
+        let p: Project = serde_json::from_str(
+            r#"{"id":null,"name":null,"root_folder_id":null,"workspace_id":null,"storage":null}"#,
+        )
+        .expect("project");
+        assert_eq!((p.id.as_str(), p.name.as_str()), ("", ""));
+        assert_eq!(p.storage, None);
+        let a: Asset = serde_json::from_str(
+            r#"{"id":null,"name":null,"type":null,"file_size":null,"parent_id":null,
+                "project_id":null,"view_url":null,"status":null,"created_at":null,
+                "head_version":null}"#,
+        )
+        .expect("asset");
+        assert_eq!(a.file_size, 0);
+        assert_eq!(a.type_, "");
+        assert!(a.head_version.is_none());
+    }
+
+    /// One null in a page used to lose the whole page. It loses nothing now:
+    /// the row with the null keeps its place and reads as unnamed.
+    #[test]
+    fn one_null_no_longer_costs_the_whole_page() {
+        let page = r#"{"data":[
+            {"id":"acct-1","display_name":"Farbhaus","storage_usage":10},
+            {"id":"acct-2","display_name":null},
+            {"id":null,"display_name":"Third"}]}"#;
+        let v: serde_json::Value = serde_json::from_str(page).expect("page");
+        let rows: Vec<Account> =
+            serde_json::from_value(v["data"].clone()).expect("a null in one row keeps the page");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].display_name, "Farbhaus");
+        assert_eq!(rows[0].storage_usage, Some(10));
+        assert_eq!(rows[1].id, "acct-2");
+        assert_eq!(rows[1].display_name, "");
+        assert_eq!(rows[2].id, "");
+        assert_eq!(rows[2].display_name, "Third");
+    }
+
+    /// A *wrong type* is still an error: tolerance for `null` is not tolerance
+    /// for a list where a string belongs, which is a schema change worth seeing.
+    #[test]
+    fn a_wrong_type_is_still_an_error() {
+        let bad: Result<Account, _> = serde_json::from_str(r#"{"id": ["a"], "display_name": "x"}"#);
+        assert!(bad.is_err(), "a list where a string belongs still fails");
+        let bad: Result<Asset, _> = serde_json::from_str(r#"{"file_size": "12"}"#);
+        assert!(bad.is_err(), "a string where a number belongs still fails");
     }
 }
