@@ -31,8 +31,10 @@ pub mod tray;
 
 pub use app::App;
 
-/// Set at build time: `FIO_VERSION=1.2.3` or `-X`-style; "dev" when unset.
+/// The version this build reports: `Cargo.toml`'s, unless a build overrides it
+/// (`FIO_VERSION=0.0.0-abc1234` for a development build off a commit). One number,
+/// in one place, and the release workflow reads the same one.
 pub const VERSION: &str = match option_env!("FIO_VERSION") {
     Some(v) => v,
-    None => "dev",
+    None => env!("CARGO_PKG_VERSION"),
 };

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "fiotransfer"
-version = "0.1.0"
+version = "1.3.0"
 edition = "2021"
 build = "build.rs"
 description = "Fast uploads to and downloads from Frame.io (Rust port of FioTransfer)"
@@ -75,7 +75,7 @@ tempfile = "3.27.0"
 #   cargo packager --formats app        (macOS app bundle; also: dmg)
 [package.metadata.packager]
 product-name = "FioTransfer"
-version = "1.0.0"
+# version is taken from [package] above, so a bump there is the bump here.
 identifier = "com.farbhaus.fiotransfer"
 out-dir = "dist"
 binaries-dir = "target/release"
