@@ -116,6 +116,19 @@ impl App {
             AuthManager::new(move || c.lock().unwrap().client_id.clone())
         };
         let api = Arc::new(Client::new(auth.clone()));
+        Self::assemble(settings_cell, auth, api)
+    }
+
+    /// The same `App`, but every API call goes through `api`. A test hands in a
+    /// real `Client` whose `base_url` is a local stub, so the destructive paths
+    /// can be driven without the network. Test seam only; nothing calls this.
+    #[doc(hidden)]
+    pub fn with_api(settings: Settings, api: Arc<Client>) -> Arc<App> {
+        let auth = api.auth.clone();
+        Self::assemble(Arc::new(Mutex::new(settings)), auth, api)
+    }
+
+    fn assemble(settings_cell: Arc<Mutex<Settings>>, auth: Arc<AuthManager>, api: Arc<Client>) -> Arc<App> {
         let app = Arc::new(App {
             settings: settings_cell,
             me_self: Mutex::new(std::sync::Weak::new()),
