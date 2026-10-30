@@ -7,11 +7,12 @@
 
 use serde::Deserialize;
 
-/// Which of the four screens is showing.
+/// Which of the five screens is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum View {
     #[default]
     Transfers,
+    Space,
     Watch,
     History,
     Settings,
@@ -21,12 +22,21 @@ impl View {
     pub fn label(&self) -> &'static str {
         match self {
             View::Transfers => "Transfers",
+            View::Space => "Space",
             View::Watch => "Watch Folders",
             View::History => "History",
             View::Settings => "Settings",
         }
     }
-    pub const ALL: [View; 4] = [View::Transfers, View::Watch, View::History, View::Settings];
+    /// `View::ALL` is the sidebar's order, which is `index.html`'s: Space sits
+    /// between History and Settings.
+    pub const ALL: [View; 5] = [
+        View::Transfers,
+        View::Watch,
+        View::History,
+        View::Space,
+        View::Settings,
+    ];
 }
 
 // ---------- the JSON the app already produces ----------
@@ -125,6 +135,11 @@ pub struct UiState {
     pub snapshot: Snapshot,
     pub history: Vec<HistoryRow>,
     pub watches: Vec<WatchRow>,
+    /// What the last Frame.io storage walk found, one row per project.
+    pub space: Vec<SpaceRow>,
+    /// True while `RefreshSpace` is walking: the Space screen says so instead of
+    /// pretending the figures are current.
+    pub space_walking: bool,
     pub toasts: Vec<Toast>,
     /// Frame.io destination the composer will upload to.
     pub destination: String,
@@ -196,6 +211,41 @@ pub struct UpdateState {
     pub error: String,
     /// Why this copy cannot update itself ("development build", …).
     pub blocker: String,
+}
+
+/// One project's footprint on Frame.io, as `App::Space` reports it.
+///
+/// The field names are the payload's, minus `root_folder_id` and
+/// `workspace_id`: the screen never names a folder, only the project it would
+/// delete. `bytes` and `files` are what the last walk added up; `error` is set
+/// when that walk could not finish (permissions, a folder deleted mid-walk).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct SpaceRow {
+    #[serde(default)] pub account_id: String,
+    #[serde(default)] pub account_name: String,
+    #[serde(default)] pub workspace_name: String,
+    #[serde(default)] pub project_id: String,
+    #[serde(default)] pub name: String,
+    #[serde(default)] pub bytes: i64,
+    #[serde(default)] pub files: i64,
+    #[serde(default)] pub error: String,
+}
+
+impl SpaceRow {
+    /// This project's part of `total`, 0.0–1.0. A total of zero is no share
+    /// rather than a divide by zero.
+    pub fn share(&self, total: i64) -> f32 {
+        if total <= 0 || self.bytes <= 0 {
+            0.0
+        } else {
+            (self.bytes as f64 / total as f64) as f32
+        }
+    }
+
+    /// True when the last walk could not finish, so the figures are not whole.
+    pub fn incomplete(&self) -> bool {
+        !self.error.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -297,5 +347,32 @@ mod tests {
         assert_eq!(fmt_bytes(1_500_000), "1.50 MB");
         assert_eq!(fmt_dur(65.0), "1m 05s");
         assert_eq!(fmt_speed(0.0), "—");
+    }
+
+    #[test]
+    fn a_space_row_from_the_app_parses_and_knows_its_share() {
+        // The payload `App::Space` returns, with the two fields the screen does
+        // not need (`workspace_id`, `root_folder_id`) still in it.
+        let json = r#"{"account_id":"acct-1","account_name":"Farbhaus",
+            "workspace_id":"ws-1","workspace_name":"Shows","project_id":"proj-1",
+            "name":"Nightfall","root_folder_id":"root-1","bytes":750,"files":3,
+            "error":""}"#;
+        let row: SpaceRow = serde_json::from_str(json).expect("space row parses");
+        assert_eq!(row.account_name, "Farbhaus");
+        assert_eq!(row.workspace_name, "Shows");
+        assert_eq!(row.project_id, "proj-1");
+        assert_eq!(row.name, "Nightfall");
+        assert_eq!((row.bytes, row.files), (750, 3));
+        assert!(!row.incomplete());
+        assert_eq!(row.share(3000), 0.25);
+        // A zero total is no share, not a divide by zero.
+        assert_eq!(row.share(0), 0.0);
+        assert_eq!(SpaceRow { bytes: 0, ..row.clone() }.share(3000), 0.0);
+
+        let failed = SpaceRow {
+            error: "403 forbidden".into(),
+            ..row
+        };
+        assert!(failed.incomplete());
     }
 }

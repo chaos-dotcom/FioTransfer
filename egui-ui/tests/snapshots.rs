@@ -1,8 +1,11 @@
 //! Headless snapshots of the shell, one PNG per screen.
 //!
 //! `cargo test -p fiotransfer-egui --test snapshots` renders the egui front end
-//! at 1180x780 (the window the webview gets, see `lib.rs`) for each of the four
-//! screens and writes `/tmp/egui-shots/{transfers,watch,history,settings}.png`.
+//! at 1180x780 (the window the webview gets, see `lib.rs`) for each of the five
+//! screens and writes
+//! `/tmp/egui-shots/{transfers,space,watch,history,settings}.png` — plus
+//! `space-empty.png`, the Space screen with no projects, which is the state the
+//! fixture's other five never take.
 //! Those files are the artefact that gets compared against the webview's own
 //! screenshots of `frontend/dist`.
 //!
@@ -35,6 +38,7 @@ fn ensure_shots_dir() -> Result<PathBuf, String> {
 fn shot_path(view: View) -> PathBuf {
     let name = match view {
         View::Transfers => "transfers",
+        View::Space => "space",
         View::Watch => "watch",
         View::History => "history",
         View::Settings => "settings",
@@ -105,6 +109,35 @@ fn the_four_screens_render_to_png() {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         assert!(size > 0, "{} is empty", path.display());
     }
+}
+
+/// The Space screen with nothing to show: no projects, and no walk running.
+///
+/// The other five screens only appear empty inside
+/// `an_empty_state_draws_without_panicking`; this one is written out as a PNG
+/// because the empty state is half of what the screen has to say (the other
+/// half is the populated chart above).
+#[test]
+fn the_empty_space_screen_renders_to_png() {
+    let dir = ensure_shots_dir().expect("create /tmp/egui-shots");
+    let mut state = UiState::default();
+    state.view = View::Space;
+
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(WINDOW_WIDTH, WINDOW_HEIGHT))
+        .with_pixels_per_point(1.0)
+        .build_state(|ctx, app: &mut FioApp| app.draw(ctx), FioApp::new(state));
+    harness.run_steps(2);
+    // The empty state is on screen, and the way out of it is too.
+    harness.get_by_label("No projects yet");
+    harness.get_by_label("Refresh");
+
+    let image = harness.render().expect("render");
+    assert_eq!((image.width(), image.height()), (WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32));
+    let path = dir.join("space-empty.png");
+    image.save(&path).expect("write space-empty.png");
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    assert!(size > 2_000, "{} is only {size} bytes", path.display());
 }
 
 /// The shell draws the sidebar, the screen it is told to, and the toasts; and a

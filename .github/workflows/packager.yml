@@ -87,6 +87,17 @@ jobs:
       # app (dist/) and the egui app (dist-egui/), each stamped with the version.
       - name: Package (unsigned)
         run: cargo packager --formats app
+      # An unsigned .app that arrives in a zip is quarantined by Gatekeeper and
+      # macOS says it is "damaged". An ad-hoc signature makes it a normal
+      # unidentified-developer app instead, which opens after right-click -> Open.
+      - name: Ad-hoc sign (no certificate, no notarisation)
+        run: |
+          set -euo pipefail
+          codesign --force --deep -s - dist/FioTransfer.app
+          codesign --force --deep -s - dist-egui/FioTransfer.app
+          codesign --verify --deep --strict dist/FioTransfer.app
+          codesign --verify --deep --strict dist-egui/FioTransfer.app
+
       - name: Name the bundles with the version
         run: |
           set -euo pipefail

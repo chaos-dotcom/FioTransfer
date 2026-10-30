@@ -10,8 +10,8 @@
 //! ```text
 //!   0.. 40   `.traffic`   the traffic-light spacer (the webview's window buttons sit there)
 //!  40.. 88   `.brand`     4 px top padding, 26 px mark + 10 px gap + "FioTransfer" (14 px), 18 px below
-//!  88..222   `.nav`       four 32 px items, 2 px apart, 10 px padding and 18 px icon
-//! 222..639   `.grow`      the flexible gap: everything the bottom blocks do not need
+//!  88..256   `.nav`       five 32 px items, 2 px apart, 10 px padding and 18 px icon
+//! 256..639   `.grow`      the flexible gap: everything the bottom blocks do not need
 //! 639..723   `.throughput` 1 px rule, 12 px top, three 17.4 px rows 5 px apart, 10 px bottom
 //! 723..768   `.account`  1 px rule, 12 px top, then the 32 px row (avatar, or the Sign in button)
 //! 768..780   the `.sidebar` bottom padding
@@ -115,7 +115,7 @@ pub struct Layout {
     /// The `.nav` column.
     pub nav: Rect,
     /// One rect per [`View::ALL`] entry, in that order.
-    pub nav_items: [Rect; 4],
+    pub nav_items: [Rect; 5],
     /// The flexible `.grow` between the nav and the bottom blocks.
     pub gap: Rect,
     /// The `.throughput` block, border included.
@@ -166,13 +166,13 @@ pub fn layout_with(rect: Rect, account_row_h: f32) -> Layout {
     );
 
     let nav_top = brand.bottom();
-    let nav_items: [Rect; 4] = std::array::from_fn(|i| {
+    let nav_items: [Rect; 5] = std::array::from_fn(|i| {
         Rect::from_min_size(
             pos2(x, nav_top + i as f32 * (NAV_H + NAV_GAP)),
             vec2(w, NAV_H),
         )
     });
-    let nav_bottom = nav_items[3].bottom();
+    let nav_bottom = nav_items[4].bottom();
     let nav = Rect::from_min_max(pos2(x, nav_top), pos2(x + w, nav_bottom));
 
     // The bottom blocks are anchored to the bottom of the panel.
@@ -298,7 +298,7 @@ fn brand(painter: &egui::Painter, l: &Layout) {
     );
 }
 
-/// `.nav`: four items, each with its SVG icon, its label and — Transfers and
+/// `.nav`: five items, each with its SVG icon, its label and — Transfers and
 /// Watch Folders only — the brand-coloured count badge.
 fn nav(ui: &mut egui::Ui, painter: &egui::Painter, l: &Layout, state: &mut UiState) {
     for (i, view) in View::ALL.iter().enumerate() {
@@ -569,7 +569,8 @@ fn nav_badge(state: &UiState, view: View) -> Option<i64> {
     match view {
         View::Transfers => Some(state.active_jobs() as i64),
         View::Watch => Some(state.watches.iter().filter(|w| w.enabled).count() as i64),
-        View::History | View::Settings => None,
+        // Space, History and Settings carry no count in the design.
+        View::Space | View::History | View::Settings => None,
     }
 }
 
@@ -653,11 +654,12 @@ fn elide(painter: &egui::Painter, text: &str, font_id: &FontId, max_w: f32) -> S
     out
 }
 
-/// The four nav icons and the brand glyph, as the SVG paths in `index.html`
+/// The five nav icons and the brand glyph, as the SVG paths in `index.html`
 /// (`viewBox="0 0 20 20"`, drawn in a rect of the icon's size).
 #[derive(Clone, Copy)]
 enum Icon {
     Arrows,
+    Pie,
     Eye,
     Clock,
     Sliders,
@@ -666,6 +668,7 @@ enum Icon {
 fn icon_for(view: View) -> Icon {
     match view {
         View::Transfers => Icon::Arrows,
+        View::Space => Icon::Pie,
         View::Watch => Icon::Eye,
         View::History => Icon::Clock,
         View::Settings => Icon::Sliders,
@@ -688,6 +691,23 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, st
             polyline(painter, &[p(13.5, 5.0), p(13.5, 15.0)], stroke);
             polyline(painter, &[p(13.5, 15.0), p(10.8, 12.3)], stroke);
             polyline(painter, &[p(13.5, 15.0), p(16.2, 12.3)], stroke);
+        }
+        // A storage pie: the disc, with one 60° slice picked out.
+        Icon::Pie => {
+            let centre = p(10.0, 10.0);
+            let radius = 7.0 * scale;
+            painter.circle_stroke(centre, radius, stroke);
+            let steps = 12;
+            let mut wedge = Vec::with_capacity(steps + 2);
+            wedge.push(centre);
+            for i in 0..=steps {
+                let angle = (-90.0 + 60.0 * i as f32 / steps as f32).to_radians();
+                wedge.push(pos2(
+                    centre.x + radius * angle.cos(),
+                    centre.y + radius * angle.sin(),
+                ));
+            }
+            painter.add(egui::Shape::convex_polygon(wedge, color, Stroke::NONE));
         }
         // "M2.5 10s2.7-5 7.5-5 7.5 5 7.5 5-2.7 5-7.5 5-7.5-5-7.5-5z" + circle 2.2
         Icon::Eye => {
@@ -890,7 +910,8 @@ mod tests {
         for pair in l.nav_items.windows(2) {
             assert_eq!(pair[1].top() - pair[0].top(), 32.0 + 2.0);
         }
-        assert_eq!(l.nav.bottom(), l.nav_items[3].bottom());
+        assert_eq!(l.nav.bottom(), l.nav_items[4].bottom());
+        assert_eq!(l.nav_items.len(), View::ALL.len(), "one item per screen");
 
         // The account row is the last 32 px above the 12 px bottom padding.
         assert_eq!(l.account.bottom(), PANEL_H - PAD_BOTTOM);
@@ -1004,6 +1025,8 @@ mod tests {
         // Two watches, one enabled (`list.filter((w) => w.enabled).length`).
         assert_eq!(nav_badge(&state, View::Watch), Some(1));
         assert_eq!(nav_badge(&state, View::History), None);
+        // Space carries no count: it is a measurement, not a queue.
+        assert_eq!(nav_badge(&state, View::Space), None);
         assert_eq!(nav_badge(&UiState::default(), View::Transfers), Some(0));
         assert_eq!(nav_badge(&UiState::default(), View::Watch), Some(0));
     }

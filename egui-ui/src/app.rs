@@ -151,6 +151,7 @@ impl eframe::App for FioApp {
 pub fn show_screen(ui: &mut egui::Ui, state: &mut UiState) {
     match state.view {
         View::Transfers => crate::views::transfers::show(ui, state),
+        View::Space => crate::views::space::show(ui, state),
         View::Watch => crate::views::watch::show(ui, state),
         View::History => crate::views::history::show(ui, state),
         View::Settings => crate::views::settings::show(ui, state),
