@@ -589,13 +589,19 @@ fn a_project_id_cannot_change_the_delete_route() {
         let w = World::new(Mode::Deletes, false);
         let id = id.replace("{SBX}", &w.root.to_string_lossy());
         let n0 = w.stub.log().len();
-        let _ = w.delete("acct", &id);
+        let res = w.delete("acct", &id);
         let paths: Vec<String> = w.stub.log()[n0..]
             .iter()
             .filter(|r| r.method == "DELETE")
             .map(|r| r.path.clone())
             .collect();
-        prop_assert_eq!(paths.len(), 1, "expected one DELETE for id {:?}: {:?}", id, paths);
+        // A delete may be refused before it is sent (an id with no segment at
+        // all); what it must never do is send a DELETE somewhere else.
+        prop_assert!(paths.len() <= 1, "id {:?} sent {} DELETEs: {:?}", id, paths.len(), paths);
+        if paths.is_empty() {
+            prop_assert!(res.is_err(), "id {:?} reported success without a request", id);
+            return Ok(());
+        }
         let p = &paths[0];
         let tail = p
             .strip_prefix("/v4/accounts/acct/projects/")
