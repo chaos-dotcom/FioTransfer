@@ -830,6 +830,7 @@ mod tests {
                     direction: "upload".into(),
                     enabled: true,
                     pending: 0,
+                    from_portal: false,
                 },
                 WatchRow {
                     id: "w-archive".into(),
@@ -838,6 +839,7 @@ mod tests {
                     direction: "download".into(),
                     enabled: false,
                     pending: 3,
+                    from_portal: false,
                 },
             ],
             ..Default::default()

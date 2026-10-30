@@ -40,6 +40,17 @@ const MIN_DEST_WIDTH: f32 = 110.0;
 const STATUS_WATCHING: &str = "Watching";
 const STATUS_PAUSED: &str = "Paused";
 
+/// The marker a watch Portal owns carries, on its detail line, where the screen
+/// already puts its secondary text.
+pub const PORTAL_MARKER: &str = "Portal";
+/// What the marker means, and the answer to the one thing this screen cannot do:
+/// a Portal watch removed here is recreated by the next reconcile, because
+/// Portal still asks for it. The row keeps its Remove button — the sentence says
+/// what pressing it costs, rather than the screen hiding a button that would
+/// lie about being final.
+pub const PORTAL_SENTENCE: &str =
+    "Kept in step by Portal. Remove the marker in Portal to drop it.";
+
 /// What the screen asks the shell to do.
 ///
 /// A view is a pure renderer over [`UiState`], so everything that needs the
@@ -222,7 +233,7 @@ fn watch_row(
     let verb = direction_verb(&watch.direction);
     let status = if watch.enabled { STATUS_WATCHING } else { STATUS_PAUSED };
 
-    strip(ui, ROW_HEIGHT, true, |ui| {
+    let row = strip(ui, ROW_HEIGHT, true, |ui| {
         // Folder: the 30 px tile, then the name and the shortened path.
         cell(ui, columns.name, ROW_HEIGHT, false, |ui| {
             ui.spacing_mut().item_spacing.x = theme::space::XL;
@@ -236,12 +247,28 @@ fn watch_row(
                         .strong(),
                 ))
                 .on_hover_text(&watch.local);
-                ui.add(theme::truncating(
-                    RichText::new(&path)
-                        .font(theme::detail())
-                        .color(theme::TEXT_3),
-                ))
-                .on_hover_text(&watch.local);
+                // The detail line: the path, or — on a watch Portal owns —
+                // `Portal` and then the path, the marker in the same muted 12 px
+                // the path is set in. A watch the user made takes the first
+                // branch and draws this line exactly as it did before there was
+                // a second one.
+                if watch.from_portal {
+                    // One line, the height of the path's own text: a plain
+                    // `ui.horizontal` would centre the line in whatever is left
+                    // under the name and drop it, which the user's rows must not
+                    // get and this one should not have either.
+                    let line = vec2(
+                        ui.available_width(),
+                        ui.fonts_mut(|fonts| fonts.row_height(&theme::detail())),
+                    );
+                    ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = theme::space::S;
+                        portal_marker(ui).on_hover_text(PORTAL_SENTENCE);
+                        path_line(ui, &path, &watch.local);
+                    });
+                } else {
+                    path_line(ui, &path, &watch.local);
+                }
             });
         });
 
@@ -317,13 +344,25 @@ fn watch_row(
             });
         });
     });
+
+    if watch.from_portal {
+        // Anywhere on the row says whose it is. The marker is four words wide and
+        // the sentence is the whole answer, so the tooltip is on the strip as
+        // well as on the marker itself.
+        row.on_hover_text(PORTAL_SENTENCE);
+    }
 }
 
 // ---------- the pieces of the table ----------
 
 /// One full-width strip: the hover wash, the row padding, the 1 px bottom
 /// border, and a child `Ui` laid out left to right.
-fn strip(ui: &mut egui::Ui, height: f32, hoverable: bool, add: impl FnOnce(&mut egui::Ui)) {
+fn strip(
+    ui: &mut egui::Ui,
+    height: f32,
+    hoverable: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
     let width = ui.available_width().max(0.0);
     let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
     if hoverable && response.hovered() {
@@ -346,6 +385,7 @@ fn strip(ui: &mut egui::Ui, height: f32, hoverable: bool, add: impl FnOnce(&mut 
         rect.bottom() - 1.0,
         theme::hairline(theme::BORDER),
     );
+    response
 }
 
 /// A fixed-width column of a row.
@@ -384,6 +424,26 @@ fn icon_tile(ui: &mut egui::Ui, glyph: Glyph) {
 fn glyph(ui: &mut egui::Ui, glyph: Glyph, colour: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
     paint(ui.painter(), rect, glyph, colour, 14.0);
+}
+
+/// The row's detail line: the shortened path, its tooltip the whole path.
+fn path_line(ui: &mut egui::Ui, path: &str, local: &str) {
+    ui.add(theme::truncating(
+        RichText::new(path)
+            .font(theme::detail())
+            .color(theme::TEXT_3),
+    ))
+    .on_hover_text(local);
+}
+
+/// The marker a Portal-owned row carries ([`PORTAL_MARKER`]): the path line's own
+/// muted 12 px, and nothing else — no new colour, no new box, no new font.
+fn portal_marker(ui: &mut egui::Ui) -> egui::Response {
+    ui.add(egui::Label::new(
+        RichText::new(PORTAL_MARKER)
+            .font(theme::detail())
+            .color(theme::TEXT_3),
+    ))
 }
 
 /// `.icon-btn`: 28 x 28, transparent, `--text-3` until hovered. The button is
@@ -663,6 +723,15 @@ mod tests {
             direction: direction.to_string(),
             enabled,
             pending,
+            from_portal: false,
+        }
+    }
+
+    /// The same row, as Portal's: the record's origin is `portal:<link id>`.
+    fn portal_watch(local: &str, label: &str, direction: &str, enabled: bool, pending: i64) -> WatchRow {
+        WatchRow {
+            from_portal: true,
+            ..watch(local, label, direction, enabled, pending)
         }
     }
 
@@ -981,6 +1050,110 @@ mod tests {
         assert_eq!(Glyph::of_direction("download"), Glyph::Down);
         assert_eq!(Glyph::of_direction("mirror"), Glyph::Sync);
         assert_eq!(Glyph::of_direction(""), Glyph::Up);
+    }
+
+    // ---------- whose row is it ----------
+
+    /// A row Portal owns says so, in the secondary text the screen already puts
+    /// under the folder name, and the sentence that explains what that means is
+    /// on the row. A row the user made says neither.
+    #[test]
+    fn a_portal_row_carries_the_marker_and_the_sentence() {
+        let mut harness = screen_harness(state_with(vec![portal_watch(
+            "/Users/chaos/Movies/Live_Work/Ep 04",
+            "Shows / Nightfall / Ep 04",
+            "upload",
+            true,
+            2,
+        )]));
+
+        // The marker is a label of its own, in the folder's secondary line.
+        let marker = harness.get_by_label(PORTAL_MARKER);
+        let path = harness.get_by_label("~/Movies/Live_Work/Ep 04");
+        assert!(
+            (marker.rect().center().y - path.rect().center().y).abs() < 2.0,
+            "the marker sits on the path's line, at {:?} and {:?}",
+            marker.rect(),
+            path.rect()
+        );
+        assert!(
+            marker.rect().right() <= path.rect().left(),
+            "the marker goes before the path, not over it"
+        );
+
+        // The sentence: hovering the row brings it up, in full.
+        marker.hover();
+        harness.run();
+        assert!(
+            harness.query_by_label(PORTAL_SENTENCE).is_some(),
+            "the sentence is the marker's tooltip"
+        );
+    }
+
+    #[test]
+    fn a_row_the_user_made_shows_no_marker_and_no_sentence() {
+        let mut harness = screen_harness(state_with(vec![watch(
+            "/Users/chaos/Movies/Rushes",
+            "Rushes 2026",
+            "upload",
+            true,
+            3,
+        )]));
+
+        assert!(
+            harness.query_by_label(PORTAL_MARKER).is_none(),
+            "a watch the user made is not Portal's"
+        );
+        // Nor does hovering it bring the sentence up.
+        let path = harness.get_by_label("~/Movies/Rushes");
+        path.hover();
+        harness.run();
+        assert!(
+            harness.query_by_label(PORTAL_SENTENCE).is_none(),
+            "no sentence on a row Portal has nothing to do with"
+        );
+        // And the row still draws exactly what it drew before: the common
+        // actions, in the common order.
+        for label in ["Pause", "Edit", "Show in Finder", "Remove"] {
+            harness.get_by_label(label);
+        }
+    }
+
+    /// One of each, in one list: the marker belongs to the Portal row only, and
+    /// the two rows keep the geometry they had.
+    #[test]
+    fn one_portal_row_and_one_user_row_in_the_same_list() {
+        let harness = screen_harness(state_with(vec![
+            watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3),
+            portal_watch("/Users/chaos/Live_Work/Ep 04", "Shows / Nightfall / Ep 04", "mirror", true, 0),
+        ]));
+
+        assert_eq!(
+            harness.get_all_by_label(PORTAL_MARKER).count(),
+            1,
+            "one Portal row, one marker"
+        );
+        // The user's row first, the Portal row second, both on the same pitch.
+        let rushes = harness.get_by_label("~/Movies/Rushes").rect();
+        let live = harness.get_by_label("~/Live_Work/Ep 04").rect();
+        assert!((live.center().y - rushes.center().y - ROW_HEIGHT).abs() < 1.0, "{:?} {:?}", rushes, live);
+
+        // The Portal row keeps its Remove button: the sentence explains what
+        // pressing it costs, and the screen offers no second way out.
+        assert_eq!(harness.get_all_by_label("Remove").count(), 2);
+    }
+
+    /// The whole screen with a Portal row on it, at the size the other watch
+    /// tests draw: the marker is a real label on a real row.
+    #[test]
+    fn the_watch_screen_with_a_portal_row_renders_to_png() {
+        let mut harness = screen_harness(state_with(vec![
+            watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3),
+            portal_watch("/Users/chaos/Live_Work/Ep 04", "Shows / Nightfall / Ep 04", "mirror", true, 0),
+        ]));
+        harness.run_steps(2);
+        harness.get_by_label(PORTAL_MARKER);
+        harness.snapshot("watch_portal");
     }
 
     #[test]

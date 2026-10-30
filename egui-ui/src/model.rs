@@ -561,6 +561,11 @@ pub struct WatchRow {
     pub direction: String,
     pub enabled: bool,
     pub pending: i64,
+    /// True when Portal owns this watch: its record's `origin` is
+    /// `portal:<link id>`, so the Portal reconciler edits it, and recreates it
+    /// when it is removed here. A watch the user made has an empty origin, and
+    /// this is false.
+    pub from_portal: bool,
 }
 
 impl WatchRow {
@@ -577,6 +582,10 @@ impl WatchRow {
             direction: w.direction.clone(),
             enabled: w.enabled,
             pending: w.pending,
+            // The record's own `origin`, through the reconciler's own reading of
+            // it: only `portal:<link id>` makes Portal the owner, and an empty
+            // origin (a watch the user made) is not Portal's.
+            from_portal: fiotransfer_core::portal::agent::link_of(&w.origin).is_some(),
         }
     }
 }

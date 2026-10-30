@@ -273,6 +273,7 @@ fn a_tall_screen_scrolls_instead_of_widening() {
             direction: "upload".into(),
             enabled: i % 3 != 0,
             pending: i % 5,
+            from_portal: false,
         })
         .collect();
     let mut harness = Harness::builder()
