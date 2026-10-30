@@ -7,7 +7,7 @@
 //!
 //! Nothing here does I/O or touches a screen: it builds a [`UiState`] and stops.
 
-use crate::model::{FileView, HistoryRow, JobView, Settings, Snapshot, Toast, ToastKind, UiState, UpdateState, User, View, WatchRow, Crumb};
+use crate::model::{FileView, HistoryRow, JobView, Settings, Snapshot, SpaceRow, Toast, ToastKind, UiState, UpdateState, User, View, WatchRow, Crumb};
 
 fn job(
     id: &str,
@@ -167,6 +167,42 @@ pub fn fixture_state(view: View) -> UiState {
         },
         history,
         watches,
+        // What the last walk found: a big project, a small one, and one whose
+        // walk failed part way with a permission error (so the row carries the
+        // figures it did count plus the reason they are not whole).
+        space: vec![
+            SpaceRow {
+                account_id: "acct-farbhaus".into(),
+                account_name: "Farbhaus".into(),
+                workspace_name: "Shows".into(),
+                project_id: "proj-nightfall".into(),
+                name: "Nightfall".into(),
+                bytes: 12_400_000_000,
+                files: 1_284,
+                error: String::new(),
+            },
+            SpaceRow {
+                account_id: "acct-farbhaus".into(),
+                account_name: "Farbhaus".into(),
+                workspace_name: "Shows".into(),
+                project_id: "proj-archive".into(),
+                name: "Archive 2024".into(),
+                bytes: 2_100_000_000,
+                files: 212,
+                error: "403 forbidden: the walk could not read folder 9f2c1a".into(),
+            },
+            SpaceRow {
+                account_id: "acct-farbhaus".into(),
+                account_name: "Farbhaus".into(),
+                workspace_name: "Marketing".into(),
+                project_id: "proj-trailer".into(),
+                name: "Trailer Cutdown".into(),
+                bytes: 640_000_000,
+                files: 38,
+                error: String::new(),
+            },
+        ],
+        space_walking: false,
         toasts: vec![
             Toast {
                 text: "Share link copied".into(),
