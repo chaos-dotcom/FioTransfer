@@ -279,10 +279,9 @@ pub fn bundle_path(exe: &Path) -> Result<PathBuf, String> {
 /// Checks that the folder holding `app` can take a new copy.
 pub fn can_replace(app: &Path) -> Result<(), String> {
     let dir = parent(app).unwrap_or_else(|| PathBuf::from("/"));
-    let c = std::ffi::CString::new(dir.to_string_lossy().as_bytes())
-        .map_err(|_| format!("no permission to replace the app in {}", dir.display()))?;
-    // W_OK == 2, as Go's syscall.Access(dir, 2) asks.
-    if unsafe { libc::access(c.as_ptr(), 2) } != 0 {
+    // W_OK == 2, as Go's syscall.Access(dir, 2) asks (a path with an interior
+    // NUL can't be asked about, and is not writable).
+    if !fiotransfer_sys::platform::is_writable(&dir.to_string_lossy()) {
         return Err(format!("no permission to replace the app in {}", dir.display()));
     }
     Ok(())
@@ -319,7 +318,6 @@ while kill -0 "$1" 2>/dev/null; do
 done
 case "$3" in */.FioTransfer-update-*) rm -rf "$3" ;; esac
 open "$2""#;
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(SCRIPT)
@@ -331,12 +329,7 @@ open "$2""#;
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     // Outlives the app: its own session, so quitting the app doesn't kill it.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        })
-    };
+    fiotransfer_sys::platform::pre_exec_detach(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     // Reap the helper so the app doesn't leave a zombie behind while it quits.
     std::thread::spawn(move || {

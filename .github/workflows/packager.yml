@@ -1,27 +1,41 @@
 name: package
 
-# Unsigned binaries for macOS, Linux and Windows, through cargo-packager.
+# Builds unsigned binaries for macOS, Linux and Windows, and cuts a release when
+# the version in Cargo.toml is new.
+#
+# THE VERSION LIVES IN ONE PLACE: `[package] version` in Cargo.toml (currently
+# 1.3.0, the version the original app is at). Everything else follows it:
+#   * `APP_VERSION` below is read from the manifest, not written here;
+#   * both crates' packager metadata omit `version`, so the bundles take the
+#     crate version;
+#   * `src/lib.rs` reports `env!("CARGO_PKG_VERSION")` unless a build overrides
+#     it with FIO_VERSION (development builds);
+#   * a release is cut only when the tag for that version does not exist yet.
+# Bump Cargo.toml, push to main, and a release appears. Nothing else to edit.
 #
 # What is packaged where, and why it differs:
-#   * macOS   - the application as it ships: the Wails-compatible webview shell
-#               (`fiotransfer`), which is AppKit code and builds only there.
-#               The egui front end is packaged beside it, so the same UI can be
-#               opened on every platform.
-#   * Linux   - the egui front end only (`fiotransfer-egui`): eframe runs on
-#               Linux, the AppKit shell does not exist there.
+#   * macOS   - the app as it ships: the Wails-compatible webview shell
+#               (`fiotransfer`), which is AppKit code and builds only there,
+#               plus the egui front end beside it.
+#   * Linux   - the egui front end only (`fiotransfer-egui`): eframe runs there,
+#               the AppKit shell does not exist.
 #   * Windows - the egui front end, same reason.
 #
-# Nothing is signed: no certificate, no notarisation, no Authenticode. These
-# artifacts are for testing and for CI proof that the code builds.
-#
-# cargo-packager 0.11 reads its configuration from `[package.metadata.packager]`
-# in each crate's Cargo.toml. `cargo packager --config <file>` is broken in that
-# release ("Not a directory"), so the configuration lives in the manifests.
+# Nothing is signed: no certificate, no notarisation, no Authenticode.
 
 on:
-  workflow_dispatch:
   push:
+    branches: [main]
     tags: ["v*"]
+  # Pull requests build the packages too, so a packaging change is proven before
+  # it lands — but the release job below can only run for a push to main.
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "egui-ui/Cargo.toml"
+      - ".github/workflows/packager.yml"
+      - "build/icons/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,7 +44,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read the version, and decide whether it is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # One source of truth: the manifest, not this file.
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "Cargo.toml says $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # A release exists already? Then this push is not a release.
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "manual run: packaging only"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$VERSION is already released: packaging only"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$VERSION is new: this run will release it"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   macos:
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,19 +84,30 @@ jobs:
           tool: cargo-packager@0.11.8
       - uses: Swatinem/rust-cache@v2
       # Both workspace members carry packager metadata, so this makes the AppKit
-      # app (dist/) and the egui app (dist-egui/).
+      # app (dist/) and the egui app (dist-egui/), each stamped with the version.
       - name: Package (unsigned)
         run: cargo packager --formats app
+      - name: Name the bundles with the version
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          mkdir -p out
+          ditto -c -k --keepParent dist/FioTransfer.app "out/FioTransfer-$V-macos-app.zip"
+          ditto -c -k --keepParent dist-egui/FioTransfer.app "out/FioTransfer-$V-macos-egui-app.zip"
+          ls -l out
       - uses: actions/upload-artifact@v4
         with:
-          name: FioTransfer-macos-unsigned
-          path: |
-            dist/*.app
-            dist-egui/*.app
+          name: macos
+          path: out/*
           if-no-files-found: error
 
   linux:
+    needs: version
     runs-on: ubuntu-latest
+    env:
+      # linuxdeploy ships as an AppImage; without FUSE in the runner it has to
+      # unpack itself instead of mounting.
+      APPIMAGE_EXTRACT_AND_RUN: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,7 +115,6 @@ jobs:
         with:
           tool: cargo-packager@0.11.8
       - uses: Swatinem/rust-cache@v2
-      # eframe/winit build against these; AppImage needs fuse to be introspected.
       - name: System libraries
         run: |
           sudo apt-get update
@@ -69,16 +123,26 @@ jobs:
             libxcb-xfixes0-dev libwayland-dev libudev-dev libssl-dev \
             fuse libfuse2 file
       - name: Package the egui front end (unsigned)
-        run: cargo packager -p fiotransfer-egui --formats deb appimage
+        run: cargo packager -p fiotransfer-egui --formats deb,appimage
+      - name: Collect with the version in the name
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          mkdir -p out
+          for f in dist-egui/*.deb dist-egui/*.AppImage; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f"); ext="${base##*.}"
+            cp "$f" "out/FioTransfer-$V-linux.$ext"
+          done
+          ls -l out
       - uses: actions/upload-artifact@v4
         with:
-          name: FioTransfer-linux-unsigned
-          path: |
-            dist-egui/*.deb
-            dist-egui/*.AppImage
+          name: linux
+          path: out/*
           if-no-files-found: error
 
   windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,11 +151,53 @@ jobs:
         with:
           tool: cargo-packager@0.11.8
       - uses: Swatinem/rust-cache@v2
-      # NSIS is fetched by cargo-packager itself; nothing is signed.
       - name: Package the egui front end (unsigned)
         run: cargo packager -p fiotransfer-egui --formats nsis
+      - name: Collect with the version in the name
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          mkdir -p out
+          for f in dist-egui/*.exe; do
+            [ -e "$f" ] || continue
+            cp "$f" "out/FioTransfer-$V-windows-setup.exe"
+          done
+          ls -l out
       - uses: actions/upload-artifact@v4
         with:
-          name: FioTransfer-windows-unsigned
-          path: dist-egui/*.exe
+          name: windows
+          path: out/*
           if-no-files-found: error
+
+  release:
+    needs: [version, macos, linux, windows]
+    # Only a push to main releases. A pull request builds everything and stops.
+    if: needs.version.outputs.release == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Show what will be released
+        run: ls -lR artifacts
+      - name: Create the release for this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "FioTransfer $VERSION" \
+            --notes "Unsigned builds of FioTransfer $VERSION, from Cargo.toml.
+
+          macOS: the application as it ships (webview shell) and the egui front end.
+          Linux: the egui front end (.deb, .AppImage).
+          Windows: the egui front end (NSIS installer).
+
+          Nothing here is signed or notarised."

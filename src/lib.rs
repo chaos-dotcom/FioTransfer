@@ -6,6 +6,12 @@
 //! same WebKit view, and the same AppKit menu bar item, download panel and
 //! Finder services.
 
+#![forbid(unsafe_code)]
+// Every `unsafe` in this workspace lives in the `fiotransfer-sys` crate: the
+// AppKit shims in `mac/` and the `libc` calls are declared and used there,
+// behind safe functions. This crate can't write `unsafe` at all — `forbid`,
+// not `deny`, so not even an `#[allow(unsafe_code)]` deeper down is possible.
+
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -31,8 +37,10 @@ pub mod tray;
 
 pub use app::App;
 
-/// Set at build time: `FIO_VERSION=1.2.3` or `-X`-style; "dev" when unset.
+/// The version this build reports: `Cargo.toml`'s, unless a build overrides it
+/// (`FIO_VERSION=0.0.0-abc1234` for a development build off a commit). One number,
+/// in one place, and the release workflow reads the same one.
 pub const VERSION: &str = match option_env!("FIO_VERSION") {
     Some(v) => v,
-    None => "dev",
+    None => env!("CARGO_PKG_VERSION"),
 };

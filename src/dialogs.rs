@@ -12,40 +12,9 @@
 //! can't serve is a dialog asked for before the app's event loop is running:
 //! that is answered as cancelled rather than waiting for a main queue that
 //! never drains.
-
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
-
-extern "C" {
-    fn fioOpenFiles(title: *const c_char) -> *mut c_char;
-    fn fioOpenDir(title: *const c_char, def: *const c_char, can_create: c_int) -> *mut c_char;
-    fn fioSaveFile(title: *const c_char, def_name: *const c_char) -> *mut c_char;
-    fn fioQuestion(title: *const c_char, message: *const c_char, ok: *const c_char, cancel: *const c_char) -> c_int;
-    fn fioAlert(title: *const c_char, message: *const c_char);
-    fn fioClipboardGet() -> *mut c_char;
-    fn fioClipboardSet(t: *const c_char);
-    fn fioWindowPNG(path: *const c_char) -> c_int;
-    fn fioFree(p: *mut c_void);
-}
-
-fn cstr(s: &str) -> CString {
-    match CString::new(s) {
-        Ok(c) => c,
-        Err(_) => {
-            let cleaned: String = s.chars().map(|c| if c == '\0' { ' ' } else { c }).collect();
-            CString::new(cleaned).unwrap_or_else(|_| CString::new("").expect("empty"))
-        }
-    }
-}
-
-/// Reads a string the C side handed over and gives its memory back.
-fn take_string(p: *mut c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
-    unsafe { fioFree(p.cast::<c_void>()) };
-    s
-}
+//!
+//! The shims themselves, and the `CString`/`CStr`/`fioFree` work around them,
+//! are `fiotransfer_sys::dialogs`'s; this module is what the app asks for.
 
 /// The paths out of `fioOpenFiles`' JSON answer.
 fn paths_from_json(json: &str) -> Vec<String> {
@@ -60,15 +29,13 @@ fn paths_from_json(json: &str) -> Vec<String> {
 
 /// Asks for files to upload; empty when cancelled.
 pub fn open_files(title: &str) -> Vec<String> {
-    let t = cstr(title);
-    paths_from_json(&take_string(unsafe { fioOpenFiles(t.as_ptr()) }))
+    paths_from_json(&fiotransfer_sys::dialogs::open_files(title))
 }
 
 /// Asks for one folder; `None` when cancelled. `default_dir` opens the panel
 /// there, and `can_create` lets the panel make a new folder.
 pub fn open_dir(title: &str, default_dir: &str, can_create: bool) -> Option<String> {
-    let (t, d) = (cstr(title), cstr(default_dir));
-    let path = take_string(unsafe { fioOpenDir(t.as_ptr(), d.as_ptr(), i32::from(can_create)) });
+    let path = fiotransfer_sys::dialogs::open_dir(title, default_dir, can_create);
     if path.is_empty() {
         None
     } else {
@@ -78,8 +45,7 @@ pub fn open_dir(title: &str, default_dir: &str, can_create: bool) -> Option<Stri
 
 /// Asks where to write a file; `None` when cancelled.
 pub fn save_file(title: &str, default_name: &str) -> Option<String> {
-    let (t, n) = (cstr(title), cstr(default_name));
-    let path = take_string(unsafe { fioSaveFile(t.as_ptr(), n.as_ptr()) });
+    let path = fiotransfer_sys::dialogs::save_file(title, default_name);
     if path.is_empty() {
         None
     } else {
@@ -93,32 +59,28 @@ pub fn save_file(title: &str, default_name: &str) -> Option<String> {
 /// and `ok` is clicked (or reached with Tab). Escape does nothing, as it did
 /// through Wails.
 pub fn question(title: &str, message: &str, ok: &str, cancel: &str) -> bool {
-    let (t, m, o, c) = (cstr(title), cstr(message), cstr(ok), cstr(cancel));
-    unsafe { fioQuestion(t.as_ptr(), m.as_ptr(), o.as_ptr(), c.as_ptr()) != 0 }
+    fiotransfer_sys::dialogs::question(title, message, ok, cancel)
 }
 
 /// Shows an error, with an OK button.
 pub fn error(title: &str, message: &str) {
-    let (t, m) = (cstr(title), cstr(message));
-    unsafe { fioAlert(t.as_ptr(), m.as_ptr()) };
+    fiotransfer_sys::dialogs::alert(title, message);
 }
 
 /// The clipboard as plain text; empty when it holds no text.
 pub fn clipboard_text() -> String {
-    take_string(unsafe { fioClipboardGet() })
+    fiotransfer_sys::dialogs::clipboard_get()
 }
 
 /// Replaces the clipboard with plain text.
 pub fn clipboard_set_text(t: &str) {
-    let c = cstr(t);
-    unsafe { fioClipboardSet(c.as_ptr()) };
+    fiotransfer_sys::dialogs::clipboard_set(t);
 }
 
 /// Writes the front window as a PNG and says whether it did. The measurement
 /// harness reads the file to check the layout it just rendered.
 pub fn window_png(path: &str) -> bool {
-    let p = cstr(path);
-    unsafe { fioWindowPNG(p.as_ptr()) != 0 }
+    fiotransfer_sys::dialogs::window_png(path)
 }
 
 #[cfg(test)]

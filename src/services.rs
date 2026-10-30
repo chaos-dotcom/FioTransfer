@@ -11,8 +11,10 @@
 //! provider, and `request` runs the host's callbacks inline on whichever thread
 //! called it — the Go app used a goroutine for this, here a host must not block
 //! (it posts a window show and an event into the app's loop and returns).
+//!
+//! The C side is `fiotransfer_sys::services`'s: it installs the provider and
+//! declares the `goService` entry point the provider calls back.
 
-use std::ffi::{c_char, c_int, CStr};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -30,10 +32,6 @@ pub struct ServiceRequest {
 pub trait ServiceHost: Send + Sync + 'static {
     fn show_window(&self);
     fn emit_service(&self);
-}
-
-extern "C" {
-    fn fioServicesInit();
 }
 
 #[derive(Default)]
@@ -102,23 +100,15 @@ pub fn take() -> Vec<ServiceRequest> {
 
 /// Installs the Finder services provider; call it before the event loop starts.
 pub fn init() {
-    unsafe { fioServicesInit() };
+    fiotransfer_sys::services::set_service_hook(service_from_c);
+    fiotransfer_sys::services::services_init();
 }
 
-/// A string the service passed in; NULL reads as empty.
-fn from_c(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-}
-
-/// Called from services_darwin.m with the pasteboard's paths as a JSON array.
-/// `kind` is 1 for the watch-folder service and 0 for upload.
-#[no_mangle]
-#[allow(non_snake_case)]
-pub extern "C" fn goService(kind: c_int, paths: *const c_char) {
-    let ps: Vec<String> = match serde_json::from_str(&from_c(paths)) {
+/// Called from services_darwin.m with the pasteboard's paths as a JSON array
+/// (through `fiotransfer_sys::services::goService`). `kind` is 1 for the
+/// watch-folder service and 0 for upload.
+fn service_from_c(kind: i32, paths: &str) {
+    let ps: Vec<String> = match serde_json::from_str(paths) {
         Ok(v) => v,
         Err(_) => return,
     };

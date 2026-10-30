@@ -137,30 +137,18 @@ pub struct WindowOptions {
     pub start_hidden: bool,
 }
 
-extern "C" {
-    fn fioMenuInit(cb: extern "C" fn(i32));
-    fn fioWindowStyle();
-    fn fioSnapshotWebView(path: *const std::os::raw::c_char) -> i32;
-    fn fioEvalJS(js: *const std::os::raw::c_char);
-    fn fioEvalJSFile(js: *const std::os::raw::c_char, path: *const std::os::raw::c_char) -> i32;
-}
-
 /// The webview's own pixels, for the measuring harness. Must not be called on
 /// the main thread (it waits for the main queue).
 pub fn snapshot_webview(path: &str) -> bool {
-    let c = std::ffi::CString::new(path).unwrap_or_default();
-    unsafe { fioSnapshotWebView(c.as_ptr()) == 1 }
+    fiotransfer_sys::gui::snapshot_webview(path)
 }
 
 pub fn eval_js(js: &str) {
-    let c = std::ffi::CString::new(js).unwrap_or_default();
-    unsafe { fioEvalJS(c.as_ptr()) }
+    fiotransfer_sys::gui::eval_js(js)
 }
 
 pub fn eval_js_to_file(js: &str, path: &str) -> bool {
-    let j = std::ffi::CString::new(js).unwrap_or_default();
-    let p = std::ffi::CString::new(path).unwrap_or_default();
-    unsafe { fioEvalJSFile(j.as_ptr(), p.as_ptr()) == 1 }
+    fiotransfer_sys::gui::eval_js_to_file(js, path)
 }
 
 extern "C" fn menu_callback(tag: i32) {
@@ -254,7 +242,7 @@ pub fn run(host: Arc<dyn BridgeHost>, opts: WindowOptions) -> i32 {
     let url = format!("http://127.0.0.1:{}/index.html", port);
 
     // The menu is built before the run loop starts, as Wails did.
-    unsafe { fioMenuInit(menu_callback) };
+    fiotransfer_sys::gui::menu_init(menu_callback);
 
     let (tx, _rx) = mpsc::unbounded_channel::<(u64, String, Vec<Value>)>();
     let host_for_ipc = host.clone();
@@ -307,7 +295,7 @@ pub fn run(host: Arc<dyn BridgeHost>, opts: WindowOptions) -> i32 {
         }
     };
 
-    unsafe { fioWindowStyle() };
+    fiotransfer_sys::gui::window_style();
 
     let mut started = false;
     let mut hidden = opts.start_hidden;
