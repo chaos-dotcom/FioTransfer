@@ -20,6 +20,18 @@ owns the path and creates the folder; Portal's own `destination_path` / `path_te
 are deliberately ignored, because the NAS layout Portal writes for Project Zeus is not
 the layout of this machine.
 
+## What happens the first time it runs
+
+A marker names a `Live_Work` folder that may already hold media — from Project Zeus, a previous app, or your own
+work. So a watch made by the reconciler does **not** start by downloading the project.
+
+The folder is walked once and what is already there is recorded as known, both ways: existing local files are
+baselined rather than uploaded again, and the remote listing records matches rather than fetching them. Files that
+appear afterwards sync normally in both directions.
+
+That is deliberate: connecting FioTransfer to a Portal with forty populated project folders must not re-download
+forty projects, and must not push a second copy of everything you already have.
+
 ## Setting it up
 
 Settings → **Portal**:
