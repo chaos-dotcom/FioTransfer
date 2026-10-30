@@ -122,8 +122,15 @@ pub fn pre_exec_detach(cmd: &mut std::process::Command) {
     };
 }
 
-/// Makes the helper outlive the app; nothing to detach where there are no
-/// sessions.
+/// Makes the helper outlive the app.
+///
+/// Nothing to do here: what `setsid()` buys on unix is a session of the child's
+/// own, and Windows has no sessions. A child process there is not killed when its
+/// parent exits, which is the property the caller wants; and the one thing that
+/// does still reach it — a Ctrl+C typed at the shared console — is not a
+/// detached helper's problem here because there is no helper to start: the only
+/// caller (`update::relaunch`) runs a `/bin/sh` script, and the Windows build
+/// never takes that path (its installer owns updates).
 #[cfg(not(unix))]
 pub fn pre_exec_detach(_cmd: &mut std::process::Command) {}
 

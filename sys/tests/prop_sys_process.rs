@@ -9,6 +9,12 @@
 //! process' SIGINT disposition to the default, so a test that calls it changes
 //! the test harness' own signal handling. It is reachable only from a
 //! short-lived child process.
+//!
+//! unix only: `pre_exec_detach` is `setsid()`, and what this checks is a session
+//! and a process group. Windows has neither, the function there is the empty
+//! one, and `hostname`/`is_tty` answer "no". Nothing to test.
+
+#![cfg(unix)]
 
 use fiotransfer_sys::platform::{hostname, is_tty, pre_exec_detach};
 
