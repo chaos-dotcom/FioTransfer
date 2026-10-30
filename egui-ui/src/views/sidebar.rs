@@ -659,9 +659,10 @@ fn elide(painter: &egui::Painter, text: &str, font_id: &FontId, max_w: f32) -> S
 #[derive(Clone, Copy)]
 enum Icon {
     Arrows,
-    Pie,
     Eye,
     Clock,
+    /// The Space donut (`#view-space`'s nav item).
+    Pie,
     Sliders,
 }
 
@@ -692,22 +693,13 @@ fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, st
             polyline(painter, &[p(13.5, 15.0), p(10.8, 12.3)], stroke);
             polyline(painter, &[p(13.5, 15.0), p(16.2, 12.3)], stroke);
         }
-        // A storage pie: the disc, with one 60° slice picked out.
+        // The Space mark, from `index.html`: `<circle r=6.6>`, `<circle r=2.4>`
+        // and two ticks, `M10 3.4v4.2M16.6 10h-4.2` — a donut seen end on.
         Icon::Pie => {
-            let centre = p(10.0, 10.0);
-            let radius = 7.0 * scale;
-            painter.circle_stroke(centre, radius, stroke);
-            let steps = 12;
-            let mut wedge = Vec::with_capacity(steps + 2);
-            wedge.push(centre);
-            for i in 0..=steps {
-                let angle = (-90.0 + 60.0 * i as f32 / steps as f32).to_radians();
-                wedge.push(pos2(
-                    centre.x + radius * angle.cos(),
-                    centre.y + radius * angle.sin(),
-                ));
-            }
-            painter.add(egui::Shape::convex_polygon(wedge, color, Stroke::NONE));
+            painter.circle_stroke(p(10.0, 10.0), 6.6 * scale, stroke);
+            painter.circle_stroke(p(10.0, 10.0), 2.4 * scale, stroke);
+            polyline(painter, &[p(10.0, 3.4), p(10.0, 7.6)], stroke);
+            polyline(painter, &[p(16.6, 10.0), p(12.4, 10.0)], stroke);
         }
         // "M2.5 10s2.7-5 7.5-5 7.5 5 7.5 5-2.7 5-7.5 5-7.5-5-7.5-5z" + circle 2.2
         Icon::Eye => {
@@ -1058,6 +1050,10 @@ mod tests {
         harness.get_by_label("Watch Folders").click();
         harness.run();
         assert_eq!(harness.state().view, View::Watch);
+
+        harness.get_by_label("Space").click();
+        harness.run();
+        assert_eq!(harness.state().view, View::Space);
 
         harness.get_by_label("Settings").click();
         harness.run();

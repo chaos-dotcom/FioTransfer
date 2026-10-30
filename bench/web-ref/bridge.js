@@ -264,6 +264,78 @@
     stream_limit: 16,
   };
 
+  // `Space()` - the walk `App::refresh_space` (src/app.rs) takes, one row per
+  // project, largest first. INVENTED: the egui fixture has no Space screen, so
+  // these four projects are made up to `SpaceProject`'s own fields. The sizes
+  // are picked to print at every branch of fmtBytes (92.5 GB, 18.4 GB, 6.20 GB,
+  // 1.05 GB, 118 GB for the total).
+  var SPACE = [
+    {
+      account_id: 'acc-nightfall',
+      account_name: 'Nightfall',
+      workspace_id: 'ws-shows',
+      workspace_name: 'Shows',
+      project_id: 'proj-ep04',
+      name: 'Nightfall Ep 04',
+      root_folder_id: 'fld-ep04',
+      bytes: 92500000000,
+      files: 1432,
+      error: '',
+    },
+    {
+      account_id: 'acc-nightfall',
+      account_name: 'Nightfall',
+      workspace_id: 'ws-shows',
+      workspace_name: 'Shows',
+      project_id: 'proj-trailer',
+      name: 'Trailer',
+      root_folder_id: 'fld-trailer',
+      bytes: 18400000000,
+      files: 96,
+      error: '',
+    },
+    {
+      account_id: 'acc-nightfall',
+      account_name: 'Nightfall',
+      workspace_id: 'ws-marketing',
+      workspace_name: 'Marketing',
+      project_id: 'proj-stills',
+      name: 'Still Lives',
+      root_folder_id: 'fld-stills',
+      bytes: 6200000000,
+      files: 214,
+      error: '',
+    },
+    {
+      // INVENTED: a project with nothing in it, so the legend's "0 B · 0 files"
+      // row and the arc-less swatch are drawn too.
+      account_id: 'acc-nightfall',
+      account_name: 'Nightfall',
+      workspace_id: 'ws-archive',
+      workspace_name: 'Archive',
+      project_id: 'proj-archive',
+      name: 'Archive 2021',
+      root_folder_id: 'fld-archive',
+      bytes: 0,
+      files: 0,
+      error: '',
+    },
+    {
+      account_id: 'acc-agency',
+      account_name: 'Nightfall Agency',
+      workspace_id: 'ws-agency',
+      workspace_name: 'Agency',
+      project_id: 'proj-title',
+      name: 'Title Sequence',
+      root_folder_id: 'fld-title',
+      bytes: 1050000000,
+      files: 37,
+      // INVENTED: one row that could not finish, so the warning is drawn.
+      error: 'permission denied in fld-title/masters',
+    },
+  ];
+  var SPACE_WALKING = false;
+
   // The egui fixture has no update status at all: idle, nothing to draw.
   var UPDATE = {
     available: false,
@@ -336,6 +408,22 @@
     AddWatch: function () { return WATCHES; },
     UpdateWatch: function () { return WATCHES; },
     RemoveWatch: function () { return WATCHES; },
+    // ---- Space (the walk `Space()` returns; INVENTED above) ----
+    Space: function () { return SPACE; },
+    SpaceWalking: function () { return SPACE_WALKING; },
+    RefreshSpace: function () {
+      SPACE_WALKING = true;
+      setTimeout(function () { SPACE_WALKING = false; }, 1200);
+      return null;
+    },
+    // The one destructive call: it drops the row and records the arguments, so
+    // the render can prove what was asked for (and that nothing else was).
+    DeleteProject: function (acct, project) {
+      SPACE = SPACE.filter(function (p) { return !(p.project_id === project && p.account_id === acct); });
+      window.__bridge.deleted.push([acct, project]);
+      return null;
+    },
+
     StartUpload: function () { return null; },
     StartDownload: function () { return null; },
     CreateFolder: function () { return { id: '', name: '', kind: 'folder', folder_id: '' }; },
@@ -392,6 +480,7 @@
     fixture: { state: STATE, snapshot: SNAPSHOT, watches: WATCHES, history: HISTORY, update: UPDATE },
     calls: calls,
     unhandled: unhandled,
+    deleted: [],
     opened: [],
     clipboard: '',
     emit: function (name, payload) {

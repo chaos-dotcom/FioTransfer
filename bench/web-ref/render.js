@@ -54,7 +54,7 @@ const OPTS = {
   toasts: !process.argv.includes('--no-toasts'),
   events: !process.argv.includes('--no-events'),
   keepProfile: process.argv.includes('--keep-profile'),
-  views: ['transfers', 'watch', 'history', 'settings'],
+  views: ['transfers', 'watch', 'history', 'settings', 'space'],
 };
 
 const MIME = {
@@ -707,7 +707,211 @@ async function main() {
     log('watch    ' + watchRow);
     log('history  ' + histRow);
     check(/^2 rows, first: Renders$/.test(watchRow), 'the watch screen lists the fixture\'s two watches');
-    check(/^3 rows, first: Nightfall_Ep04_Dailies 42\/42$/.test(histRow), 'the history screen lists the fixture\'s three rows');
+    // The Space screen: the donut, the legend, the walking state, and the
+    // delete dialog, which is the only destructive path in the app.
+    await cdp.evaluate("document.querySelector('[data-view=\"space\"]').click()");
+    await sleep(300);
+    const space = await cdp.evaluate(`(() => {
+      const rows = [...document.querySelectorAll('#space-legend .row')];
+      const arcs = [...document.querySelectorAll('#space-chart .slice')];
+      const last = rows[rows.length - 1];
+      return {
+        rows: rows.length,
+        first: rows[0] ? rows[0].title : '',
+        last: last ? last.title : '',
+        arcs: arcs.length,
+        fills: arcs.map((a) => a.getAttribute('fill')),
+        total: (document.querySelector('#space-total') || {}).textContent || '',
+        warn: [...document.querySelectorAll('#space-legend .space-warn')].map((e) => e.getAttribute('title')),
+        svg: !!document.querySelector('#space-chart svg'),
+      };
+    })()`);
+    log('space    ' + JSON.stringify(space));
+    check(space.rows === 5, 'the space legend lists every project');
+    check(space.first === 'Nightfall Ep 04 — 92.5 GB — 1432 files', 'the legend reads name — size — files, largest first');
+    check(space.last === 'Archive 2021 — 0 B — 0 files', 'a project that holds nothing still has a line');
+    check(space.arcs === 4 && new Set(space.fills).size === 4, 'one arc per project that holds something, four distinct colours');
+    check(space.fills[0] === '#5b53ff', 'the largest project is drawn in the brand colour');
+    check(space.total === '118 GB · 5 projects', 'the header carries the total and the project count');
+    check(space.warn.length === 1 && /permission denied/.test(space.warn[0]), 'a walk that failed is marked, with its reason');
+
+    // Where the pieces landed: the chart left of the legend, the arcs inside the
+    // SVG box, the hole in the middle of the ring, and no sideways scrolling.
+    const geom = await cdp.evaluate(`(() => {
+      const box = (el) => {
+        const b = el.getBoundingClientRect();
+        return { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height), right: Math.round(b.right), bottom: Math.round(b.bottom) };
+      };
+      const svg = document.querySelector('#space-chart svg');
+      const vb = svg.viewBox.baseVal;
+      const view = document.querySelector('#view-space');
+      const arcs = [...svg.querySelectorAll('path.slice')];
+      const arcBoxes = arcs.map((a) => {
+        const b = a.getBBox();
+        return { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height), d: a.getAttribute('d').length };
+      });
+      const textBoxes = [...svg.querySelectorAll('text')].map((t) => {
+        const b = t.getBBox();
+        return { s: t.textContent, x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height) };
+      });
+      const sr = svg.getBoundingClientRect();
+      const centre = document.elementFromPoint(sr.x + sr.width / 2, sr.y + sr.height / 2);
+      const del = document.querySelector('#space-legend .space-del');
+      const legend = document.querySelector('.space-legend').getBoundingClientRect();
+      const row = document.querySelector('#space-legend .row').getBoundingClientRect();
+      return {
+        chart: box(document.querySelector('#space-chart')),
+        legend: box(document.querySelector('.space-legend')),
+        svg: box(svg),
+        viewBox: { w: vb.width, h: vb.height },
+        overflow: view.scrollWidth - view.clientWidth,
+        arcBoxes,
+        textBoxes,
+        centre: centre ? centre.tagName + (centre.getAttribute('class') ? '.' + centre.getAttribute('class') : '') : null,
+        rowH: Math.round(row.height),
+        del: box(del),
+        legendRight: Math.round(legend.right),
+        legendBottom: Math.round(legend.bottom),
+        viewBottom: Math.round(view.getBoundingClientRect().bottom),
+      };
+    })()`);
+    log('geometry ' + JSON.stringify(geom));
+    const radius = (p, cx, cy) => Math.hypot(Math.max(Math.abs(p.x - cx), Math.abs(p.x + p.w - cx)), Math.max(Math.abs(p.y - cy), Math.abs(p.y + p.h - cy)));
+    check(geom.chart.right <= geom.legend.x, 'the chart sits left of the legend, not over it');
+    check(geom.overflow === 0, 'the space screen does not scroll sideways (' + geom.overflow + ' px)');
+    check(
+      geom.arcBoxes.length === 4 && geom.arcBoxes.every((b) => b.x >= 0 && b.y >= 0 && b.x + b.w <= geom.viewBox.w && b.y + b.h <= geom.viewBox.h),
+      'every arc stays inside the 240x240 SVG box',
+    );
+    check(geom.centre !== null && !/slice/.test(geom.centre) && geom.centre !== 'path', 'the middle of the ring is a hole, not an arc (' + geom.centre + ')');
+    check(
+      geom.textBoxes.length === 2 && geom.textBoxes.every((t) => radius(t, 120, 120) < 72),
+      'the total and its label sit inside the ring\'s hole (72 px radius)',
+    );
+    check(geom.del.right <= geom.legendRight - 4 && geom.del.w >= 48, 'the Delete button fits inside the legend card');
+    check(geom.legendBottom <= geom.viewBottom, 'the whole legend is on screen at 1180x780 (' + geom.legendBottom + ' of ' + geom.viewBottom + ')');
+
+    // The walking state, driven through the screen's own render: SpaceWalking is
+    // the flag, so the state has to read right while it is true.
+    const walking = await cdp.evaluate(`(() => {
+      const keep = { rows: SP.rows, walked: SP.walked };
+      SP.rows = [];
+      SP.walking = true;
+      renderSpace();
+      const out = {
+        status: !document.querySelector('#space-status').classList.contains('hidden'),
+        statusText: document.querySelector('#space-status').textContent.trim(),
+        spinner: !!document.querySelector('#space-status .spinner'),
+        refreshDisabled: document.querySelector('#space-refresh').disabled,
+        empty: !document.querySelector('#space-empty').classList.contains('hidden'),
+        title: document.querySelector('#space-empty-title').textContent.trim(),
+        body: !document.querySelector('#space-body').classList.contains('hidden'),
+      };
+      SP.walking = false;
+      SP.walked = true;
+      renderSpace();
+      const empty = {
+        title: document.querySelector('#space-empty-title').textContent.trim(),
+        button: document.querySelector('#space-empty-btn').textContent.trim(),
+        hiddenButton: document.querySelector('#space-empty-btn').classList.contains('hidden'),
+        body: !document.querySelector('#space-body').classList.contains('hidden'),
+      };
+      SP.rows = keep.rows;
+      SP.walked = keep.walked;
+      renderSpace();
+      return { out, empty };
+    })()`);
+    log('walking  ' + JSON.stringify(walking.out));
+    log('empty    ' + JSON.stringify(walking.empty));
+    check(walking.out.status && walking.out.spinner, 'a walk in progress shows the walking line and a spinner');
+    check(/^Walking Frame\.io…/.test(walking.out.statusText), 'the walking line says what it is doing');
+    check(walking.out.refreshDisabled, 'Refresh is disabled while a walk is in progress');
+    check(walking.out.empty && walking.out.title === 'Walking Frame.io…' && !walking.out.body, 'an empty screen while walking says so');
+    check(walking.empty.title === 'No projects' && !walking.empty.body, 'a finished walk with nothing in it says so');
+    check(walking.empty.button === 'Refresh' && !walking.empty.hiddenButton, 'the empty screen offers Refresh');
+
+    // One project: the arc is a whole ring, which is two half arcs in one path -
+    // an arc that ends where it starts has no direction to draw.
+    const single = await cdp.evaluate(`(() => {
+      const keep = SP.rows;
+      SP.rows = [{
+        account_id: 'acc-one', account_name: 'One', workspace_id: 'ws-one', workspace_name: 'Work',
+        project_id: 'proj-only', name: 'Only project', root_folder_id: 'fld-only',
+        bytes: 4000000000, files: 3, error: '',
+      }];
+      renderSpace();
+      const paths = [...document.querySelectorAll('#space-chart .slice')];
+      const boxes = paths.map((p) => { const b = p.getBBox(); return [Math.round(b.x), Math.round(b.y), Math.round(b.width), Math.round(b.height)]; });
+      const out = {
+        paths: paths.length,
+        d: paths.map((p) => p.getAttribute('d')).join(''),
+        subpaths: (paths[0]?.getAttribute('d').match(/M/g) || []).length,
+        boxes,
+        total: document.querySelector('#space-total').textContent,
+        rows: document.querySelectorAll('#space-legend .row').length,
+      };
+      SP.rows = keep;
+      renderSpace();
+      return out;
+    })()`);
+    log('one      ' + JSON.stringify({ paths: single.paths, subpaths: single.subpaths, d: single.d, boxes: single.boxes, total: single.total }));
+    check(single.paths === 1 && single.subpaths === 2, 'a single project draws one arc of two halves');
+    check(single.boxes[0][2] >= 200 && single.boxes[0][3] >= 200, 'that arc spans the whole ring');
+    check(single.total === '4.00 GB · 1 project' && single.rows === 1, 'one project reads "1 project", not "1 projects"');
+
+    const del = await cdp.evaluate(`(async () => {
+      const openLast = () => {
+        const buttons = document.querySelectorAll('#space-legend .space-del');
+        buttons[buttons.length - 1].click();
+        return document.querySelector('#space-confirm');
+      };
+      const rowsNow = () => document.querySelectorAll('#space-legend .row').length;
+      const m = openLast();
+      const shown = {
+        open: !m.classList.contains('hidden'),
+        name: document.querySelector('#sc-name').textContent,
+        size: document.querySelector('#sc-size').textContent,
+        where: document.querySelector('#sc-where').textContent,
+        warn: document.querySelector('#sc-warn').textContent.trim(),
+        focus: document.activeElement.id,
+        delFocused: document.activeElement === document.querySelector('#sc-del'),
+      };
+      document.querySelector('#sc-cancel').click();
+      const afterCancel = rowsNow();
+      openLast();
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      const afterEscape = { rows: rowsNow(), open: !m.classList.contains('hidden'), deleted: window.__bridge.deleted.length };
+      openLast();
+      document.querySelector('#sc-del').click();
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        shown,
+        afterCancel,
+        afterEscape,
+        deletedAfterCancel: afterEscape.deleted,
+        rowsAfter: rowsNow(),
+        closed: m.classList.contains('hidden'),
+        deleted: window.__bridge.deleted,
+        total: (document.querySelector('#space-total') || {}).textContent,
+      };
+    })()`);
+    log('delete   ' + JSON.stringify(del));
+    check(del.shown.open, 'the delete dialog opens');
+    check(del.shown.name === 'Archive 2021', 'the delete dialog names the project');
+    check(del.shown.size === '0 B · 0 files', 'the delete dialog names the size and the file count');
+    check(del.shown.where === 'Archive · Nightfall', 'the delete dialog names where the project lives');
+    check(
+      /deletes the project on Frame.io only. Nothing on this Mac is touched/i.test(del.shown.warn),
+      'the delete dialog says the delete is on Frame.io only',
+    );
+    check(del.shown.focus === 'sc-cancel' && !del.shown.delFocused, 'Cancel holds the focus, so Enter cancels');
+    check(del.afterCancel === 5 && del.deletedAfterCancel === 0, 'Cancel deletes nothing');
+    check(del.afterEscape.rows === 5 && !del.afterEscape.open && del.afterEscape.deleted === 0, 'Escape closes the dialog and deletes nothing');
+    check(del.rowsAfter === 4 && del.closed, 'the confirmed delete removes the row and closes the dialog');
+    check(
+      JSON.stringify(del.deleted) === JSON.stringify([['acc-nightfall', 'proj-archive']]),
+      'the confirmed delete asked for that project, on that account, and nothing else',
+    );
     log('');
 
     // ---- the pixels ----

@@ -596,36 +596,45 @@ fn legend_row(ui: &mut egui::Ui, index: usize, row: &SpaceRow, columns: &Columns
 /// The name cell: an 8 px swatch at the name's own top edge, then the two lines
 /// (`.name` and `.sub`) that `.space-row .cell-name { align-items: flex-start }`
 /// puts beside it.
+///
+/// The block is bounded by the column: `.sub` is `overflow: hidden;
+/// text-overflow: ellipsis`, so a long place line is cut rather than allowed to
+/// shove the size and the Delete button to the right.
 fn name_cell(ui: &mut egui::Ui, width: f32, row: &SpaceRow, colour: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
     let inset = SWATCH + COL_GAP;
-    let names = ui
-        .scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(Rect::from_min_max(
-                    pos2(rect.left() + inset, rect.top()),
-                    rect.max,
-                ))
-                .layout(Layout::left_to_right(Align::Center)),
-            |ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.add(Label::new(
-                        RichText::new(&row.name)
-                            .font(theme::body())
-                            .color(theme::TEXT),
-                    ))
-                    .on_hover_text(&row.name);
-                    sub_line(ui, row);
-                })
-                .response
-            },
+    let names_w = (width - inset).max(0.0);
+    // A plain child, not `scope_builder`: a scope would advance this row's
+    // cursor to the names' own width and pull the size and the Delete button
+    // after it.
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_size(
+                pos2(rect.left() + inset, rect.top()),
+                vec2(names_w, ROW_H),
+            ))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    child.set_max_width(names_w);
+    child.vertical(|ui| {
+        ui.set_max_width(names_w);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.add(
+            Label::new(
+                RichText::new(&row.name)
+                    .font(theme::body())
+                    .color(theme::TEXT),
+            )
+            .truncate(),
         )
-        .inner;
+        .on_hover_text(&row.name);
+        sub_line(ui, row, names_w);
+    });
+    let names = child.min_rect();
 
     // `.space-row .swatch { margin-top: 1px }`, on the first line's own top.
     ui.painter().rect_filled(
-        Rect::from_min_size(pos2(rect.left(), names.rect.top() + 1.0), Vec2::splat(SWATCH)),
+        Rect::from_min_size(pos2(rect.left(), names.top() + 1.0), Vec2::splat(SWATCH)),
         SWATCH_R,
         colour,
     );
@@ -634,28 +643,62 @@ fn name_cell(ui: &mut egui::Ui, width: f32, row: &SpaceRow, colour: Color32) {
 
 /// `.sub`: "Shows · Farbhaus", then " · could not finish" in `--notice` when the
 /// walk failed (with the reason on the pointer, as the webview puts it in `title`).
-fn sub_line(ui: &mut egui::Ui, row: &SpaceRow) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add(Label::new(
-            RichText::new(where_line(row))
-                .font(theme::detail())
-                .color(theme::TEXT_3),
-        ));
-        if row.incomplete() {
-            ui.add(Label::new(
-                RichText::new(" · ")
-                    .font(theme::detail())
-                    .color(theme::TEXT_3),
-            ));
-            ui.add(Label::new(
-                RichText::new("could not finish")
-                    .font(theme::detail())
-                    .color(theme::NOTICE),
-            ))
-            .on_hover_text(&row.error);
-        }
-    });
+///
+/// The place line gives way to the warning: the flag stays whole and the place is
+/// what gets the ellipsis, which is the only part a reader can hover for the rest.
+fn sub_line(ui: &mut egui::Ui, row: &SpaceRow, width: f32) {
+    let line = theme::font::DETAIL * theme::font::BODY_LINE;
+    ui.allocate_ui_with_layout(
+        vec2(width, line),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_max_width(width);
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let warn_w = if row.incomplete() {
+                ui.painter()
+                    .layout_no_wrap(
+                        " · could not finish".to_owned(),
+                        theme::detail(),
+                        theme::WHITE,
+                    )
+                    .size()
+                    .x
+            } else {
+                0.0
+            };
+            let place_w = (width - warn_w).max(0.0);
+            ui.allocate_ui_with_layout(
+                vec2(place_w, line),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.add(
+                        Label::new(
+                            RichText::new(where_line(row))
+                                .font(theme::detail())
+                                .color(theme::TEXT_3),
+                        )
+                        .truncate(),
+                    );
+                },
+            );
+            if row.incomplete() {
+                ui.add(Label::new(
+                    RichText::new(" · ")
+                        .font(theme::detail())
+                        .color(theme::TEXT_3),
+                ));
+                ui.add(
+                    Label::new(
+                        RichText::new("could not finish")
+                            .font(theme::detail())
+                            .color(theme::NOTICE),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&row.error);
+            }
+        },
+    );
 }
 
 /// The project's place: workspace and account, either one alone, or just
@@ -1105,7 +1148,7 @@ fn confirm_dialog(ctx: &egui::Context, confirm: &Confirm) -> Decision {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
 
             // `.modal-head { padding: 14px 12px 10px 18px }`
-            let head = egui::Frame::new()
+            let _ = egui::Frame::new()
                 .inner_margin(Margin {
                     left: 18,
                     right: 12,
@@ -1129,7 +1172,6 @@ fn confirm_dialog(ctx: &egui::Context, confirm: &Confirm) -> Decision {
                         });
                     });
                 });
-            let _ = head;
 
             // `.edit-body { padding: 4px 18px 14px; gap: 10px }`
             egui::Frame::new()
@@ -1789,8 +1831,91 @@ mod tests {
     }
 
     #[test]
+    fn every_row_shares_the_heads_columns() {
+        // A row's name block grows with its words (a long place line, a warning
+        // flag), and it must not drag the size and the Delete button after it:
+        // every size ends on the head's Size edge, every count on its Files
+        // edge, and every Delete on the same right edge.
+        let (harness, _) = screen(state_with(three_projects()));
+        let rect = |label: &str| {
+            harness
+                .get_by_label(label)
+                .rect()
+        };
+        let size_edge = rect("Size").max.x;
+        let files_edge = rect("Files").max.x;
+
+        for (size, count, delete) in [
+            ("1.00 GB", "312", "Delete Rushes 2026 on Frame.io"),
+            ("250 MB", "48", "Delete Nightfall on Frame.io"),
+            ("4.00 MB", "2", "Delete Old Trailers on Frame.io"),
+        ] {
+            assert_eq!(rect(size).max.x, size_edge, "{size} is not on the Size edge");
+            assert_eq!(rect(count).max.x, files_edge, "{count} is not on the Files edge");
+            let button = rect(delete);
+            assert!(
+                button.max.x <= 956.0,
+                "{delete} runs past the card: {:?}",
+                button
+            );
+        }
+
+        let first = rect("Delete Rushes 2026 on Frame.io");
+        for other in [
+            "Delete Nightfall on Frame.io",
+            "Delete Old Trailers on Frame.io",
+        ] {
+            assert_eq!(rect(other).max.x, first.max.x, "{other} is not in the actions column");
+        }
+    }
+
+    #[test]
+    fn a_long_place_line_is_cut_inside_its_column() {
+        // `.sub { overflow: hidden; text-overflow: ellipsis }`: the place line and
+        // its warning stay inside the name column instead of running over the
+        // size.
+        let mut row = project("Nightfall", &"A very long workspace name ".repeat(4), 1_000, 2);
+        row.error = "403 forbidden".into();
+        let (harness, _) = screen(state_with(vec![row]));
+
+        let warn = harness.get_by_label("could not finish").rect();
+        let size_edge = harness.get_by_label("Size").rect().max.x;
+        assert!(
+            warn.max.x <= size_edge,
+            "the warning runs into the size column: {warn:?} past {size_edge}"
+        );
+    }
+
+    #[test]
+    fn the_dialog_s_delete_is_the_only_error_red_on_the_screen() {
+        let (mut harness, _) = screen(state_with(three_projects()));
+        harness.get_by_label("Delete Rushes 2026 on Frame.io").click();
+        harness.run();
+        harness.run();
+
+        // `.btn.danger-solid { background: var(--error) }` — a filled red button,
+        // which nothing else on this screen uses.
+        let reds = harness
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) => Some(rect),
+                _ => None,
+            })
+            .filter(|rect| rect.fill == theme::ERROR && rect.corner_radius == theme::R_S)
+            .count();
+        assert_eq!(reds, 1, "one red button, the one that deletes");
+    }
+
+    #[test]
     fn the_chart_has_a_name_for_a_screen_reader() {
         let (harness, _) = screen(state_with(three_projects()));
         harness.get_by_label(CHART_LABEL);
     }
 }
+
+
+
+
+

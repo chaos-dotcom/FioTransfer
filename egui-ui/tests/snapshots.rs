@@ -12,8 +12,8 @@
 //! The renderer is wgpu through `egui_kittest` (the crate's `wgpu` feature), so
 //! no window is needed. The fixture (`src/fixture.rs`, shared with the wasm
 //! capture) is the state a running app would hand the shell: a running upload, a
-//! finished download, two watch folders, three history rows, signed in, and one
-//! toast per kind.
+//! finished download, two watch folders, three history rows, three projects on
+//! Frame.io, signed in, and one toast per kind.
 
 use std::path::{Path, PathBuf};
 
@@ -90,9 +90,9 @@ fn write_png(dir: &Path, view: View) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// The artefact: four PNGs, one per screen, at the webview's window size.
+/// The artefact: five PNGs, one per screen, at the webview's window size.
 #[test]
-fn the_four_screens_render_to_png() {
+fn the_five_screens_render_to_png() {
     let dir = ensure_shots_dir().expect("create /tmp/egui-shots");
     for view in View::ALL {
         let path = write_png(&dir, view).unwrap_or_else(|e| panic!("{} screen: {e}", view.label()));
@@ -122,15 +122,19 @@ fn the_empty_space_screen_renders_to_png() {
     let dir = ensure_shots_dir().expect("create /tmp/egui-shots");
     let mut state = UiState::default();
     state.view = View::Space;
+    // Signed in, with no projects counted yet — the state the empty block is
+    // written for (signed out, it offers Settings instead).
+    state.logged_in = true;
 
     let mut harness = Harness::builder()
         .with_size(egui::vec2(WINDOW_WIDTH, WINDOW_HEIGHT))
         .with_pixels_per_point(1.0)
         .build_state(|ctx, app: &mut FioApp| app.draw(ctx), FioApp::new(state));
     harness.run_steps(2);
-    // The empty state is on screen, and the way out of it is too.
-    harness.get_by_label("No projects yet");
-    harness.get_by_label("Refresh");
+    // The empty state is on screen, and the way out of it is too: the head's
+    // Refresh and the one in the middle of the empty block.
+    harness.get_by_label(fiotransfer_egui::views::space::EMPTY_TITLE);
+    assert_eq!(harness.get_all_by_label("Refresh").count(), 2);
 
     let image = harness.render().expect("render");
     assert_eq!((image.width(), image.height()), (WINDOW_WIDTH as u32, WINDOW_HEIGHT as u32));
@@ -166,7 +170,7 @@ fn the_shell_draws_a_screen_and_its_toasts() {
     assert_eq!(toast_max_width(WINDOW_WIDTH), 400.0);
 }
 
-/// The shell draws each of the four screens when it is told to.
+/// The shell draws each of the five screens when it is told to.
 #[test]
 fn every_view_id_draws_its_own_screen() {
     for view in View::ALL {
@@ -226,7 +230,7 @@ fn long_strings_do_not_panic() {
     assert_eq!(image.width(), WINDOW_WIDTH as u32);
 }
 
-/// `page_head` is the strip all four screens open with: 64 px tall, the title on
+/// `page_head` is the strip every screen opens with: 64 px tall, the title on
 /// the left, the screen's buttons on the right, and it never overflows the width
 /// it is given.
 #[test]
@@ -246,7 +250,7 @@ fn the_page_head_is_the_stylesheet_height() {
 
 /// `show_screen` draws whatever `state.view` names, for every variant.
 #[test]
-fn show_screen_covers_all_four_views() {
+fn show_screen_covers_every_view() {
     for view in View::ALL {
         let mut state = UiState::default();
         state.view = view;

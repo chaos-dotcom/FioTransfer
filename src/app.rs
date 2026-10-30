@@ -99,6 +99,10 @@ pub struct App {
     open_at_login: AtomicBool,
     started: Mutex<Option<Instant>>,
 
+    /// Last Frame.io storage walk, so the Space view can be opened without
+    /// re-walking every project.
+    space: Mutex<Option<(Instant, Vec<SpaceProject>)>>,
+    space_walking: AtomicBool,
     upd: Mutex<UpdaterState>,
     updating: AtomicBool,
     services_app: AtomicBool,
@@ -130,6 +134,8 @@ impl App {
             projects_listed: Mutex::new(None),
             open_at_login: AtomicBool::new(false),
             started: Mutex::new(None),
+            space: Mutex::new(None),
+            space_walking: AtomicBool::new(false),
             upd: Mutex::new(UpdaterState {
                 st: UpdateStatus { current: crate::VERSION.to_string(), state: "idle".into(), ..Default::default() },
                 rel: None,
@@ -1195,6 +1201,131 @@ fn tray_row(j: &xfer::JobView) -> TrayJob {
     t
 }
 
+// ---------- Space: what Frame.io is holding, per project ----------
+
+/// One project's footprint on Frame.io.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SpaceProject {
+    pub account_id: String,
+    pub account_name: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub project_id: String,
+    pub name: String,
+    pub root_folder_id: String,
+    pub bytes: i64,
+    pub files: i64,
+    /// Set when the walk could not finish (permissions, a deleted folder).
+    pub error: String,
+}
+
+impl App {
+    /// The last walk, if there is one. Cheap: the Space view calls this on every
+    /// frame.
+    pub fn space(&self) -> Vec<SpaceProject> {
+        self.space.lock().unwrap().as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+    }
+
+    pub fn space_walking(&self) -> bool {
+        self.space_walking.load(Ordering::Relaxed)
+    }
+
+    /// Walks every account, workspace and project and adds up what each project
+    /// holds. Reads only: nothing here deletes or downloads anything.
+    pub async fn refresh_space(self: &Arc<Self>) {
+        if self.space_walking.swap(true, Ordering::SeqCst) {
+            return; // a walk is already running
+        }
+        let cx = self.api_cx();
+        let mut out: Vec<SpaceProject> = Vec::new();
+        let accounts = match self.api.accounts(&cx).await {
+            Ok(a) => a,
+            Err(e) => {
+                self.space_walking.store(false, Ordering::SeqCst);
+                let _ = e;
+                return;
+            }
+        };
+        for acct in accounts {
+            let workspaces = self.api.workspaces(&cx, &acct.id).await.unwrap_or_default();
+            for ws in workspaces {
+                let projects = self.api.projects(&cx, &acct.id, &ws.id).await.unwrap_or_default();
+                for p in projects {
+                    let mut row = SpaceProject {
+                        account_id: acct.id.clone(),
+                        account_name: acct.display_name.clone(),
+                        workspace_id: ws.id.clone(),
+                        workspace_name: ws.name.clone(),
+                        project_id: p.id.clone(),
+                        name: p.name.clone(),
+                        root_folder_id: p.root_folder_id.clone(),
+                        ..Default::default()
+                    };
+                    match self.walk_folder(&cx, &acct.id, &p.root_folder_id, 0).await {
+                        Ok((bytes, files)) => {
+                            row.bytes = bytes;
+                            row.files = files;
+                        }
+                        Err(e) => row.error = e,
+                    }
+                    out.push(row);
+                }
+            }
+        }
+        out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        *self.space.lock().unwrap() = Some((Instant::now(), out));
+        self.space_walking.store(false, Ordering::SeqCst);
+        self.state_changed();
+    }
+
+    /// Adds up one folder tree. Depth-capped so a cycle in Frame.io's data can
+    /// not spin forever.
+    async fn walk_folder(&self, cx: &CancellationToken, acct: &str, folder: &str, depth: usize) -> Result<(i64, i64), String> {
+        if depth > 32 || folder.is_empty() {
+            return Ok((0, 0));
+        }
+        let kids = self.api.children(cx, acct, folder).await.map_err(|e| e.to_string())?;
+        let (mut bytes, mut files) = (0i64, 0i64);
+        for k in kids {
+            match k.type_.as_str() {
+                "folder" => {
+                    let (b, f) = Box::pin(self.walk_folder(cx, acct, &k.id, depth + 1)).await?;
+                    bytes += b;
+                    files += f;
+                }
+                "version_stack" => {
+                    if let Some(head) = &k.head_version {
+                        bytes += head.file_size;
+                        files += 1;
+                    }
+                }
+                _ => {
+                    bytes += k.file_size;
+                    files += 1;
+                }
+            }
+        }
+        Ok((bytes, files))
+    }
+
+    /// Deletes a project on Frame.io. This is the only destructive call the Space
+    /// view makes, and it touches Frame.io alone: no local file is read, moved or
+    /// removed, so a copy elsewhere (a `Live_Work` folder, a NAS, a watch folder)
+    /// stays exactly as it is.
+    pub async fn delete_project(&self, acct: &str, project: &str) -> Result<(), String> {
+        let cx = self.api_cx();
+        self.api.delete_project(&cx, acct, project).await.map_err(|e| e.to_string())?;
+        if let Some(h) = self.hist() {
+            h.log(&format!("SPACE    deleted project {} on Frame.io (nothing local was touched)", project));
+        }
+        if let Some((_, list)) = self.space.lock().unwrap().as_mut() {
+            list.retain(|p| p.project_id != project);
+        }
+        self.state_changed();
+        Ok(())
+    }
+}
+
 // ---------- The bridge: window.go.main.App[method] ----------
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -1403,6 +1534,18 @@ impl App {
                 ok(Value::Null)
             }
             "TakeServiceRequests" => ok(self.take_service_requests()),
+            // ---- space ----
+            "Space" => ok(self.space()),
+            "SpaceWalking" => ok(self.space_walking()),
+            "RefreshSpace" => {
+                let me = self.handle();
+                tokio::spawn(async move { me.refresh_space().await });
+                ok(Value::Null)
+            }
+            "DeleteProject" => {
+                self.delete_project(&s(&args, 0), &s(&args, 1)).await?;
+                ok(Value::Null)
+            }
             // ---- the bridge's own helpers ----
             "__clipboard_set" => {
                 crate::dialogs::clipboard_set_text(&s(&args, 0));
