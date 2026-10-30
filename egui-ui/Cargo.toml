@@ -40,6 +40,12 @@ egui = "0.33.3"
 egui_kittest = { version = "0.33.3", features = ["wgpu", "snapshot"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
+# Property tests for the Space delta (`tests/prop_space.rs`): the ring's
+# arithmetic and the confirm state machine. The crate is already in the lock as
+# the app's own dev-dependency, so this resolves offline.
+[dev-dependencies]
+proptest = "1.12.0"
+
 # The browser entry point, and nothing else: eframe re-exports
 # `wasm_bindgen`/`web_sys`, but not `wasm_bindgen_futures::spawn_local`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

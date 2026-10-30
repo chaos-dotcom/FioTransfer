@@ -1219,6 +1219,14 @@ pub struct SpaceProject {
     pub error: String,
 }
 
+/// Orders a walk biggest-first. `sort_by` is stable, so two projects holding the
+/// same number of bytes keep the order the walk found them in (account, then
+/// workspace, then Frame.io's `name_asc` listing): the Space view's colour ramp
+/// and its legend rows must not swap places between two identical walks.
+pub fn order_space(rows: &mut [SpaceProject]) {
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+}
+
 impl App {
     /// The last walk, if there is one. Cheap: the Space view calls this on every
     /// frame.
@@ -1272,7 +1280,7 @@ impl App {
                 }
             }
         }
-        out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        order_space(&mut out);
         *self.space.lock().unwrap() = Some((Instant::now(), out));
         self.space_walking.store(false, Ordering::SeqCst);
         self.state_changed();
