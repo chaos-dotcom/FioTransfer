@@ -485,6 +485,12 @@ fn text_at(v: &Value, key: &str) -> String {
 
 /// A Frame.io folder as Portal names it: `{"id": …, "name": …, "account_id":
 /// …}`, or just its name as a string, or nothing at all.
+///
+/// A live deployment sends the folder as `{"type":"frameio","account_id":…,
+/// "folder_id":…,"path":[{"id":…,"name":…}],"project_id":…,"turbosort":…}`: the
+/// id is under `folder_id`, and the name is the last element of `path` rather
+/// than a `name` key. Both spellings are read, because getting this wrong is not
+/// a parse error — it is a link that is silently skipped for having no folder.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Folder {
     pub id: String,
@@ -498,8 +504,24 @@ impl<'de> Deserialize<'de> for Folder {
         Ok(match &v {
             Value::String(s) => Folder { id: String::new(), name: s.trim().to_string(), account_id: String::new() },
             Value::Object(_) => Folder {
-                id: text_at(&v, "id"),
-                name: text_at(&v, "name"),
+                id: {
+                    let id = text_at(&v, "id");
+                    if id.is_empty() { text_at(&v, "folder_id") } else { id }
+                },
+                name: {
+                    let name = text_at(&v, "name");
+                    if !name.is_empty() {
+                        name
+                    } else {
+                        // `path` is the breadcrumb, root first: the folder itself is
+                        // its last element.
+                        v.get("path")
+                            .and_then(|p| p.as_array())
+                            .and_then(|a| a.last())
+                            .map(|last| text_at(last, "name"))
+                            .unwrap_or_default()
+                    }
+                },
                 account_id: {
                     let a = text_at(&v, "account_id");
                     if a.is_empty() {
@@ -1482,6 +1504,24 @@ mod tests {
         // And an empty base still produces a relative path rather than panicking:
         // `get` refuses before it ever uses it.
         assert_eq!(PortalClient::new("", "t").url("/api/health"), "/api/health");
+    }
+
+    #[test]
+    fn the_folder_shape_a_live_portal_sends_is_read() {
+        // Copied from GET /api/upload-links on a real deployment (abridged).
+        let raw = r#"{"id":"1d66131e-b3fc-4dd2-96d3-8970190f9a70","name":"LUC","kind":"upload",
+          "turbosort":"20261028_YML-XMAS-Luc",
+          "folder":{"path":[{"id":"8008cf70-f28e-474d-a209-d67afb9fddb6","name":"LUC"}],
+                    "type":"frameio","folder_id":"8008cf70-f28e-474d-a209-d67afb9fddb6",
+                    "turbosort":"20261028_YML-XMAS-Luc",
+                    "account_id":"6f4121b3-628d-4b7a-91ea-8b1ac4a3f0a3",
+                    "project_id":"7a4609ad-f5ef-4542-9b3b-d2f6c37086d7"}}"#;
+        let l: UploadLink = serde_json::from_str(raw).expect("a live row parses");
+        assert_eq!(l.marker(), "20261028_YML-XMAS-Luc");
+        assert_eq!(l.acct(), "6f4121b3-628d-4b7a-91ea-8b1ac4a3f0a3", "the account is on the folder");
+        assert_eq!(l.dest_folder(), "8008cf70-f28e-474d-a209-d67afb9fddb6", "the id is under `folder_id`");
+        assert_eq!(l.folder.name, "LUC", "the name is the last breadcrumb, not a `name` key");
+        assert_eq!(l.label(), "LUC", "the link's own name wins for the label");
     }
 
 }
