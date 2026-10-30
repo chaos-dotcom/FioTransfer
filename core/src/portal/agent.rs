@@ -26,7 +26,7 @@ use serde::Serialize;
 use crate::app::App;
 use crate::history::watch::DIR_MIRROR;
 use crate::history::watch::Watch;
-use crate::portal::{self, PortalClient, UploadLink};
+use crate::portal::{PortalClient, UploadLink};
 
 /// The origin a Portal-owned watch carries: `portal:<link id>`.
 pub fn origin_of(link_id: &str) -> String {
