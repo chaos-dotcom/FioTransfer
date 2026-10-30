@@ -20,6 +20,10 @@ make bench                             # build bin/fio-bench
 make test                              # cargo test --workspace
 ```
 
+## The command line
+
+`fio` is also how a headless install sets the Portal connection up and checks it — `fio portal status | signin <url> <email> | signout | reconcile [--url URL] | token <token> | token --clear` — so a machine reached over ssh, or a cron job, needs no window for either.
+
 ## Where the pieces live now
 
 | Piece | Where |
