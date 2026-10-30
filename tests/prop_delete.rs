@@ -621,16 +621,3 @@ fn one_delete_writes_exactly_one_log_line() {
     assert!(lines[0].contains(PHRASE));
 }
 
-#[test]
-fn wire_table() {
-    let w = World::new(Mode::Deletes, false);
-    let ids = ["", ".", "..", "../files/x", "../../v4/me", "projA/../projB", "a/b", "%2e%2e%2fprojB", " projA ", "uuid-4c1f-aaaa-bbbb-ccccdddd", "p1\nSPACE    deleted project X on Frame.io (nothing local was touched)"];
-    for id in ids {
-        let n0 = w.stub.log().len();
-        let r = w.delete("acct", id);
-        let paths: Vec<String> = w.stub.log()[n0..].iter().map(|q| format!("{} {} -> {}", q.method, q.path, q.status)).collect();
-        println!("WIRE {:?} => {:?} ; {:?}", id, r.is_ok(), paths);
-    }
-    println!("LOGLINES {}", w.log_lines().len());
-    for l in w.log_lines() { println!("LOGLINE [{}]", l); }
-}
