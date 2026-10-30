@@ -416,8 +416,12 @@ fn save_token(t: &Token) {
         return;
     }
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(fallback_path()) {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    // 0600 on unix; on Windows the folder's ACL is what keeps this token to its
+    // owner (see `fileio::mode`).
+    crate::fileio::mode(&mut opts, 0o600);
+    if let Ok(mut f) = opts.open(fallback_path()) {
         let _ = f.write_all(&b);
     }
 }

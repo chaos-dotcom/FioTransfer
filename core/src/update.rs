@@ -474,7 +474,6 @@ async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>,
 
 /// Go's os.MkdirTemp(dir, prefix): a fresh 0700 folder next to the app.
 fn mkdtemp(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
-    use std::os::unix::fs::DirBuilderExt;
     let mut last = String::new();
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -483,7 +482,11 @@ fn mkdtemp(dir: &Path, prefix: &str) -> Result<PathBuf, String> {
     for i in 0..100u64 {
         let n = seed ^ (i.wrapping_mul(0x9e37_79b9_7f4a_7c15)) ^ ((std::process::id() as u64) << 32);
         let p = dir.join(format!("{}{:012x}", prefix, n & 0xffff_ffff_ffff));
-        match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+        let mut builder = std::fs::DirBuilder::new();
+        // 0700 on unix; on Windows the folder inherits its parent's ACL (see
+        // `fileio::dir_mode`).
+        crate::fileio::dir_mode(&mut builder, 0o700);
+        match builder.create(&p) {
             Ok(()) => return Ok(p),
             Err(e) => last = e.to_string(),
         }

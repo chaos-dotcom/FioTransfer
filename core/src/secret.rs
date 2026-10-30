@@ -14,6 +14,9 @@ use security_framework::passwords::{delete_generic_password, get_generic_passwor
 /// read (which can raise a "wants access" dialog and would sign a test in with the
 /// real account) nor written (so `auth` falls back to the 0600 file, which lives
 /// under `HOME` and is therefore redirectable to a temporary directory).
+///
+/// Only macOS reads it: the other platforms answer "no keychain" without asking.
+#[cfg(target_os = "macos")]
 fn disabled() -> bool {
     std::env::var_os("FIO_NO_KEYCHAIN").is_some()
 }
