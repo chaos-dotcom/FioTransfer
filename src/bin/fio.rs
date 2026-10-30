@@ -264,7 +264,9 @@ const PORTAL_USAGE: &str = "fio portal — the Portal connection, set up and che
                                        one-time code (two-factor) from --totp, $FIO_PORTAL_TOTP,
                                        or a second line
   fio portal signout                   forget the stored session
-  fio portal reconcile [--url URL]     make the watch folders Portal's markers ask for
+  fio portal reconcile [--url URL] [--dry-run]
+                                       make the watch folders Portal's markers ask
+                                       for; --dry-run prints the plan and changes nothing
   fio portal token <token> | --clear   store a bearer token instead (a deployment's
                                        PORTAL_API_TOKEN, or a passkey-only account)
 
@@ -640,11 +642,36 @@ fn portal_signout_command() -> ! {
 }
 
 async fn portal_reconcile_command(args: &[String]) -> ! {
+    let dry = args.iter().any(|a| a == "--dry-run");
     let url = match portal_url_flag(args) {
         Ok(u) => u,
         Err(e) => fatal(&e),
     };
     let app = portal_app_for_reconcile(config::load(), &url);
+    if dry {
+        // Plan only: same credential, same request, same decisions — and then stop.
+        // Nothing is created, nothing removed, and no last-reconcile record is
+        // written, because nothing happened.
+        let rep = portal::agent::preview(&app).await;
+        if !rep.error.trim().is_empty() {
+            fatal(rep.error.trim());
+        }
+        println!("links seen: {}", rep.links_seen);
+        println!("would keep in step: {}", rep.ensured);
+        println!("would remove: {}", rep.removed);
+        for s in &rep.skipped {
+            let link = if s.link.is_empty() { "(no id)".to_string() } else { s.link.clone() };
+            println!("skipped {} \"{}\": {}", link, s.marker, s.reason);
+        }
+        if !rep.planned.is_empty() {
+            println!("would keep these folders:");
+            for p in &rep.planned {
+                println!("  {}", p);
+            }
+        }
+        println!("dry run: nothing was created, changed or removed.");
+        std::process::exit(0);
+    }
     let rep = app.portal_reconcile().await;
     // Kept before the report is printed or the error ends the command, so
     // `fio portal status` can say how the last run went even when it failed.

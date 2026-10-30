@@ -857,3 +857,34 @@ fn a_folder_that_already_holds_media_is_baselined_not_re_uploaded() {
     assert_eq!(std::fs::read(folder.join("slate.txt")).unwrap(), b"slate");
     assert_eq!(std::fs::metadata(folder.join("Rushes/Day 1/A001.bin")).unwrap().len(), 4096);
 }
+
+
+/// A dry run is the answer to "what will you do to my library?", and it has to be
+/// honest in both directions: the plan it prints is the plan it would carry out,
+/// and running it leaves nothing behind — no folder, no watch, no record.
+#[test]
+fn a_dry_run_plans_the_same_watch_and_creates_nothing() {
+    let Some((url, token)) = live() else { return };
+    let w = world(&url);
+    portal::set_token(&token).expect("token stored");
+
+    let _g = w.rt.enter();
+    let plan = w.rt.block_on(async { fiotransfer::portal::agent::preview(&w.app).await });
+    assert!(plan.error.is_empty(), "{:?}", plan.error);
+    assert_eq!(plan.links_seen, 3);
+    assert_eq!(plan.ensured, 1, "one marker asks for a folder");
+    assert_eq!(plan.planned.len(), 1);
+    assert!(plan.planned[0].ends_with("Farbhaus"), "{:?}", plan.planned);
+    assert_eq!(plan.skipped.len(), 2, "the two hostile markers are still refused, with reasons");
+
+    // Nothing was created and nothing was watched.
+    assert!(!std::path::Path::new(&plan.planned[0]).exists(), "a dry run made the folder");
+    let watches = w.app.hist.lock().unwrap().as_ref().unwrap().watches().expect("watches");
+    assert!(watches.is_empty(), "a dry run created {} watch(es)", watches.len());
+
+    // And the real run then does exactly what the plan said.
+    let done = w.rt.block_on(async { w.app.portal_reconcile().await });
+    assert!(done.error.is_empty(), "{:?}", done.error);
+    assert_eq!(done.ensured, plan.ensured, "the plan and the run disagree");
+    assert!(std::path::Path::new(&plan.planned[0]).is_dir(), "the run did not make what the plan named");
+}
