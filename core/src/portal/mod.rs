@@ -85,7 +85,7 @@ impl std::fmt::Display for PortalErr {
                 match *status {
                     401 | 403 => write!(
                         f,
-                        "Portal refused the token ({}). Paste the PORTAL_API_TOKEN from Portal's .env and press Save",
+                        "Portal refused the token ({}). It may be wrong, or Portal's .env may set none at all — see docs/PORTAL.md",
                         status
                     ),
                     404 => write!(f, "Portal has no /api/upload-links ({}): is that the Portal address?", status),
