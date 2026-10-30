@@ -7,12 +7,14 @@
 //! show in Finder, remove). The empty state is "No watch folders".
 //!
 //! A Portal-managed project is one job, not two rows: a **Smart In/Out Tray**
-//! whose title line is `<dest_label> · Smart In/Out Tray`, with a line per sync
-//! lane under it — `Inbound (In Tray)` and `Outbound (Out Tray)` — because Portal
-//! publishes a project as two one-way folders and the person watching it sees
-//! one job. A duplex with one lane configured shows that lane and says plainly
-//! which one is missing. A watch the user made is still one row of its own,
-//! drawn exactly as it was.
+//! whose title line is the project's name and then `· Smart In/Out Tray` in the
+//! row's detail style, with a line per sync lane under it — `Inbound (In Tray)`
+//! and `Outbound (Out Tray)` — because Portal publishes a project as two one-way
+//! folders and the person watching it sees one job. The job's title line also
+//! carries `Open in Portal`, which opens the project's link on the Portal server.
+//! A duplex with one lane configured shows that lane and says plainly which one
+//! is missing. A watch the user made is still one row of its own, drawn exactly
+//! as it was.
 //!
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`].
@@ -65,6 +67,18 @@ pub const PORTAL_SENTENCE: &str =
 
 /// The job one Portal-managed project is, after its destination label.
 pub const SMART_IN_OUT_TRAY: &str = "Smart In/Out Tray";
+/// The words that say what the job is, after the project's name on the title
+/// line: [`SMART_IN_OUT_TRAY`] behind the separator the title has always used,
+/// set in the row's own detail style — one step down from the name's body, and
+/// muted — so the project is what the row reads first. It used to be one run with
+/// the name, which made the tray read as loud as the project.
+pub const TRAY_SUFFIX: &str = "· Smart In/Out Tray";
+/// The job's way into Portal, on its title line beside Remove.
+pub const OPEN_IN_PORTAL: &str = "Open in Portal";
+/// Why [`OPEN_IN_PORTAL`] does nothing: the address it opens is a setting, and an
+/// empty one is how Portal is switched off. The link says this on hover rather
+/// than vanishing, so the row always offers the same things.
+pub const PORTAL_ADDRESS_MISSING: &str = "set the Portal address in Settings";
 /// The inbound lane, its tray in brackets: the download watch on the client's
 /// folder.
 pub const LANE_INBOUND: &str = "Inbound (In Tray)";
@@ -101,6 +115,10 @@ pub enum Action {
     /// Remove a job's lanes together: one Remove on a Smart In/Out Tray, which
     /// takes both of the watches Portal made for it.
     RemoveDuplex { rows: Vec<usize> },
+    /// The job's `Open in Portal`: the page for this project's upload link on
+    /// the Portal server, `{portal_url}/upload-links/{link id}`. Both lanes are
+    /// the same link, so the job needs one of these, not one per lane.
+    OpenInPortal(String),
     /// Show the folder in Finder (`.w-reveal`).
     Reveal(usize),
 }
@@ -149,6 +167,9 @@ fn ask(state: &mut UiState, action: Action) {
                 state.ask(Request::Reveal(local));
             }
         }
+        // The shell opens it in the browser (`App::open_url`): the app already
+        // has the one way out to a URL, and this is that way.
+        Action::OpenInPortal(url) => state.ask(Request::OpenUrl(url)),
         // The webview's watch editor (`.w-edit`, the folder + destination
         // picker) was not ported to this window. The pencil stays where the
         // webview draws it, and says so instead of pretending to open a dialog.
@@ -185,11 +206,22 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
     list_head(ui, &columns);
     // One block per job: a duplex's lanes under its title, a watch the user made
     // on its own row. The block's rows are indices into `state.watches`, which is
-    // what every action is addressed by.
+    // what every action is addressed by. The job's `Open in Portal` needs the
+    // server's address off `Settings`, which is not a row's: it is read here, so
+    // the rows stay indices and the address stays one value for the screen.
     let home = state.home.clone();
+    let portal_url = state.settings.portal_url.clone();
     for block in watch_blocks(&state.watches) {
         match &block.duplex_id {
-            Some(_) => duplex_block(ui, &block.rows, &mut state.watches, &home, &columns, &mut action),
+            Some(_) => duplex_block(
+                ui,
+                &block.rows,
+                &mut state.watches,
+                &home,
+                &portal_url,
+                &columns,
+                &mut action,
+            ),
             None => {
                 for index in &block.rows {
                     watch_row(ui, *index, &mut state.watches[*index], &home, &columns, &mut action);
@@ -351,6 +383,7 @@ fn duplex_block(
     rows: &[usize],
     watches: &mut [WatchRow],
     home: &str,
+    portal_url: &str,
     columns: &Columns,
     action: &mut Option<Action>,
 ) {
@@ -358,7 +391,14 @@ fn duplex_block(
         return;
     };
     let label = watches[first].label.clone();
-    job_head(ui, &label, rows, columns, action);
+    // The page the job's one link is on, or nothing to open: `duplex_id` is the
+    // record's `origin` with the outbound lane's `#exports` already off, so both
+    // lanes answer the same address.
+    let link_url = watches[first]
+        .duplex_id
+        .as_deref()
+        .and_then(|id| portal_link_url(portal_url, id));
+    job_head(ui, &label, link_url.as_deref(), rows, columns, action);
 
     for lane in [Lane::Inbound, Lane::Outbound] {
         match rows.iter().copied().find(|&index| watches[index].lane == lane) {
@@ -368,29 +408,43 @@ fn duplex_block(
     }
 }
 
-/// The job's title line: `<dest_label> · Smart In/Out Tray`, and the job's one
-/// Remove at the right, where a row keeps its actions.
+/// The job's title line: the project's name, then [`TRAY_SUFFIX`] beside it in
+/// the row's detail style, and at the right the job's own actions — `Open in
+/// Portal`, and the one Remove that takes both lanes.
+///
+/// `link_url` is the Portal page the job's link is on; `None` is a Portal address
+/// not set, which is why `Open in Portal` is drawn off there rather than left
+/// out.
 fn job_head(
     ui: &mut egui::Ui,
     label: &str,
+    link_url: Option<&str>,
     rows: &[usize],
     columns: &Columns,
     action: &mut Option<Action>,
 ) {
-    let title = format!("{label} · {SMART_IN_OUT_TRAY}");
-
     let head = strip(ui, ROW_HEIGHT, true, |ui| {
         cell(ui, columns.name, ROW_HEIGHT, false, |ui| {
             ui.spacing_mut().item_spacing.x = theme::space::XL;
             icon_tile(ui, Glyph::Folder);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
-                ui.add(theme::truncating(
-                    RichText::new(&title)
-                        .font(theme::body())
-                        .color(theme::TEXT)
-                        .strong(),
-                ));
+                // One line, two runs: the project at the row's own weight, and
+                // the words that say what the job is one step down and muted, so
+                // the project is what reads first.
+                title_line(ui, |ui| {
+                    ui.add(theme::truncating(
+                        RichText::new(label)
+                            .font(theme::body())
+                            .color(theme::TEXT)
+                            .strong(),
+                    ));
+                    ui.add(theme::truncating(
+                        RichText::new(TRAY_SUFFIX)
+                            .font(theme::detail())
+                            .color(theme::TEXT_3),
+                    ));
+                });
                 // The second line is the marker a Portal row already carries, in
                 // the same muted 12 px: the job is Portal's, and the paths are
                 // on the lanes below rather than here.
@@ -400,14 +454,21 @@ fn job_head(
             });
         });
 
-        // The middle columns stay empty on the title line, so the Remove lands in
-        // the column the rows keep their actions in.
+        // The middle columns stay empty on the title line, so the job's actions
+        // land in the column the rows keep theirs in.
         empty_cells(ui, columns);
         cell(ui, columns.actions, ROW_HEIGHT, false, |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if icon_button_with(ui, Glyph::Trash, "Remove", PORTAL_SENTENCE) {
                     *action = Some(Action::RemoveDuplex { rows: rows.to_vec() });
+                }
+                // Beside the Remove, the one thing the job offers that acts on
+                // Portal rather than on the watches: the page both lanes are.
+                // It answers with the address it was clicked with, so a link
+                // drawn off for want of a Portal address asks for nothing.
+                if let Some(url) = open_in_portal(ui, link_url) {
+                    *action = Some(Action::OpenInPortal(url.to_string()));
                 }
             });
         });
@@ -652,6 +713,24 @@ fn glyph(ui: &mut egui::Ui, glyph: Glyph, colour: Color32) {
     paint(ui.painter(), rect, glyph, colour, 14.0);
 }
 
+/// The job's title line: the project's name and [`TRAY_SUFFIX`] side by side,
+/// at the body font's own height.
+///
+/// A plain `ui.horizontal` assumes there is something interactive on the line
+/// and sizes itself from `interact_size`, which would push the marker under it
+/// down the row. This is [`detail_line`] one font step up: the line the job's
+/// name has always been given, with the tray's words on it.
+fn title_line(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let line = vec2(
+        ui.available_width(),
+        ui.fonts_mut(|fonts| fonts.row_height(&theme::body())),
+    );
+    ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = theme::space::S;
+        add(ui);
+    });
+}
+
 /// One line of a folder cell's secondary text, at the detail font's own height.
 ///
 /// A plain `ui.horizontal` would centre the line in whatever is left under the
@@ -685,6 +764,69 @@ fn portal_marker(ui: &mut egui::Ui) -> egui::Response {
             .font(theme::detail())
             .color(theme::TEXT_3),
     ))
+}
+
+/// The Portal page a job's link is on: `{portal_url}/upload-links/{link id}` —
+/// the server's address out of `Settings::portal_url`, and the link id out of
+/// the watch record's `origin`.
+///
+/// `link_id` is the watch record's `origin` without its lane suffix
+/// ([`WatchRow::duplex_id`]): `portal:L1` and `portal:L1#exports` are one link,
+/// so both lanes open the same page and the job offers one action rather than
+/// two. An empty address is nothing to open, and answers `None`.
+pub fn portal_link_url(portal_url: &str, link_id: &str) -> Option<String> {
+    let base = portal_url.trim().trim_end_matches('/');
+    if base.is_empty() || link_id.is_empty() {
+        return None;
+    }
+    Some(format!("{base}/upload-links/{link_id}"))
+}
+
+/// `.a` in the stylesheet, in the row's action column: a link — 12.5 px,
+/// `--link`, lighter on hover — rather than a button, because it leaves the app
+/// instead of acting on the watch.
+///
+/// `url` is the page it opens, and its tooltip; the page it answers with is the
+/// one it was clicked with, and nothing at all is the answer when it was not
+/// clicked. `None` is a Portal address not set: the link is then drawn off,
+/// muted, with [`PORTAL_ADDRESS_MISSING`] on hover, and answers nothing.
+fn open_in_portal<'url>(ui: &mut egui::Ui, url: Option<&'url str>) -> Option<&'url str> {
+    let mut clicked = false;
+    ui.scope(|ui| {
+        {
+            let widgets = &mut ui.style_mut().visuals.widgets;
+            // No box, in any state: `a` is text, not a `.btn`.
+            for widget in [
+                &mut widgets.inactive,
+                &mut widgets.hovered,
+                &mut widgets.active,
+                &mut widgets.noninteractive,
+            ] {
+                widget.weak_bg_fill = Color32::TRANSPARENT;
+                widget.bg_stroke = Stroke::NONE;
+            }
+            if url.is_some() {
+                widgets.inactive.fg_stroke = theme::hairline(theme::LINK);
+                widgets.hovered.fg_stroke = theme::hairline(theme::LINK_HOVER);
+                widgets.active.fg_stroke = theme::hairline(theme::LINK);
+            } else {
+                // Off: the mute the row already sets its paths in, so it reads
+                // as waiting on a setting rather than as something to press.
+                widgets.noninteractive.fg_stroke = theme::hairline(theme::TEXT_3);
+            }
+            ui.style_mut().spacing.button_padding = vec2(0.0, 0.0);
+        }
+        let link = egui::Button::new(RichText::new(OPEN_IN_PORTAL).font(theme::note())).small();
+        let response = ui.add_enabled(url.is_some(), link);
+        clicked = match url {
+            Some(url) => response.on_hover_text(url).clicked(),
+            None => {
+                response.on_disabled_hover_text(PORTAL_ADDRESS_MISSING);
+                false
+            }
+        };
+    });
+    url.filter(|_| clicked)
 }
 
 /// `.icon-btn`: 28 x 28, transparent, `--text-3` until hovered. The button is
@@ -1035,6 +1177,23 @@ mod tests {
                 },
                 state,
             )
+    }
+
+    /// The job's title line on screen: the project's name, and the tray suffix
+    /// beside it.
+    ///
+    /// The name is not unique — the Frame.io column prints the same words on
+    /// every lane — so it is the one that shares the suffix's line.
+    fn job_title<'h>(
+        harness: &'h Harness<'_, UiState>,
+        name: &'h str,
+    ) -> (egui_kittest::Node<'h>, egui_kittest::Node<'h>) {
+        let suffix = harness.get_by_label(TRAY_SUFFIX);
+        let title = harness
+            .get_all_by_label(name)
+            .find(|node| (node.rect().center().y - suffix.rect().center().y).abs() < 2.0)
+            .unwrap_or_else(|| panic!("no `{name}` on the job's title line"));
+        (title, suffix)
     }
 
     #[test]
@@ -1448,15 +1607,15 @@ mod tests {
 
     // ---------- a duplex is one job with two sync lanes ----------
 
-    /// The title line the owner asked for, exactly: `<dest_label> · Smart In/Out
-    /// Tray`, and a line per lane under it with its tray in brackets.
+    /// The title line the owner asked for, exactly: the project's name and then
+    /// `· Smart In/Out Tray`, and a line per lane under it with its tray in
+    /// brackets.
     #[test]
     fn a_duplex_draws_one_job_with_both_lane_labels() {
         let harness = screen_harness(state_with(luc()));
 
-        // The job, in the owner's words.
-        let job = format!("LUC · {SMART_IN_OUT_TRAY}");
-        let title = harness.get_by_label(&job);
+        // The job, in the owner's words: the project, then the tray.
+        let (title, _) = job_title(&harness, "LUC");
         // Its two lanes, each with its own tray named.
         let inbound = harness.get_by_label(LANE_INBOUND);
         let outbound = harness.get_by_label(LANE_OUTBOUND);
@@ -1478,7 +1637,9 @@ mod tests {
         // and its own state.
         harness.get_by_label("~/Live_Work/LUC/1_DRIVE");
         harness.get_by_label("~/Live_Work/LUC/0_EXPORTS");
-        assert_eq!(harness.get_all_by_label("LUC").count(), 2, "the Frame.io side, on both lanes");
+        // `LUC` three times: the title line's name, and the Frame.io side on
+        // each of the two lanes.
+        assert_eq!(harness.get_all_by_label("LUC").count(), 3, "the title, and both lanes");
         harness.get_by_label("4");
         harness.get_by_label("2");
         assert_eq!(harness.get_all_by_label("Watching").count(), 2, "each lane its own state");
@@ -1509,7 +1670,7 @@ mod tests {
             Lane::Inbound,
         )]));
 
-        harness.get_by_label(&format!("LUC · {SMART_IN_OUT_TRAY}"));
+        job_title(&harness, "LUC");
         harness.get_by_label(LANE_INBOUND);
         // The lane that is not there, and the plain statement of it.
         assert!(
@@ -1577,8 +1738,7 @@ mod tests {
         // Its row is one row, and the job follows it on the same pitch: the
         // folder's name and the job's title are both a row's first line.
         let rushes = harness.get_by_label("Rushes").rect();
-        let job = format!("LUC · {SMART_IN_OUT_TRAY}");
-        let title = harness.get_by_label(&job).rect();
+        let title = job_title(&harness, "LUC").1.rect();
         assert!(
             (title.center().y - rushes.center().y - ROW_HEIGHT).abs() < 1.0,
             "{rushes:?} {title:?}"
@@ -1599,8 +1759,10 @@ mod tests {
             lane_watch("/Users/chaos/Live_Work/ARCH/1_DRIVE", "Archive", "download", true, 0, "ARCH", Lane::Inbound),
         ]));
 
-        let archive = harness.get_by_label(&format!("Archive · {SMART_IN_OUT_TRAY}")).rect();
-        let luc = harness.get_by_label(&format!("LUC · {SMART_IN_OUT_TRAY}")).rect();
+        // Each job's title line, in the order the blocks are drawn.
+        let titles: Vec<_> = harness.get_all_by_label(TRAY_SUFFIX).map(|n| n.rect()).collect();
+        assert_eq!(titles.len(), 2, "two jobs, two title lines");
+        let (archive, luc) = (titles[0], titles[1]);
         assert!(archive.top() < luc.top(), "Archive first: {archive:?} {luc:?}");
 
         // Each block holds its own two lanes, in its own place: four lanes, two
@@ -1682,17 +1844,153 @@ mod tests {
         );
     }
 
+    // ---------- the title line's two runs, and the job's way into Portal ----------
+
+    /// The name and the tray are two runs on one line, in two styles: the
+    /// project's at the row's own weight, and `· Smart In/Out Tray` in the detail
+    /// style the row already sets `Portal` and its paths in — one step down, and
+    /// muted — so the project reads as the name and the tray as what the job is.
+    #[test]
+    fn the_jobs_title_sets_the_project_first_and_the_tray_one_step_down() {
+        let harness = screen_harness(state_with(luc()));
+        let (name, suffix) = job_title(&harness, "LUC");
+
+        // The words, unchanged: `· ` and the tray's own name.
+        assert_eq!(TRAY_SUFFIX, format!("· {SMART_IN_OUT_TRAY}"));
+
+        // One line, the tray after the name rather than under it.
+        assert!(
+            (suffix.rect().center().y - name.rect().center().y).abs() < 2.0,
+            "one line: {:?} {:?}",
+            name.rect(),
+            suffix.rect()
+        );
+        assert!(
+            suffix.rect().left() >= name.rect().right(),
+            "the tray's words come after the project's: {:?} {:?}",
+            name.rect(),
+            suffix.rect()
+        );
+
+        // Two styles, each the font it is set in: the name is a line of the body
+        // font and the suffix a line of the detail font, so the suffix is the
+        // smaller of the two by exactly the step the row's paths already take.
+        let body = harness.ctx.fonts_mut(|fonts| fonts.row_height(&theme::body()));
+        let detail = harness.ctx.fonts_mut(|fonts| fonts.row_height(&theme::detail()));
+        assert!(
+            (name.rect().height() - body).abs() < 0.5,
+            "the name is a body line: {:?}, {body} px",
+            name.rect()
+        );
+        assert!(
+            (suffix.rect().height() - detail).abs() < 0.5,
+            "the tray is a detail line: {:?}, {detail} px",
+            suffix.rect()
+        );
+        assert!(detail < body, "the detail step is the smaller one");
+    }
+
+    /// `Open in Portal` opens the page the job's link is on: the server from
+    /// Settings, and the link id out of the watch's `origin` — the outbound
+    /// lane's `#exports` off it, so both lanes answer the same page.
+    #[test]
+    fn open_in_portal_asks_the_app_for_the_links_page() {
+        let mut harness = screen_harness(state_with(luc()));
+        harness.state_mut().settings.portal_url = "https://portal.nightfall.tv".to_string();
+        harness.run();
+
+        let url = "https://portal.nightfall.tv/upload-links/LUC".to_string();
+        // The tooltip is the address, before it is pressed — and the job's
+        // sentence is not on screen as well: one link, one tooltip.
+        harness.get_by_label(OPEN_IN_PORTAL).hover();
+        harness.run();
+        assert!(harness.query_by_label(&url).is_some(), "the tooltip is the URL it opens");
+        assert!(
+            harness.query_by_label(PORTAL_SENTENCE).is_none(),
+            "the link's own tooltip, not the job's sentence over it"
+        );
+
+        harness.get_by_label(OPEN_IN_PORTAL).click();
+        harness.run();
+        assert_eq!(
+            harness.state().requests,
+            vec![Request::OpenUrl(url)],
+            "one action, one page, and nothing else asked of the app"
+        );
+    }
+
+    /// With no Portal address there is nothing to open: the action is drawn off,
+    /// says why on hover, and pushes nothing at all.
+    #[test]
+    fn open_in_portal_is_off_without_a_portal_address() {
+        let mut harness = screen_harness(state_with(luc()));
+        assert!(harness.state().settings.portal_url.is_empty());
+
+        harness.get_by_label(OPEN_IN_PORTAL).hover();
+        harness.run();
+        assert!(
+            harness.query_by_label(PORTAL_ADDRESS_MISSING).is_some(),
+            "the reason on hover: `{PORTAL_ADDRESS_MISSING}`"
+        );
+
+        harness.get_by_label(OPEN_IN_PORTAL).click();
+        harness.run();
+        assert!(
+            harness.state().requests.is_empty(),
+            "an action with nothing to open asks for nothing: {:?}",
+            harness.state().requests
+        );
+        // The job's other actions are untouched by it.
+        assert_eq!(harness.get_all_by_label("Remove").count(), 1);
+    }
+
+    /// A link's page is the server's address and the id, and nothing else: the
+    /// outbound lane's origin is the same id with a suffix on it.
+    #[test]
+    fn a_links_page_is_the_servers_address_and_the_id() {
+        assert_eq!(
+            portal_link_url("https://host", "L1").as_deref(),
+            Some("https://host/upload-links/L1")
+        );
+        // Settings stores the address without a trailing slash; one typed with
+        // it anyway does not double it.
+        assert_eq!(
+            portal_link_url("https://host/", "L1").as_deref(),
+            Some("https://host/upload-links/L1")
+        );
+        assert_eq!(
+            portal_link_url("  https://host  ", "L1").as_deref(),
+            Some("https://host/upload-links/L1")
+        );
+        // The outbound lane's origin carries `#exports`; its page does not.
+        let (id, lane) = crate::model::lane_of("portal:L1#exports", "upload");
+        assert_eq!(lane, Lane::Outbound);
+        assert_eq!(
+            portal_link_url("https://host", id.as_deref().unwrap_or_default()).as_deref(),
+            Some("https://host/upload-links/L1")
+        );
+        // Nothing to open: no address, or no id.
+        assert_eq!(portal_link_url("", "L1"), None);
+        assert_eq!(portal_link_url("   ", "L1"), None);
+        assert_eq!(portal_link_url("https://host", ""), None);
+    }
+
     /// The two-lane job, at the size the other watch snapshots are drawn at.
+    ///
+    /// With a Portal address set, so the snapshot shows the job as a configured
+    /// app draws it: the title's two runs, and `Open in Portal` live beside the
+    /// Remove.
     #[test]
     fn the_watch_screen_with_a_duplex_renders_to_png() {
         let mut rows = vec![watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3)];
         rows.extend(luc());
         let mut harness = screen_harness(state_with(rows));
+        harness.state_mut().settings.portal_url = "https://portal.nightfall.tv".to_string();
         harness.run_steps(2);
-        let job = format!("LUC · {SMART_IN_OUT_TRAY}");
-        harness.get_by_label(&job);
+        job_title(&harness, "LUC");
         harness.get_by_label(LANE_INBOUND);
         harness.get_by_label(LANE_OUTBOUND);
         harness.snapshot("watch_duplex");
     }
+
 }
