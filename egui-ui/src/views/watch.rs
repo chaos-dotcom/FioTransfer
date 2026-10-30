@@ -8,8 +8,8 @@
 //!
 //! A Portal-managed project is one job, not two rows: a **Smart In/Out Tray**
 //! whose title line is the project's name and then `· Smart In/Out Tray` in the
-//! row's detail style, with a line per sync lane under it — `Inbound (In Tray)`
-//! and `Outbound (Out Tray)` — because Portal publishes a project as two one-way
+//! row's detail style, with a line per sync lane under it — `Inbound` and
+//! `Outbound` — because Portal publishes a project as two one-way
 //! folders and the person watching it sees one job. The job's title line also
 //! carries `Open in Portal`, which opens the project's link on the Portal server.
 //! A duplex with one lane configured shows that lane and says plainly which one
@@ -90,12 +90,12 @@ pub const OPEN_IN_PORTAL: &str = "Open in Portal";
 /// empty one is how Portal is switched off. The link says this on hover rather
 /// than vanishing, so the row always offers the same things.
 pub const PORTAL_ADDRESS_MISSING: &str = "set the Portal address in Settings";
-/// The inbound lane, its tray in brackets: the download watch on the client's
-/// folder.
-pub const LANE_INBOUND: &str = "Inbound (In Tray)";
-/// The outbound lane, its tray in brackets: the upload watch on the exports
-/// folder.
-pub const LANE_OUTBOUND: &str = "Outbound (Out Tray)";
+/// The inbound lane: the download watch on the client's folder. The lane's own
+/// word, with no tray in brackets — the job's title already says the tray, and a
+/// lane reads as the half of it it is.
+pub const LANE_INBOUND: &str = "Inbound";
+/// The outbound lane: the upload watch on the exports folder.
+pub const LANE_OUTBOUND: &str = "Outbound";
 /// What a lane with no watch behind it says, after its label and an em dash.
 pub const LANE_NOT_CONFIGURED: &str = "not configured";
 
@@ -556,8 +556,8 @@ fn sync_lane_row(
     });
 }
 
-/// The lane a job does not have: its words, then what is missing — `Outbound
-/// (Out Tray) — not configured`.
+/// The lane a job does not have: its words, then what is missing — `Outbound —
+/// not configured`.
 fn missing_lane(ui: &mut egui::Ui, lane: Lane, columns: &Columns) {
     let text = format!("{} — {LANE_NOT_CONFIGURED}", lane_label(lane));
 
@@ -2313,19 +2313,19 @@ mod tests {
     // ---------- a duplex is one job with two sync lanes ----------
 
     /// The title line the owner asked for, exactly: the project's name and then
-    /// `· Smart In/Out Tray`, and a line per lane under it with its tray in
-    /// brackets.
+    /// `· Smart In/Out Tray`, and a line per lane under it named by its own word
+    /// alone.
     #[test]
     fn a_duplex_draws_one_job_with_both_lane_labels() {
         let harness = screen_harness(state_with(luc()));
 
         // The job, in the owner's words: the project, then the tray.
         let (title, _) = job_title(&harness, "LUC");
-        // Its two lanes, each with its own tray named.
+        // Its two lanes, each named by its own word.
         let inbound = harness.get_by_label(LANE_INBOUND);
         let outbound = harness.get_by_label(LANE_OUTBOUND);
-        assert_eq!(LANE_INBOUND, "Inbound (In Tray)");
-        assert_eq!(LANE_OUTBOUND, "Outbound (Out Tray)");
+        assert_eq!(LANE_INBOUND, "Inbound");
+        assert_eq!(LANE_OUTBOUND, "Outbound");
 
         // Under the title, inbound first, one row apart, the rows on the pitch
         // the list has always used.
