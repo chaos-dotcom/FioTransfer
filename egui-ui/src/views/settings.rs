@@ -13,8 +13,10 @@
 //! belongs to. It is four settings (`App::set_portal` writes them: the address,
 //! the local folder, the on/off flag and — to the keychain, never to
 //! settings.json — the bearer token), one status line from `App::portal_status`,
-//! and a "Reconcile now". It draws with the same rows as everything above it: no
-//! new colour, no new font, no new height.
+//! and a "Reconcile now". Two credentials get in: a pasted access token, or
+//! Portal's own sign-in ("Sign in instead", `App::portal_sign_in`), whose session
+//! cookie is kept and whose password is not. It draws with the same rows as
+//! everything above it: no new colour, no new font, no new height.
 //!
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`]. `.settings
@@ -98,6 +100,11 @@ pub enum Action {
     SavePortalToken(Secret),
     /// "Forget" next to the access token.
     ForgetPortalToken,
+    /// "Sign in" next to the email and the password: Portal's own login, with
+    /// the password on its way to the app as a [`Secret`].
+    SignInPortal { email: String, password: Secret },
+    /// "Sign out" of the stored Portal session.
+    SignOutPortal,
     /// The "Enabled" toggle.
     SetPortalEnabled(bool),
     /// "Reconcile now".
@@ -144,6 +151,10 @@ fn ask(state: &mut UiState, action: Action) {
         Action::SetPortalRoot(root) => state.ask(Request::SetPortalRoot(root)),
         Action::SavePortalToken(token) => state.ask(Request::SetPortalToken(token)),
         Action::ForgetPortalToken => state.ask(Request::ForgetPortalToken),
+        Action::SignInPortal { email, password } => {
+            state.ask(Request::SignInPortal { email, password })
+        }
+        Action::SignOutPortal => state.ask(Request::SignOutPortal),
         Action::SetPortalEnabled(on) => state.ask(Request::SetPortalEnabled(on)),
         Action::ReconcileNow => state.ask(Request::PortalReconcile),
     }
@@ -224,6 +235,8 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
             portal_url_line(ui, state, &mut action);
             rule(ui);
             portal_token_line(ui, state, &mut action);
+            rule(ui);
+            portal_signin_line(ui, state, &mut action);
             rule(ui);
             portal_root_line(ui, state, &mut action);
             rule(ui);
@@ -783,6 +796,15 @@ const PORTAL_ROOT_HINT: &str = "~/Live_Work";
 /// empty field says which of the two states it is in instead.
 const TOKEN_STORED: &str = "stored in your keychain";
 const TOKEN_MISSING: &str = "not set";
+/// The sign-in row's two placeholders: what an admin address looks like, and a
+/// password field that says nothing about the password it is waiting for.
+const PORTAL_EMAIL_HINT: &str = "admin@example.com";
+const PORTAL_PASSWORD_HINT: &str = "your Portal password";
+/// What the sign-in row says under its fields: the one promise the row makes.
+const PASSWORD_NOTE: &str =
+    "The password is not stored: only Portal's session cookie is, in your keychain.";
+/// The same line while the POST is out.
+const SIGNING_IN: &str = "Signing in…";
 /// What the address field says when it refuses a value.
 const PORTAL_URL_REASON: &str = "The Portal address has to start with http:// or https://";
 
@@ -913,7 +935,10 @@ pub fn portal_line(status: &PortalView) -> PortalLine {
         };
     }
     if !status.signed_in {
-        return line("No access token yet: paste one above and press Save.".to_string(), true);
+        return line(
+            "Not signed in yet: save an access token above, or sign in below.".to_string(),
+            true,
+        );
     }
     if !status.error.trim().is_empty() {
         let when = portal_when(status.last_at, status.now_ms);
@@ -1074,6 +1099,102 @@ fn portal_token_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option
             help_line(ui, "A token is stored in your keychain, never in settings.json.");
         } else {
             help_line(ui, "No token is stored yet. Paste one and press Save.");
+        }
+    });
+}
+
+/// "Sign in instead": Portal's own login, under the access token.
+///
+/// A bearer token is one way in and this is the other one: the admin's email,
+/// the password, and Portal answers with a session cookie. The password is
+/// masked, and it is kept nowhere — the note under the row says so and the
+/// shell empties the draft the moment the answer lands, whichever way it went.
+///
+/// A stored session names its admin ("Signed in as …") and offers "Sign out"
+/// instead of the two fields; opening the fields again would only ask for a
+/// password beside the session that already works.
+fn portal_signin_line(ui: &mut egui::Ui, state: &mut UiState, action: &mut Option<Action>) {
+    // Portal's own name for the session comes first: it is Portal's answer, not
+    // the address anybody typed, and it is empty for a bearer token.
+    let signed_in_as = state.portal.status.email.trim().to_string();
+    if !signed_in_as.is_empty() {
+        // The label on the left, "Sign out" on the card's edge, and who it is
+        // underneath — the shape the "Enabled" row has.
+        let words = format!("Signed in as {signed_in_as}");
+        line(ui, |ui| {
+            ui.horizontal(|ui| {
+                field_label(ui, "Sign in instead");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if secondary_button_enabled(ui, "Sign out", true) {
+                        *action = Some(Action::SignOutPortal);
+                    }
+                });
+            });
+            ui.add_space(theme::space::XXS);
+            help_line(ui, &words);
+        });
+        return;
+    }
+
+    // The field starts on the address the last sign-in saved. What is typed is
+    // what gets posted, so a field somebody emptied stays empty.
+    let mut email = if state.portal.email_draft.is_empty() {
+        state.settings.portal_email.clone()
+    } else {
+        state.portal.email_draft.clone()
+    };
+    let signing_in = state.portal.signing_in;
+    let ready = !email.trim().is_empty()
+        && !state.portal.password_draft.is_empty()
+        && !signing_in;
+    line(ui, |ui| {
+        let label = field_label(ui, "Sign in instead");
+        ui.add_space(theme::space::M);
+        let field = portal_field(ui, &mut email, PORTAL_EMAIL_HINT).labelled_by(label.id);
+        if field.changed() {
+            // An email is not a secret, and a typo is worth keeping to be fixed.
+            state.portal.email_draft = email.clone();
+            state.portal.signin_error = None;
+        }
+        ui.add_space(theme::space::M);
+        ui.horizontal(|ui| {
+            // Right to left, as the token row has it: "Sign in" on the card's
+            // edge, the masked field taking what is left.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let pressed = primary_button(ui, "Sign in", ready);
+                let field_width = (ui.available_width() - theme::space::XXXL).max(60.0);
+                ui.scope(|ui| {
+                    ui.style_mut().visuals.extreme_bg_color = theme::SURFACE;
+                    // Named by its hint, the way the composer's passphrase field
+                    // is: one row, one name above it, and the field says what it
+                    // wants inside itself.
+                    ui.add(
+                        TextEdit::singleline(&mut state.portal.password_draft)
+                            .password(true)
+                            .hint_text(PORTAL_PASSWORD_HINT)
+                            .margin(Margin::symmetric(theme::space::L as i8, theme::space::M as i8))
+                            .desired_width(field_width),
+                    );
+                });
+                if pressed {
+                    let email = email.trim().to_string();
+                    let password = state.portal.password_draft.clone();
+                    if !email.is_empty() && !password.is_empty() {
+                        *action = Some(Action::SignInPortal {
+                            email,
+                            password: Secret::new(password),
+                        });
+                    }
+                }
+            });
+        });
+        ui.add_space(theme::space::XXS);
+        match state.portal.signin_error.clone() {
+            // The app's own sentence, where the note was: a refused sign-in has
+            // something to say and the note does not.
+            Some(reason) => reason_line(ui, &reason),
+            None if signing_in => help_line(ui, SIGNING_IN),
+            None => help_line(ui, PASSWORD_NOTE),
         }
     });
 }
@@ -1902,6 +2023,9 @@ mod tests {
         ui_state.portal.status = PortalView {
             enabled: true,
             signed_in: true,
+            // A bearer token names no admin: the sign-in row is the signed-out
+            // one, and "Signed in as …" belongs to `session_state`.
+            email: String::new(),
             url: "https://portal.example.com".to_string(),
             root: "/Users/chaos/Live_Work".to_string(),
             running: false,
@@ -2177,7 +2301,10 @@ mod tests {
 
         status.signed_in = false;
         status.url = "https://portal.example.com".to_string();
-        assert_eq!(portal_line(&status).text, "No access token yet: paste one above and press Save.");
+        assert_eq!(
+            portal_line(&status).text,
+            "Not signed in yet: save an access token above, or sign in below."
+        );
         assert!(portal_line(&status).failed);
 
         // Configured, and never run: no numbers to claim yet.
@@ -2297,6 +2424,166 @@ mod tests {
         harness.get_by_label("No token is stored yet. Paste one and press Save.");
     }
 
+    /// The screen with a Portal session stored: the same set-up as
+    /// `portal_state`, but the credential is Portal's own sign-in, which names
+    /// the admin it belongs to.
+    fn session_state() -> UiState {
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        ui_state.portal.status.email = "ops@nightfall.tv".to_string();
+        ui_state
+    }
+
+    #[test]
+    fn a_signed_out_screen_offers_the_email_and_the_password() {
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        let harness = screen_harness(ui_state);
+
+        // The row is named, and the address the last sign-in used is already in
+        // its field.
+        harness.get_by_label("Sign in instead");
+        assert!(
+            every_word(&harness).contains(&"ops@nightfall.tv".to_string()),
+            "the field is prefilled from settings.portal_email"
+        );
+        // Two masked fields now: the access token's, and this row's password.
+        assert_eq!(
+            harness.get_all_by_role(egui::accesskit::Role::PasswordInput).count(),
+            2,
+            "the token field and the password field"
+        );
+        // The promise the row makes, in the same `.help` line as the rows above.
+        harness.get_by_label(PASSWORD_NOTE);
+        assert!(
+            harness.query_by_label("Signed in as ops@nightfall.tv").is_none(),
+            "nobody is signed in yet"
+        );
+
+        // Nothing typed in the password yet, so "Sign in" waits.
+        let button = harness.get_by_label("Sign in");
+        assert!(button.accesskit_node().is_disabled(), "an empty password is not a sign-in");
+    }
+
+    #[test]
+    fn the_password_is_masked_never_rendered_and_never_printed() {
+        let password = "s3kret-P0rtal-pass";
+        let mut ui_state = portal_state();
+        ui_state.settings.portal_email = "ops@nightfall.tv".to_string();
+        let mut harness = screen_harness(ui_state);
+
+        harness
+            .get_all_by_role(egui::accesskit::Role::PasswordInput)
+            .last()
+            .expect("the sign-in password field")
+            .focus();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::PasswordInput)
+            .last()
+            .expect("the sign-in password field")
+            .type_text(password);
+        harness.run();
+
+        // What is drawn is the mask: no rendered word carries the password.
+        for word in every_word(&harness) {
+            assert!(!word.contains(password), "a rendered label carries the password: {word:?}");
+        }
+        // And it is not a setting, so it never reaches settings.json.
+        let saved = serde_json::to_string(&harness.state().settings).expect("the settings serialise");
+        assert!(!saved.contains(password), "the password reached the settings: {saved}");
+
+        // Both fields filled: "Sign in" posts the address and a `Secret`.
+        let button = harness.get_by_label("Sign in");
+        assert!(!button.accesskit_node().is_disabled(), "an address and a password");
+        button.click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SignInPortal {
+                email: "ops@nightfall.tv".to_string(),
+                password: Secret::new(password),
+            }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        // A `{:?}` of the request prints the address and the mask, never the
+        // password, so no toast or log line can leak it.
+        let printed = format!("{:?}", harness.state().requests);
+        assert!(!printed.contains(password), "a request printed the password: {printed}");
+        assert!(printed.contains("ops@nightfall.tv"), "the address is not a secret: {printed}");
+    }
+
+    #[test]
+    fn a_sign_in_in_flight_waits_rather_than_posting_twice() {
+        let mut ui_state = portal_state();
+        ui_state.portal.email_draft = "ops@nightfall.tv".to_string();
+        ui_state.portal.password_draft = "s3kret".to_string();
+        ui_state.portal.signing_in = true;
+        let harness = screen_harness(ui_state);
+
+        let button = harness.get_by_label("Sign in");
+        assert!(button.accesskit_node().is_disabled(), "one sign-in at a time");
+        harness.get_by_label(SIGNING_IN);
+        assert!(
+            harness.query_by_label(PASSWORD_NOTE).is_none(),
+            "while it is out, the row says what it is doing"
+        );
+    }
+
+    #[test]
+    fn a_refused_sign_in_says_why_under_the_fields() {
+        let mut ui_state = portal_state();
+        ui_state.portal.email_draft = "ops@nightfall.tv".to_string();
+        ui_state.portal.signin_error =
+            Some("Portal refused the sign-in (401): Invalid email or password".to_string());
+        let harness = screen_harness(ui_state);
+
+        // The app's sentence, where the note was, and the address it is about
+        // still in the field.
+        harness.get_by_label("Portal refused the sign-in (401): Invalid email or password");
+        assert!(harness.query_by_label(PASSWORD_NOTE).is_none(), "the reason takes the note's place");
+        assert!(every_word(&harness).contains(&"ops@nightfall.tv".to_string()));
+        assert_eq!(
+            harness.get_all_by_role(egui::accesskit::Role::PasswordInput).count(),
+            2,
+            "the fields are still there to retry with"
+        );
+    }
+
+    #[test]
+    fn a_stored_session_says_who_it_is_and_offers_sign_out() {
+        let mut harness = screen_harness(session_state());
+
+        harness.get_by_label("Signed in as ops@nightfall.tv");
+        // A session names its admin, so the two fields are not drawn: only the
+        // access token's masked field is left.
+        assert_eq!(
+            harness.get_all_by_role(egui::accesskit::Role::PasswordInput).count(),
+            1,
+            "a stored session does not ask for a password"
+        );
+        assert!(harness.query_by_label("Sign in").is_none(), "nothing to sign in to");
+        // The Frame.io row has a "Sign out" too: this one is the Portal card's,
+        // which is drawn last.
+        harness.get_all_by_label("Sign out").last().expect("the Portal sign-out").click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SignOutPortal),
+            "requests: {:?}",
+            harness.state().requests
+        );
+    }
+
+    #[test]
+    fn a_signed_in_session_counts_as_configured() {
+        // The reconcile button asks for a credential, and a session is one: the
+        // status that precedes it is the same either way.
+        let view = session_state().portal.status;
+        assert!(view.configured(), "an address and a session");
+        let harness = screen_harness(session_state());
+        assert!(!harness.get_by_label("Reconcile now").accesskit_node().is_disabled());
+    }
+
     /// The Portal card is drawn by the same pieces as the cards above it: the
     /// labels start on the card's own left padding, the fields are the same
     /// height, and no new colour or font is named. This is the check that the
@@ -2313,20 +2600,28 @@ mod tests {
         let client_label = harness.get_by_label("Adobe Client ID").rect();
         assert!((url_label.left() - client_label.left()).abs() < 0.5, "the same card padding");
 
-        // Fields: the Portal address, the folder and the token are the height of
-        // the Client ID field (`.input`, 32 px), not a new one.
+        // Fields: the Portal address, the folder, the token and the sign-in
+        // email are the height of the Client ID field (`.input`, 32 px), not a
+        // new one.
         let fields: Vec<f32> = harness
             .get_all_by_role(egui::accesskit::Role::TextInput)
             .map(|node| node.rect().height())
             .collect();
-        assert!(fields.len() >= 3, "the Client ID field and the two Portal ones: {}", fields.len());
+        assert!(fields.len() >= 4, "the Client ID field and the three Portal ones: {}", fields.len());
         let client = fields[0];
         assert!(client > 0.0);
         for height in &fields[1..] {
             assert!((height - client).abs() < 1.0, "a field is {height} px, the Client ID's is {client}");
         }
-        let token = harness.get_by_role(egui::accesskit::Role::PasswordInput).rect();
-        assert!((token.height() - client).abs() < 1.0, "the token field is {token:?}");
+        // The two masked ones, the access token's and the sign-in password's.
+        let masked: Vec<f32> = harness
+            .get_all_by_role(egui::accesskit::Role::PasswordInput)
+            .map(|node| node.rect().height())
+            .collect();
+        assert_eq!(masked.len(), 2, "the token field and the password field");
+        for height in masked {
+            assert!((height - client).abs() < 1.0, "a masked field is {height} px, the Client ID's is {client}");
+        }
     }
 
 

@@ -184,6 +184,9 @@ pub struct Settings {
     pub portal_enabled: bool,
     pub portal_on_change: String,
     pub portal_every_secs: i64,
+    /// The admin email the last Portal sign-in used: a setting, not a secret,
+    /// so the "Sign in instead" field is prefilled with it.
+    pub portal_email: String,
 }
 
 impl Default for Settings {
@@ -212,6 +215,7 @@ impl Default for Settings {
             portal_enabled: false,
             portal_on_change: "overwrite".to_string(),
             portal_every_secs: 30,
+            portal_email: String::new(),
         }
     }
 }

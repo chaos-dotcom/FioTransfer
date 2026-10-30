@@ -27,9 +27,38 @@ Settings → **Portal**:
 | Field | What goes in it |
 | --- | --- |
 | **Server URL** | Your Portal, e.g. `https://portal.yourdomain.com`. Must be `http://` or `https://` with a host. |
-| **Access token** | The `PORTAL_API_TOKEN` from Portal's `.env` (generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`). Saved to the login keychain; never written to `settings.json`, never displayed again. |
+| **Access token** | The `PORTAL_API_TOKEN` from Portal's `.env` (generate with `openssl rand -base64 32 \| tr '+/' '-_' \| tr -d '='`). Saved to the login keychain; never written to `settings.json`, never displayed again. Optional: see "Signing in instead" below. |
+| **Sign in instead** | Your Portal admin email and password. FioTransfer calls Portal's own login, keeps the session cookie, and throws the password away. Use this when the deployment has no `PORTAL_API_TOKEN`. |
 | **Local folder** | Where the project folders live. Default `~/Live_Work`. |
 | **Enabled** | Off by default: nothing is contacted until you turn it on. |
+
+### Signing in instead of a token
+
+`PORTAL_API_TOKEN` is optional in Portal and `deploy.sh` never writes one. While it is unset,
+every `/api` endpoint accepts only a browser session cookie, so no bearer token can work however
+correct it is. On such a deployment, sign in:
+
+1. **Server URL**: your Portal's address.
+2. **Sign in instead**: the admin email and password you use in Portal's own login screen, then
+   **Sign in**.
+3. The row then reads **Signed in as <email>** and a **Sign out** button replaces the fields.
+
+What is kept: the session cookie Portal sets (`portal_session`, fourteen days), in the login
+keychain under its own item, and your email in `settings.json` so the field is prefilled next
+time. What is not kept, anywhere: the password. It exists for the length of that one request, is
+never written to `settings.json`, never logged, and never shown by the app again.
+
+Precedence: if a bearer token is stored, it wins — that is what a headless install has. Otherwise
+the session is used. A session Portal stops accepting is reported as *"the Portal session
+expired"*, which is a different message from *"Portal refused the token"*: the fix is to sign in
+again, not to look for a token. Portal accounts with a second factor (TOTP or a passkey) cannot
+complete this sign-in from the app; use a bearer token there.
+
+Portal marks its session cookie `Secure` even when it is reached over plain http
+(`SESSION_COOKIE_SECURE` defaults to true). Over `https://` the cookie is sent exactly as Portal
+wrote it. Over plain `http://` to another machine it is sent too, without the `Secure` attribute:
+the password already crossed that same connection. Use `https://` for any Portal that is not on
+this machine.
 
 ### If the token is refused
 
@@ -38,7 +67,8 @@ while it is unset every `/api` endpoint accepts only a browser session cookie �
 cannot work, however correct it is. Even then Portal answers `401 Authentication required`, which
 looks identical to a wrong token.
 
-So if the status line says *"Portal refused the token"*, first make sure the deployment has one:
+So if the status line says *"Portal refused the token"*, either **sign in** with the admin email
+and password (see above), or make sure the deployment has a token:
 
 ```sh
 ssh you@your-portal-host
@@ -78,11 +108,18 @@ up as a success. While **Enabled** is on, FioTransfer re-checks every 30 seconds
 # a real instance, local, no Frame.io needed for the reconcile itself
 PORTAL_LIVE_URL=http://127.0.0.1:18080 PORTAL_LIVE_TOKEN=… \
   cargo test --offline -p fiotransfer --test portal_live -- --nocapture
+
+# the sign-in path, against a Portal that holds no token
+PORTAL_LIVE_URL=http://127.0.0.1:18080 PORTAL_LIVE_EMAIL=… PORTAL_LIVE_PASSWORD=… \
+  cargo test --offline -p fiotransfer --test portal_live -- --nocapture
 ```
 
 That test serves three links (one good marker, one `../etc`, one `.`) and asserts one
-mirrored watch, two stated refusals, and an idempotent second run. It is skipped unless
-both variables are set, so ordinary test runs stay offline.
+mirrored watch, two stated refusals, and an idempotent second run; with the sign-in
+variables it also asserts the sign-in itself, a refused password that stores nothing, and
+a session whose cookies are gone reading as expired rather than as a refused token. Each
+case is skipped unless its variables are set, so ordinary test runs stay offline. The
+password is read from the environment only: it is never a constant in the test file.
 
 ## What it does not do yet
 
@@ -90,3 +127,5 @@ both variables are set, so ordinary test runs stay offline.
 * Nothing is sent back to Portal — a link's state in Portal is unaffected by what
   FioTransfer does with its folder.
 * The token cannot be rotated from the app; change it in Portal and re-enter it here.
+* A second-factor (TOTP or passkey) sign-in is not something the app can complete: sign in
+  with a browser and use a bearer token on such a deployment.
