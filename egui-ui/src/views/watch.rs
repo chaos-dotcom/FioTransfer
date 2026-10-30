@@ -6,10 +6,18 @@
 //! file count, the last transfer, and the row's actions (pause/resume, edit,
 //! show in Finder, remove). The empty state is "No watch folders".
 //!
+//! A Portal-managed project is one job, not two rows: a **Smart In/Out Tray**
+//! whose title line is `<dest_label> · Smart In/Out Tray`, with a line per sync
+//! lane under it — `Inbound (In Tray)` and `Outbound (Out Tray)` — because Portal
+//! publishes a project as two one-way folders and the person watching it sees
+//! one job. A duplex with one lane configured shows that lane and says plainly
+//! which one is missing. A watch the user made is still one row of its own,
+//! drawn exactly as it was.
+//!
 //! The shell (`crate::app`) supplies the `.view` padding, the scroll area and
 //! the page head; the tokens come from [`crate::theme`].
 
-use crate::model::{Request, ToastKind, UiState, WatchRow};
+use crate::model::{watch_blocks, Lane, Request, ToastKind, UiState, WatchRow};
 use crate::theme;
 use egui::{
     Align, Color32, CornerRadius, Layout, Painter, Rect, RichText, Sense, Shape, Stroke, StrokeKind,
@@ -51,6 +59,30 @@ pub const PORTAL_MARKER: &str = "Portal";
 pub const PORTAL_SENTENCE: &str =
     "Kept in step by Portal. Remove the marker in Portal to drop it.";
 
+// The words the job a duplex is, and its lanes, are said in. This is the
+// screen's copy; the code behind it is `Lane`, `WatchRow::duplex_id` and
+// [`crate::model::watch_blocks`].
+
+/// The job one Portal-managed project is, after its destination label.
+pub const SMART_IN_OUT_TRAY: &str = "Smart In/Out Tray";
+/// The inbound lane, its tray in brackets: the download watch on the client's
+/// folder.
+pub const LANE_INBOUND: &str = "Inbound (In Tray)";
+/// The outbound lane, its tray in brackets: the upload watch on the exports
+/// folder.
+pub const LANE_OUTBOUND: &str = "Outbound (Out Tray)";
+/// What a lane with no watch behind it says, after its label and an em dash.
+pub const LANE_NOT_CONFIGURED: &str = "not configured";
+
+/// A lane's own words on screen.
+fn lane_label(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Inbound => LANE_INBOUND,
+        Lane::Outbound => LANE_OUTBOUND,
+        Lane::None => "",
+    }
+}
+
 /// What the screen asks the shell to do.
 ///
 /// A view is a pure renderer over [`UiState`], so everything that needs the
@@ -66,6 +98,9 @@ pub enum Action {
     Edit(usize),
     /// Remove the watch folder (`.w-remove`).
     Remove(usize),
+    /// Remove a job's lanes together: one Remove on a Smart In/Out Tray, which
+    /// takes both of the watches Portal made for it.
+    RemoveDuplex { rows: Vec<usize> },
     /// Show the folder in Finder (`.w-reveal`).
     Reveal(usize),
 }
@@ -93,6 +128,19 @@ fn ask(state: &mut UiState, action: Action) {
         }
         Action::Remove(index) => {
             if let Some(id) = state.watches.get(index).map(|watch| watch.id.clone()) {
+                state.ask(Request::RemoveWatch(id));
+            }
+        }
+        Action::RemoveDuplex { rows } => {
+            // The job's lanes go together: Portal made them as one project, and
+            // taking one would leave a lane standing with nothing above it. The
+            // sentence on the job says Portal puts them back unless its own
+            // marker is cleared.
+            let ids: Vec<String> = rows
+                .iter()
+                .filter_map(|index| state.watches.get(*index).map(|watch| watch.id.clone()))
+                .collect();
+            for id in ids {
                 state.ask(Request::RemoveWatch(id));
             }
         }
@@ -135,8 +183,19 @@ pub fn show_with_actions(ui: &mut egui::Ui, state: &mut UiState) -> Option<Actio
 
     let columns = Columns::for_width(ui.available_width());
     list_head(ui, &columns);
-    for (index, watch) in state.watches.iter_mut().enumerate() {
-        watch_row(ui, index, watch, &state.home, &columns, &mut action);
+    // One block per job: a duplex's lanes under its title, a watch the user made
+    // on its own row. The block's rows are indices into `state.watches`, which is
+    // what every action is addressed by.
+    let home = state.home.clone();
+    for block in watch_blocks(&state.watches) {
+        match &block.duplex_id {
+            Some(_) => duplex_block(ui, &block.rows, &mut state.watches, &home, &columns, &mut action),
+            None => {
+                for index in &block.rows {
+                    watch_row(ui, *index, &mut state.watches[*index], &home, &columns, &mut action);
+                }
+            }
+        }
     }
 
     action
@@ -219,7 +278,10 @@ fn head_cell(ui: &mut egui::Ui, width: f32, right: bool, text: &str) {
     });
 }
 
-/// One watched folder (`.row .row-main`).
+/// One watched folder (`.row .row-main`): a watch the user made, or a Portal row
+/// whose origin names no sync lane this screen can place. Both draw exactly what
+/// they drew before there were job blocks — the folder and its path, the
+/// Frame.io destination, the status, the file count, and the row's actions.
 fn watch_row(
     ui: &mut egui::Ui,
     index: usize,
@@ -230,8 +292,6 @@ fn watch_row(
 ) {
     let name = base_name(&watch.local);
     let path = short_path(&watch.local, home);
-    let verb = direction_verb(&watch.direction);
-    let status = if watch.enabled { STATUS_WATCHING } else { STATUS_PAUSED };
 
     let row = strip(ui, ROW_HEIGHT, true, |ui| {
         // Folder: the 30 px tile, then the name and the shortened path.
@@ -257,12 +317,7 @@ fn watch_row(
                     // `ui.horizontal` would centre the line in whatever is left
                     // under the name and drop it, which the user's rows must not
                     // get and this one should not have either.
-                    let line = vec2(
-                        ui.available_width(),
-                        ui.fonts_mut(|fonts| fonts.row_height(&theme::detail())),
-                    );
-                    ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = theme::space::S;
+                    detail_line(ui, |ui| {
                         portal_marker(ui).on_hover_text(PORTAL_SENTENCE);
                         path_line(ui, &path, &watch.local);
                     });
@@ -272,77 +327,8 @@ fn watch_row(
             });
         });
 
-        // Frame.io: the direction icon and the destination label.
-        cell(ui, columns.dest, ROW_HEIGHT, false, |ui| {
-            ui.spacing_mut().item_spacing.x = 7.0;
-            glyph(ui, Glyph::of_direction(&watch.direction), theme::TEXT_3);
-            ui.add(theme::truncating(
-                RichText::new(&watch.label)
-                    .font(theme::body())
-                    .color(theme::TEXT_2),
-            ))
-            .on_hover_text(format!("{verb} {}", watch.label));
-        });
-
-        // Status: the dot and the word (`.status.watching` / `.status.paused`).
-        cell(ui, columns.status, ROW_HEIGHT, false, |ui| {
-            let key = if watch.enabled { "watching" } else { "paused" };
-            dot(ui, theme::status_color(key));
-            ui.add(theme::truncating(
-                RichText::new(status)
-                    .font(theme::note())
-                    .color(theme::TEXT_2),
-            ));
-        });
-
-        if let Some(width) = columns.files {
-            cell(ui, width, ROW_HEIGHT, true, |ui| {
-                ui.add(theme::truncating(
-                    RichText::new(count_word(watch.pending))
-                        .font(theme::body())
-                        .color(theme::TEXT_2),
-                ))
-                .on_hover_text(format!("{} pending", watch.pending));
-            });
-        }
-
-        if let Some(width) = columns.last {
-            cell(ui, width, ROW_HEIGHT, false, |ui| {
-                // `WatchRow` carries no last-transfer time; the webview prints
-                // an em dash when there is none.
-                ui.label(
-                    RichText::new("—")
-                        .font(theme::body())
-                        .color(theme::TEXT_2),
-                );
-            });
-        }
-
-        // Actions: pause/resume, edit, show in Finder, remove.
-        cell(ui, columns.actions, ROW_HEIGHT, false, |ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if icon_button(ui, Glyph::Trash, "Remove") {
-                    *action = Some(Action::Remove(index));
-                }
-                if icon_button(ui, Glyph::Reveal, "Show in Finder") {
-                    *action = Some(Action::Reveal(index));
-                }
-                if icon_button(ui, Glyph::Pencil, "Edit") {
-                    *action = Some(Action::Edit(index));
-                }
-                let (glyph, label) = if watch.enabled {
-                    (Glyph::Pause, "Pause")
-                } else {
-                    (Glyph::Play, "Resume")
-                };
-                if icon_button(ui, glyph, label) {
-                    let enabled = !watch.enabled;
-                    watch.enabled = enabled;
-                    *action = Some(Action::SetEnabled { index, enabled });
-                }
-            });
-        });
+        middle_cells(ui, watch, columns);
+        actions_cell(ui, columns, index, watch, Some(Action::Remove(index)), action);
     });
 
     if watch.from_portal {
@@ -351,6 +337,246 @@ fn watch_row(
         // well as on the marker itself.
         row.on_hover_text(PORTAL_SENTENCE);
     }
+}
+
+/// One Portal-managed project as one job: the title line, then a line for each
+/// sync lane under it.
+///
+/// The rows are the job's lanes in `UiState::watches`, inbound first — the order
+/// [`crate::model::watch_blocks`] put them in. A lane the link has no watch for
+/// is drawn as the line that says so, rather than left out: the job is a Smart
+/// In/Out Tray, and half of it being missing is part of what there is to see.
+fn duplex_block(
+    ui: &mut egui::Ui,
+    rows: &[usize],
+    watches: &mut [WatchRow],
+    home: &str,
+    columns: &Columns,
+    action: &mut Option<Action>,
+) {
+    let Some(&first) = rows.first() else {
+        return;
+    };
+    let label = watches[first].label.clone();
+    job_head(ui, &label, rows, columns, action);
+
+    for lane in [Lane::Inbound, Lane::Outbound] {
+        match rows.iter().copied().find(|&index| watches[index].lane == lane) {
+            Some(index) => sync_lane_row(ui, index, &mut watches[index], home, columns, action),
+            None => missing_lane(ui, lane, columns),
+        }
+    }
+}
+
+/// The job's title line: `<dest_label> · Smart In/Out Tray`, and the job's one
+/// Remove at the right, where a row keeps its actions.
+fn job_head(
+    ui: &mut egui::Ui,
+    label: &str,
+    rows: &[usize],
+    columns: &Columns,
+    action: &mut Option<Action>,
+) {
+    let title = format!("{label} · {SMART_IN_OUT_TRAY}");
+
+    let head = strip(ui, ROW_HEIGHT, true, |ui| {
+        cell(ui, columns.name, ROW_HEIGHT, false, |ui| {
+            ui.spacing_mut().item_spacing.x = theme::space::XL;
+            icon_tile(ui, Glyph::Folder);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(theme::truncating(
+                    RichText::new(&title)
+                        .font(theme::body())
+                        .color(theme::TEXT)
+                        .strong(),
+                ));
+                // The second line is the marker a Portal row already carries, in
+                // the same muted 12 px: the job is Portal's, and the paths are
+                // on the lanes below rather than here.
+                detail_line(ui, |ui| {
+                    portal_marker(ui).on_hover_text(PORTAL_SENTENCE);
+                });
+            });
+        });
+
+        // The middle columns stay empty on the title line, so the Remove lands in
+        // the column the rows keep their actions in.
+        empty_cells(ui, columns);
+        cell(ui, columns.actions, ROW_HEIGHT, false, |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if icon_button_with(ui, Glyph::Trash, "Remove", PORTAL_SENTENCE) {
+                    *action = Some(Action::RemoveDuplex { rows: rows.to_vec() });
+                }
+            });
+        });
+    });
+
+    // One sentence for the job, the one a Portal row already carries: removing
+    // this here is not the end of it, and the Remove above is not hidden for
+    // saying so.
+    head.on_hover_text(PORTAL_SENTENCE);
+}
+
+/// One sync lane of a job: the lane's words, its folder and path, the Frame.io
+/// side, and the lane's own state — the same cells a row draws, in the same
+/// fonts and the same 56 px row.
+fn sync_lane_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    watch: &mut WatchRow,
+    home: &str,
+    columns: &Columns,
+    action: &mut Option<Action>,
+) {
+    let lane = lane_label(watch.lane).to_string();
+    let path = short_path(&watch.local, home);
+
+    strip(ui, ROW_HEIGHT, true, |ui| {
+        cell(ui, columns.name, ROW_HEIGHT, false, |ui| {
+            // Indented under the title's text: the folder tile's width and its
+            // gap, so a lane reads as part of the job above it.
+            ui.add_space(theme::size::KIND_ICON + theme::space::XL);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(theme::truncating(
+                    RichText::new(&lane)
+                        .font(theme::body())
+                        .color(if watch.enabled { theme::TEXT } else { theme::TEXT_2 })
+                        .strong(),
+                ));
+                path_line(ui, &path, &watch.local);
+            });
+        });
+
+        middle_cells(ui, watch, columns);
+        // The lane keeps every action but Remove: one Remove, on the job.
+        actions_cell(ui, columns, index, watch, None, action);
+    });
+}
+
+/// The lane a job does not have: its words, then what is missing — `Outbound
+/// (Out Tray) — not configured`.
+fn missing_lane(ui: &mut egui::Ui, lane: Lane, columns: &Columns) {
+    let text = format!("{} — {LANE_NOT_CONFIGURED}", lane_label(lane));
+
+    strip(ui, ROW_HEIGHT, false, |ui| {
+        cell(ui, columns.name, ROW_HEIGHT, false, |ui| {
+            ui.add_space(theme::size::KIND_ICON + theme::space::XL);
+            ui.add(theme::truncating(
+                RichText::new(&text)
+                    .font(theme::body())
+                    .color(theme::TEXT_3),
+            ));
+        });
+        empty_cells(ui, columns);
+        cell(ui, columns.actions, ROW_HEIGHT, false, |_ui| {});
+    });
+}
+
+/// The Frame.io, status, files and last-transfer cells of a row — the same on a
+/// lane and on a watch the user made.
+fn middle_cells(ui: &mut egui::Ui, watch: &WatchRow, columns: &Columns) {
+    let verb = direction_verb(&watch.direction);
+    let status = if watch.enabled { STATUS_WATCHING } else { STATUS_PAUSED };
+
+    // Frame.io: the direction icon and the destination label.
+    cell(ui, columns.dest, ROW_HEIGHT, false, |ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        glyph(ui, Glyph::of_direction(&watch.direction), theme::TEXT_3);
+        ui.add(theme::truncating(
+            RichText::new(&watch.label)
+                .font(theme::body())
+                .color(theme::TEXT_2),
+        ))
+        .on_hover_text(format!("{verb} {}", watch.label));
+    });
+
+    // Status: the dot and the word (`.status.watching` / `.status.paused`).
+    cell(ui, columns.status, ROW_HEIGHT, false, |ui| {
+        let key = if watch.enabled { "watching" } else { "paused" };
+        dot(ui, theme::status_color(key));
+        ui.add(theme::truncating(
+            RichText::new(status)
+                .font(theme::note())
+                .color(theme::TEXT_2),
+        ));
+    });
+
+    if let Some(width) = columns.files {
+        cell(ui, width, ROW_HEIGHT, true, |ui| {
+            ui.add(theme::truncating(
+                RichText::new(count_word(watch.pending))
+                    .font(theme::body())
+                    .color(theme::TEXT_2),
+            ))
+            .on_hover_text(format!("{} pending", watch.pending));
+        });
+    }
+
+    if let Some(width) = columns.last {
+        cell(ui, width, ROW_HEIGHT, false, |ui| {
+            // `WatchRow` carries no last-transfer time; the webview prints
+            // an em dash when there is none.
+            ui.label(
+                RichText::new("—")
+                    .font(theme::body())
+                    .color(theme::TEXT_2),
+            );
+        });
+    }
+}
+
+/// The middle columns with nothing in them, for a line that has no figures of
+/// its own — the job's title, and a lane that is not configured.
+fn empty_cells(ui: &mut egui::Ui, columns: &Columns) {
+    cell(ui, columns.dest, ROW_HEIGHT, false, |_ui| {});
+    cell(ui, columns.status, ROW_HEIGHT, false, |_ui| {});
+    if let Some(width) = columns.files {
+        cell(ui, width, ROW_HEIGHT, true, |_ui| {});
+    }
+    if let Some(width) = columns.last {
+        cell(ui, width, ROW_HEIGHT, false, |_ui| {});
+    }
+}
+
+/// A row's actions, right to left: pause/resume, edit, show in Finder, and the
+/// Remove when the row owns one.
+fn actions_cell(
+    ui: &mut egui::Ui,
+    columns: &Columns,
+    index: usize,
+    watch: &mut WatchRow,
+    remove: Option<Action>,
+    action: &mut Option<Action>,
+) {
+    cell(ui, columns.actions, ROW_HEIGHT, false, |ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if let Some(remove) = remove {
+                if icon_button(ui, Glyph::Trash, "Remove") {
+                    *action = Some(remove);
+                }
+            }
+            if icon_button(ui, Glyph::Reveal, "Show in Finder") {
+                *action = Some(Action::Reveal(index));
+            }
+            if icon_button(ui, Glyph::Pencil, "Edit") {
+                *action = Some(Action::Edit(index));
+            }
+            let (glyph, label) = if watch.enabled {
+                (Glyph::Pause, "Pause")
+            } else {
+                (Glyph::Play, "Resume")
+            };
+            if icon_button(ui, glyph, label) {
+                let enabled = !watch.enabled;
+                watch.enabled = enabled;
+                *action = Some(Action::SetEnabled { index, enabled });
+            }
+        });
+    });
 }
 
 // ---------- the pieces of the table ----------
@@ -426,6 +652,21 @@ fn glyph(ui: &mut egui::Ui, glyph: Glyph, colour: Color32) {
     paint(ui.painter(), rect, glyph, colour, 14.0);
 }
 
+/// One line of a folder cell's secondary text, at the detail font's own height.
+///
+/// A plain `ui.horizontal` would centre the line in whatever is left under the
+/// name and drop it; this keeps the line where the name's second line belongs.
+fn detail_line(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let line = vec2(
+        ui.available_width(),
+        ui.fonts_mut(|fonts| fonts.row_height(&theme::detail())),
+    );
+    ui.allocate_ui_with_layout(line, Layout::left_to_right(Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = theme::space::S;
+        add(ui);
+    });
+}
+
 /// The row's detail line: the shortened path, its tooltip the whole path.
 fn path_line(ui: &mut egui::Ui, path: &str, local: &str) {
     ui.add(theme::truncating(
@@ -449,9 +690,16 @@ fn portal_marker(ui: &mut egui::Ui) -> egui::Response {
 /// `.icon-btn`: 28 x 28, transparent, `--text-3` until hovered. The button is
 /// painted, and `WidgetInfo` gives it the name a screen reader and a test use.
 fn icon_button(ui: &mut egui::Ui, glyph: Glyph, label: &str) -> bool {
+    icon_button_with(ui, glyph, label, label)
+}
+
+/// The same button with its tooltip said in other words: for an action whose
+/// cost is not in the glyph — the job's Remove, which Portal undoes. The name a
+/// screen reader and a test use is still `label`.
+fn icon_button_with(ui: &mut egui::Ui, glyph: Glyph, label: &str, tooltip: &str) -> bool {
     let size = vec2(theme::size::ICON_BTN, theme::size::ICON_BTN);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let response = response.on_hover_text(label);
+    let response = response.on_hover_text(tooltip);
     let colour = if response.hovered() {
         theme::TEXT
     } else {
@@ -724,15 +972,47 @@ mod tests {
             enabled,
             pending,
             from_portal: false,
+            duplex_id: None,
+            lane: Lane::None,
         }
     }
 
-    /// The same row, as Portal's: the record's origin is `portal:<link id>`.
+    /// The same row, as Portal's, on a watch whose origin names no lane this
+    /// screen can place: the marker, and nothing about duplexes.
     fn portal_watch(local: &str, label: &str, direction: &str, enabled: bool, pending: i64) -> WatchRow {
         WatchRow {
             from_portal: true,
             ..watch(local, label, direction, enabled, pending)
         }
+    }
+
+    /// One sync lane of a Portal-managed project: the record's origin is
+    /// `portal:<link id>` for the inbound lane and `portal:<link id>#exports`
+    /// for the outbound one, and the lane is read from that and the direction.
+    fn lane_watch(
+        local: &str,
+        label: &str,
+        direction: &str,
+        enabled: bool,
+        pending: i64,
+        duplex: &str,
+        lane: Lane,
+    ) -> WatchRow {
+        WatchRow {
+            from_portal: true,
+            duplex_id: Some(duplex.to_string()),
+            lane,
+            ..watch(local, label, direction, enabled, pending)
+        }
+    }
+
+    /// A duplex with both lanes: the client's folder downloaded into, the
+    /// exports folder uploaded from, and one destination label between them.
+    fn luc() -> Vec<WatchRow> {
+        vec![
+            lane_watch("/Users/chaos/Live_Work/LUC/1_DRIVE", "LUC", "download", true, 4, "LUC", Lane::Inbound),
+            lane_watch("/Users/chaos/Live_Work/LUC/0_EXPORTS", "LUC", "upload", true, 2, "LUC", Lane::Outbound),
+        ]
     }
 
     fn state_with(watches: Vec<WatchRow>) -> UiState {
@@ -1164,5 +1444,255 @@ mod tests {
         // The sub line carries the whole path, shortened to `~`.
         let shortened = short_path(&long, "/Users/chaos");
         harness.get_by_label(&shortened);
+    }
+
+    // ---------- a duplex is one job with two sync lanes ----------
+
+    /// The title line the owner asked for, exactly: `<dest_label> · Smart In/Out
+    /// Tray`, and a line per lane under it with its tray in brackets.
+    #[test]
+    fn a_duplex_draws_one_job_with_both_lane_labels() {
+        let harness = screen_harness(state_with(luc()));
+
+        // The job, in the owner's words.
+        let job = format!("LUC · {SMART_IN_OUT_TRAY}");
+        let title = harness.get_by_label(&job);
+        // Its two lanes, each with its own tray named.
+        let inbound = harness.get_by_label(LANE_INBOUND);
+        let outbound = harness.get_by_label(LANE_OUTBOUND);
+        assert_eq!(LANE_INBOUND, "Inbound (In Tray)");
+        assert_eq!(LANE_OUTBOUND, "Outbound (Out Tray)");
+
+        // Under the title, inbound first, one row apart, the rows on the pitch
+        // the list has always used.
+        assert!(inbound.rect().center().y > title.rect().center().y);
+        assert!(outbound.rect().center().y > inbound.rect().center().y);
+        assert!(
+            (outbound.rect().center().y - inbound.rect().center().y - ROW_HEIGHT).abs() < 1.0,
+            "the lanes are rows: {:?} {:?}",
+            inbound.rect(),
+            outbound.rect()
+        );
+
+        // Each lane carries its folder's path, the Frame.io side, its own count
+        // and its own state.
+        harness.get_by_label("~/Live_Work/LUC/1_DRIVE");
+        harness.get_by_label("~/Live_Work/LUC/0_EXPORTS");
+        assert_eq!(harness.get_all_by_label("LUC").count(), 2, "the Frame.io side, on both lanes");
+        harness.get_by_label("4");
+        harness.get_by_label("2");
+        assert_eq!(harness.get_all_by_label("Watching").count(), 2, "each lane its own state");
+
+        // One Remove for the job, and every other action still on its lane.
+        assert_eq!(harness.get_all_by_label("Remove").count(), 1);
+        assert_eq!(harness.get_all_by_label("Pause").count(), 2);
+        assert_eq!(harness.get_all_by_label("Edit").count(), 2);
+        assert_eq!(harness.get_all_by_label("Show in Finder").count(), 2);
+
+        // The two watches are not two rows of their own: no folder name is
+        // printed, because the job is what is listed.
+        assert!(harness.query_by_label("1_DRIVE").is_none());
+        assert!(harness.query_by_label("0_EXPORTS").is_none());
+    }
+
+    /// A link with a sync rule but no exports folder: one lane, and a line that
+    /// says which one is missing, in the owner's words.
+    #[test]
+    fn a_duplex_with_one_lane_says_which_is_not_configured() {
+        let harness = screen_harness(state_with(vec![lane_watch(
+            "/Users/chaos/Live_Work/LUC/1_DRIVE",
+            "LUC",
+            "download",
+            true,
+            4,
+            "LUC",
+            Lane::Inbound,
+        )]));
+
+        harness.get_by_label(&format!("LUC · {SMART_IN_OUT_TRAY}"));
+        harness.get_by_label(LANE_INBOUND);
+        // The lane that is not there, and the plain statement of it.
+        assert!(
+            harness.query_by_label(LANE_OUTBOUND).is_none(),
+            "the missing lane has no row of its own"
+        );
+        let absent = format!("{LANE_OUTBOUND} — {LANE_NOT_CONFIGURED}");
+        let missing = harness.get_by_label(&absent);
+        // One row under the lane that exists: a row's first line sits on the
+        // same pitch the list has always used, and this line — alone in its row,
+        // with no path under it — is centred in its row rather than on that first
+        // line, so it reads a little lower than a lane's own words.
+        let inbound = harness.get_by_label(LANE_INBOUND);
+        let step = missing.rect().center().y - inbound.rect().center().y;
+        assert!(
+            step > ROW_HEIGHT && step < ROW_HEIGHT * 2.0,
+            "the missing lane is the lane's next row, {step} px on: {:?} {:?}",
+            missing.rect(),
+            inbound.rect()
+        );
+        // A job with one lane still has one Remove, and one of every other
+        // action.
+        assert_eq!(harness.get_all_by_label("Remove").count(), 1);
+        assert_eq!(harness.get_all_by_label("Pause").count(), 1);
+    }
+
+    /// The same, the other way round: the exports folder configured, the client's
+    /// folder not. The line names the lane that is missing, not a fixed one.
+    #[test]
+    fn an_outbound_only_duplex_names_the_inbound_lane_as_missing() {
+        let harness = screen_harness(state_with(vec![lane_watch(
+            "/Users/chaos/Live_Work/LUC/0_EXPORTS",
+            "LUC",
+            "upload",
+            false,
+            0,
+            "LUC",
+            Lane::Outbound,
+        )]));
+
+        harness.get_by_label(LANE_OUTBOUND);
+        harness.get_by_label(&format!("{LANE_INBOUND} — {LANE_NOT_CONFIGURED}"));
+        harness.get_by_label("Paused");
+        assert!(harness.query_by_label(LANE_INBOUND).is_none());
+    }
+
+    /// A watch the user made keeps the row it has always had: no title, no lane
+    /// labels, no marker — and it sits beside a job without taking anything from
+    /// it.
+    #[test]
+    fn a_user_watch_keeps_its_own_row_beside_a_job() {
+        let harness = screen_harness(state_with(vec![
+            watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3),
+            lane_watch("/Users/chaos/Live_Work/LUC/1_DRIVE", "LUC", "download", true, 4, "LUC", Lane::Inbound),
+            lane_watch("/Users/chaos/Live_Work/LUC/0_EXPORTS", "LUC", "upload", true, 2, "LUC", Lane::Outbound),
+        ]));
+
+        // The user's row, exactly as before: the folder's name, its path, its
+        // destination, its count, its four actions.
+        harness.get_by_label("Rushes");
+        harness.get_by_label("~/Movies/Rushes");
+        harness.get_by_label("Rushes 2026");
+        harness.get_by_label("3");
+        assert_eq!(harness.get_all_by_label("Remove").count(), 2, "the user's row and the job's");
+        // Its row is one row, and the job follows it on the same pitch: the
+        // folder's name and the job's title are both a row's first line.
+        let rushes = harness.get_by_label("Rushes").rect();
+        let job = format!("LUC · {SMART_IN_OUT_TRAY}");
+        let title = harness.get_by_label(&job).rect();
+        assert!(
+            (title.center().y - rushes.center().y - ROW_HEIGHT).abs() < 1.0,
+            "{rushes:?} {title:?}"
+        );
+        // And only the job is Portal's: one marker on the screen.
+        assert_eq!(harness.get_all_by_label(PORTAL_MARKER).count(), 1);
+    }
+
+    /// Two duplexes in one list: each is one block, and the blocks are in label
+    /// order whatever order the records arrived in — the list of a portal listing
+    /// is not the order a person reads.
+    #[test]
+    fn two_duplexes_make_two_blocks_in_label_order() {
+        let harness = screen_harness(state_with(vec![
+            lane_watch("/Users/chaos/Live_Work/LUC/1_DRIVE", "LUC", "download", true, 0, "LUC", Lane::Inbound),
+            lane_watch("/Users/chaos/Live_Work/ARCH/0_EXPORTS", "Archive", "upload", true, 0, "ARCH", Lane::Outbound),
+            lane_watch("/Users/chaos/Live_Work/LUC/0_EXPORTS", "LUC", "upload", true, 0, "LUC", Lane::Outbound),
+            lane_watch("/Users/chaos/Live_Work/ARCH/1_DRIVE", "Archive", "download", true, 0, "ARCH", Lane::Inbound),
+        ]));
+
+        let archive = harness.get_by_label(&format!("Archive · {SMART_IN_OUT_TRAY}")).rect();
+        let luc = harness.get_by_label(&format!("LUC · {SMART_IN_OUT_TRAY}")).rect();
+        assert!(archive.top() < luc.top(), "Archive first: {archive:?} {luc:?}");
+
+        // Each block holds its own two lanes, in its own place: four lanes, two
+        // titles, and the lanes of one job under that job's title.
+        assert_eq!(harness.get_all_by_label(LANE_INBOUND).count(), 2);
+        assert_eq!(harness.get_all_by_label(LANE_OUTBOUND).count(), 2);
+        let inbound: Vec<_> = harness.get_all_by_label(LANE_INBOUND).map(|r| r.rect()).collect();
+        assert!(inbound[0].top() < inbound[1].top());
+        assert!(
+            (inbound[0].center().y - archive.center().y - ROW_HEIGHT).abs() < 1.0,
+            "the first job's inbound lane sits under the first title"
+        );
+        // Two jobs, one Remove each.
+        assert_eq!(harness.get_all_by_label("Remove").count(), 2);
+    }
+
+    /// The job's Remove is the job's: it asks the app to drop both watches, since
+    /// Portal made them as one project. A lane's own pause still names its own
+    /// watch.
+    #[test]
+    fn the_jobs_remove_and_a_lanes_pause_are_addressed_by_their_own_rows() {
+        let mut harness = screen_harness(state_with(luc()));
+
+        harness.get_by_label("Remove").click();
+        harness.run();
+        assert_eq!(
+            harness.state().requests,
+            vec![
+                Request::RemoveWatch("id:/Users/chaos/Live_Work/LUC/1_DRIVE".to_string()),
+                Request::RemoveWatch("id:/Users/chaos/Live_Work/LUC/0_EXPORTS".to_string()),
+            ],
+            "requests: {:?}",
+            harness.state().requests
+        );
+
+        // The second lane's pause is the second row's watch.
+        let mut harness = screen_harness(state_with(luc()));
+        let pauses: Vec<_> = harness.get_all_by_label("Pause").collect();
+        pauses[1].click();
+        harness.run();
+        assert!(
+            harness.state().requests.contains(&Request::SetWatchEnabled {
+                id: "id:/Users/chaos/Live_Work/LUC/0_EXPORTS".to_string(),
+                on: false,
+            }),
+            "requests: {:?}",
+            harness.state().requests
+        );
+        // The row that was clicked is the one that reads Paused now, and the lane
+        // above it is still watching.
+        assert!(!harness.state().watches[1].enabled);
+        assert!(harness.state().watches[0].enabled);
+    }
+
+    /// The job is Portal's, and says so with the sentence that already exists:
+    /// removing it here is not the end of it.
+    #[test]
+    fn the_job_carries_the_portal_sentence() {
+        let mut harness = screen_harness(state_with(luc()));
+
+        // The marker is the same four words a Portal row carries, with the same
+        // sentence on it; the title line and the job's own tooltip say it too.
+        harness.get_by_label(PORTAL_MARKER).hover();
+        harness.run();
+        assert!(
+            harness.query_by_label(PORTAL_SENTENCE).is_some(),
+            "the job's tooltip is the sentence a Portal row already carries"
+        );
+        assert!(PORTAL_SENTENCE.contains("Remove the marker in Portal"));
+
+        // And the Remove itself says what pressing it costs: Portal puts the job
+        // back unless its marker is cleared in Portal. Its name is still Remove.
+        let mut harness = screen_harness(state_with(luc()));
+        harness.get_by_label("Remove").hover();
+        harness.run();
+        assert!(
+            harness.query_by_label(PORTAL_SENTENCE).is_some(),
+            "the job's Remove carries the sentence"
+        );
+    }
+
+    /// The two-lane job, at the size the other watch snapshots are drawn at.
+    #[test]
+    fn the_watch_screen_with_a_duplex_renders_to_png() {
+        let mut rows = vec![watch("/Users/chaos/Movies/Rushes", "Rushes 2026", "upload", true, 3)];
+        rows.extend(luc());
+        let mut harness = screen_harness(state_with(rows));
+        harness.run_steps(2);
+        let job = format!("LUC · {SMART_IN_OUT_TRAY}");
+        harness.get_by_label(&job);
+        harness.get_by_label(LANE_INBOUND);
+        harness.get_by_label(LANE_OUTBOUND);
+        harness.snapshot("watch_duplex");
     }
 }

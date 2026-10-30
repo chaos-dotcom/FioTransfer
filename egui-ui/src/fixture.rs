@@ -9,7 +9,7 @@
 
 use crate::model::{
     Crumb, FileView, HistoryRow, JobView, PortalUi, PortalView, Settings, Snapshot, SpaceAccount, SpaceRow, Toast,
-    ToastKind, UiState, UpdateState, User, View, WatchRow,
+    Lane, ToastKind, UiState, UpdateState, User, View, WatchRow,
 };
 
 /// The moment the fixture is drawn at, so the Portal status line's "2 min ago" is
@@ -138,6 +138,8 @@ pub fn fixture_state(view: View) -> UiState {
             // Both fixture watches are the user's: the Watch screen's own
             // snapshot must stay the user-made screen it has always been.
             from_portal: false,
+            duplex_id: None,
+            lane: Lane::None,
         },
         WatchRow {
             id: "w-dailies".into(),
@@ -147,6 +149,8 @@ pub fn fixture_state(view: View) -> UiState {
             enabled: false,
             pending: 0,
             from_portal: false,
+            duplex_id: None,
+            lane: Lane::None,
         },
     ];
 

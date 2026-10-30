@@ -551,6 +551,69 @@ impl From<fiotransfer_core::app::SpacePayload> for SpacePayload {
     }
 }
 
+/// Which sync lane of a duplex one watch drives.
+///
+/// A Portal-managed project is drawn as one job — a **Smart In/Out Tray** — made
+/// of up to two sync lanes. The inbound lane is the download watch on the
+/// client's folder (its origin is `portal:<link id>`); the outbound lane is the
+/// upload watch on the exports folder (origin `portal:<link id>#exports`). A
+/// watch the user made belongs to no duplex — it keeps a row of its own — and
+/// its lane is `None`.
+///
+/// The lane follows the watch record's `direction`, not the folder's name: a
+/// project whose client folder is called anything at all still has its inbound
+/// lane on the download watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lane {
+    /// A watch the user made: no duplex, no lane.
+    #[default]
+    None,
+    /// The download watch: the client's folder, fed from Frame.io.
+    Inbound,
+    /// The upload watch: the exports folder, sent to Frame.io.
+    Outbound,
+}
+
+/// The prefix and suffix of a Portal-owned watch's `origin`, as
+/// `fiotransfer_core::portal::agent` writes them. Spelled here because this file
+/// also builds for `wasm32`, where the core (and so `portal::agent::link_of`) is
+/// not compiled in; `the_origin_parser_agrees_with_the_portal_agent` holds the
+/// two to the same answer on the native build.
+const PORTAL_PREFIX: &str = "portal:";
+const EXPORTS_SUFFIX: &str = "#exports";
+
+/// A watch's duplex — the Portal link id — and the sync lane it drives, from the
+/// record's `origin` and `direction`.
+///
+/// `portal:L1` is the inbound lane of duplex `L1`; `portal:L1#exports` is its
+/// outbound lane. A watch the user made (`origin` empty) answers
+/// `(None, Lane::None)`, and so does an origin this screen cannot read — an
+/// unreadable origin leaves its row drawing exactly as it did before there were
+/// lanes, rather than inventing a job.
+pub fn lane_of(origin: &str, direction: &str) -> (Option<String>, Lane) {
+    let Some(link) = origin.strip_prefix(PORTAL_PREFIX) else {
+        return (None, Lane::None);
+    };
+    let (id, exports) = match link.strip_suffix(EXPORTS_SUFFIX) {
+        Some(rest) => (rest, true),
+        None => (link, false),
+    };
+    // Nothing before the suffix, or a `#` anywhere else: not an origin the
+    // reconciler writes (`plan` refuses a link id that holds one), so no duplex.
+    if id.is_empty() || id.contains('#') {
+        return (None, Lane::None);
+    }
+    let lane = match direction {
+        "download" => Lane::Inbound,
+        "upload" => Lane::Outbound,
+        // A direction with no lane of its own — a mirror Portal watch, or one
+        // this build does not know — takes the side its origin names.
+        _ if exports => Lane::Outbound,
+        _ => Lane::Inbound,
+    };
+    (Some(id.to_string()), lane)
+}
+
 /// One row of the Watch Folders screen, from the app's `WatchView`.
 #[derive(Debug, Clone, Default)]
 pub struct WatchRow {
@@ -566,6 +629,12 @@ pub struct WatchRow {
     /// when it is removed here. A watch the user made has an empty origin, and
     /// this is false.
     pub from_portal: bool,
+    /// The duplex this watch is a lane of: the Portal link id, without the
+    /// `#exports` suffix, so both lanes of one link answer the same id. `None`
+    /// for a watch the user made, and for an origin this screen cannot read.
+    pub duplex_id: Option<String>,
+    /// Which sync lane of [`WatchRow::duplex_id`] this watch drives.
+    pub lane: Lane,
 }
 
 impl WatchRow {
@@ -575,6 +644,7 @@ impl WatchRow {
     /// capture is given its rows by `src/fixture.rs`.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn from_core(w: &fiotransfer_core::xfer::watch::WatchView) -> WatchRow {
+        let (duplex_id, lane) = lane_of(&w.origin, &w.direction);
         WatchRow {
             id: w.id.clone(),
             local: w.local_path.clone(),
@@ -586,8 +656,91 @@ impl WatchRow {
             // it: only `portal:<link id>` makes Portal the owner, and an empty
             // origin (a watch the user made) is not Portal's.
             from_portal: fiotransfer_core::portal::agent::link_of(&w.origin).is_some(),
+            duplex_id,
+            lane,
         }
     }
+}
+
+/// One block of the Watch Folders screen: a duplex and its lanes, or a single
+/// watch the user made.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchBlock {
+    /// The duplex this block is, by link id; `None` for a watch the user made,
+    /// which is a block of one and is drawn on its own row.
+    pub duplex_id: Option<String>,
+    /// Where the block's rows sit in [`UiState::watches`], inbound lane first and
+    /// then outbound — the order the lanes are drawn in.
+    pub rows: Vec<usize>,
+}
+
+/// The rows of the Watch Folders screen, grouped for drawing: one block per
+/// duplex, one block per watch the user made.
+///
+/// A duplex's lanes are put together in one block wherever its first lane sat,
+/// so a lane that appears before its sibling does not split the job and a record
+/// order of `out, in` still draws inbound first.
+///
+/// The blocks are then ordered: the watches the user made first, in the order
+/// the app lists them (a user's own folder keeps the place it had), then one
+/// block per duplex, by label — the Frame.io destination the duplex names — with
+/// a stable sort, so two duplexes that share a label keep the app's order and
+/// the same list always draws the same way.
+///
+/// The indices point into the slice they were made from, so the screen addresses
+/// its actions (`RemoveWatch`, `SetWatchEnabled`) by the row that owns them.
+pub fn watch_blocks(rows: &[WatchRow]) -> Vec<WatchBlock> {
+    let mut blocks: Vec<WatchBlock> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        match &row.duplex_id {
+            Some(id) => match blocks.iter_mut().find(|b| b.duplex_id.as_ref() == Some(id)) {
+                Some(block) => block.rows.push(index),
+                None => blocks.push(WatchBlock { duplex_id: Some(id.clone()), rows: vec![index] }),
+            },
+            None => blocks.push(WatchBlock { duplex_id: None, rows: vec![index] }),
+        }
+    }
+    for block in &mut blocks {
+        // Inbound before outbound, whatever order the records were created in.
+        block.rows.sort_by_key(|&index| match rows[index].lane {
+            Lane::Inbound => 0,
+            Lane::Outbound => 1,
+            Lane::None => 2,
+        });
+    }
+    // A watch the user made keeps the place the app gave it — its own rows are
+    // not reordered at all — and the jobs follow them in label order. `sort_by` is
+    // stable, so two jobs that share a label keep the app's order too.
+    let (mut own, mut jobs): (Vec<WatchBlock>, Vec<WatchBlock>) =
+        blocks.into_iter().partition(|block| block.duplex_id.is_none());
+    jobs.sort_by(|a, b| {
+        rows[a.rows[0]].label.to_lowercase().cmp(&rows[b.rows[0]].label.to_lowercase())
+    });
+    own.extend(jobs);
+    own
+}
+
+/// The same rows, in the order [`watch_blocks`] draws them.
+///
+/// The screen groups by `duplex_id` itself; this is for the shell, so the list
+/// the app hands over is already the list that is drawn and a reader of
+/// `UiState::watches` sees what is on screen. The rows move, nothing else: an
+/// app watch id still addresses its own row.
+pub fn in_block_order(rows: Vec<WatchRow>) -> Vec<WatchRow> {
+    let blocks = watch_blocks(&rows);
+    let mut rest: Vec<Option<WatchRow>> = rows.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(rest.len());
+    for block in blocks {
+        for index in block.rows {
+            if let Some(row) = rest[index].take() {
+                out.push(row);
+            }
+        }
+    }
+    // The grouping reaches every row; a row it somehow missed is listed after
+    // the rest rather than dropped.
+    out.extend(rest.into_iter().flatten());
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -798,5 +951,127 @@ mod tests {
         assert_eq!(ours.projects[0].workspace_name, "Shows");
         assert_eq!(ours.projects[0].name, "Nightfall");
         assert_eq!(ours.projects[0].files, 3);
+    }
+
+    // ---------- a duplex, its sync lanes, and where they sit on the screen ----------
+
+    /// The record's `origin` says which duplex a watch is a lane of, and its
+    /// `direction` says which lane. Both are read from the record: the folder's
+    /// name plays no part.
+    #[test]
+    fn an_origin_and_a_direction_name_a_duplex_and_a_lane() {
+        // The inbound lane: the drive watch, a download, `portal:<link id>`.
+        assert_eq!(
+            lane_of("portal:L1", "download"),
+            (Some("L1".to_string()), Lane::Inbound)
+        );
+        // The outbound lane: the exports watch, an upload, `#exports` on the end.
+        assert_eq!(
+            lane_of("portal:L1#exports", "upload"),
+            (Some("L1".to_string()), Lane::Outbound)
+        );
+        // Both lanes answer the same duplex, which is what groups them.
+        assert_eq!(lane_of("portal:L1", "download").0, lane_of("portal:L1#exports", "upload").0);
+
+        // The direction decides, not the suffix: a link whose drive watch pushes
+        // (a mirror) still draws on the side its record says.
+        assert_eq!(lane_of("portal:L1", "upload"), (Some("L1".to_string()), Lane::Outbound));
+        assert_eq!(lane_of("portal:L1#exports", "download"), (Some("L1".to_string()), Lane::Inbound));
+        // A direction with no lane of its own takes its origin's side.
+        assert_eq!(lane_of("portal:L1", "mirror"), (Some("L1".to_string()), Lane::Inbound));
+        assert_eq!(lane_of("portal:L1#exports", "mirror"), (Some("L1".to_string()), Lane::Outbound));
+        assert_eq!(lane_of("portal:L1", ""), (Some("L1".to_string()), Lane::Inbound));
+
+        // A watch the user made: no origin, so no duplex and no lane.
+        assert_eq!(lane_of("", "upload"), (None, Lane::None));
+        assert_eq!(lane_of("", "download"), (None, Lane::None));
+        assert_eq!(lane_of("user", "upload"), (None, Lane::None));
+
+        // Malformed: a prefix with nothing after it, a `#` that is not the
+        // exports suffix, the suffix with nothing before it, and the prefix in
+        // the wrong case. None of them invents a job.
+        assert_eq!(lane_of("portal:", "download"), (None, Lane::None));
+        assert_eq!(lane_of("portal:#exports", "upload"), (None, Lane::None));
+        assert_eq!(lane_of("portal:L1#bogus", "download"), (None, Lane::None));
+        assert_eq!(lane_of("portal:L1#exports#exports", "upload"), (None, Lane::None));
+        assert_eq!(lane_of("Portal:L1", "download"), (None, Lane::None), "the prefix is exact");
+        assert_eq!(lane_of(" portal:L1", "download"), (None, Lane::None));
+    }
+
+    /// The parser here and the reconciler's must read the same origin the same
+    /// way, or a watch would be Portal's on one screen and nobody's on the next.
+    /// The constants are spelled out in this file for the browser build, which has
+    /// no core; this is what keeps the two spellings honest.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_origin_parser_agrees_with_the_portal_agent() {
+        use fiotransfer_core::portal::agent::{
+            EXPORTS_SUFFIX as CORE_SUFFIX, exports_origin_of, link_of, origin_of,
+        };
+        assert_eq!(EXPORTS_SUFFIX, CORE_SUFFIX, "the suffix this file spells is the core's");
+        assert_eq!(PORTAL_PREFIX, "portal:", "and so is the prefix");
+        assert_eq!(origin_of("L1").strip_prefix(PORTAL_PREFIX), link_of(&origin_of("L1")));
+        assert_eq!(
+            exports_origin_of("L1").strip_prefix(PORTAL_PREFIX),
+            link_of(&exports_origin_of("L1"))
+        );
+        // `link_of` keeps the suffix on, which is what it is for: the origin is
+        // what identifies a watch. This file strips it to find the duplex.
+        assert_eq!(link_of(&exports_origin_of("L1")), Some("L1#exports"));
+        assert_eq!(lane_of(&origin_of("L1"), "download").0, Some("L1".to_string()));
+        assert_eq!(lane_of(&exports_origin_of("L1"), "upload").0, Some("L1".to_string()));
+        assert_eq!(lane_of("", "download"), (link_of("").map(str::to_string), Lane::None));
+    }
+
+    /// Two lanes of one link are one block, in inbound-then-outbound order,
+    /// wherever the records sat in the list; a watch the user made is a block of
+    /// its own; and the blocks are drawn in label order.
+    #[test]
+    fn the_rows_group_by_duplex_and_sort_by_label() {
+        fn portal(id: &str, label: &str, origin: &str, direction: &str) -> WatchRow {
+            let (duplex_id, lane) = lane_of(origin, direction);
+            WatchRow {
+                id: id.to_string(),
+                label: label.to_string(),
+                direction: direction.to_string(),
+                duplex_id,
+                lane,
+                ..WatchRow::default()
+            }
+        }
+        fn user(id: &str, label: &str) -> WatchRow {
+            WatchRow { id: id.to_string(), label: label.to_string(), ..WatchRow::default() }
+        }
+
+        // The exports watch first and the drive watch third: the two lanes are
+        // still one block, and the lane order is not the record order.
+        let rows = vec![
+            portal("out", "LUC", "portal:LUC#exports", "upload"),
+            user("mine", "Rushes 2026"),
+            portal("in", "LUC", "portal:LUC", "download"),
+            portal("b-out", "Archive", "portal:ARCH#exports", "upload"),
+            portal("b-in", "Archive", "portal:ARCH", "download"),
+        ];
+        let blocks = watch_blocks(&rows);
+        assert_eq!(blocks.len(), 3, "two duplexes and one watch of the user's: {blocks:?}");
+        // The user's own folder first, where the app had it; then the two jobs
+        // by label, Archive before LUC.
+        assert_eq!(blocks[0].duplex_id, None);
+        assert_eq!(blocks[0].rows, vec![1]);
+        assert_eq!(blocks[1].duplex_id.as_deref(), Some("ARCH"));
+        assert_eq!(blocks[1].rows, vec![4, 3], "inbound first, then outbound");
+        assert_eq!(blocks[2].duplex_id.as_deref(), Some("LUC"));
+        assert_eq!(blocks[2].rows, vec![2, 0]);
+
+        // The same list grouped twice is the same list: nothing depends on the
+        // order the records arrived in beyond the tie-break, which is stable.
+        assert_eq!(watch_blocks(&rows), blocks);
+
+        // A duplex with one lane is one block of one row.
+        let one = vec![portal("in", "Solo", "portal:SOLO", "download")];
+        assert_eq!(watch_blocks(&one), vec![WatchBlock { duplex_id: Some("SOLO".into()), rows: vec![0] }]);
+
+        // Nothing to group is no blocks, not a block with no rows.
+        assert!(watch_blocks(&[]).is_empty());
     }
 }
